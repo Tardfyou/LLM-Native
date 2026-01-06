@@ -1,0 +1,18 @@
+# LLM API Keys Configuration
+# Copy this file and fill in your actual API keys
+
+# OpenAI API Key
+openai_key: "sk-your-openai-key-here"
+
+# Anthropic Claude API Key
+claude_key: "sk-ant-api03-your-claude-key-here"
+
+# Google Gemini API Key
+google_key: "AIzaSy-your-gemini-key-here"
+
+# DeepSeek API Key (optional)
+deepseek_key: "sk-6b1ae1bdb0e24c0189f0f0e9db43a94a"
+
+# For local models (optional)
+# base_url: "http://localhost:8000/v1"
+# api_key: "dummy"

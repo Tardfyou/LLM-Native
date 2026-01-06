@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  # Production Framework Service
+  framework:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod  # 使用生产Dockerfile
+    environment:
+      - PYTHONPATH=/app/src:/app
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
+      - DEEPSEEK_API_KEY=sk-6b1ae1bdb0e24c0189f0f0e9db43a94a
+    ports:
+      - "8000:8000"  # API service port
+    volumes:
+      - knowledge_data:/app/data/knowledge
+      - benchmark_data:/app/data/benchmarks
+      - results:/app/results
+      - logs:/app/logs
+    working_dir: /app
+    command: ["python3", "-m", "uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      - vector-db
+    profiles:
+      - prod
+
+  # Development Framework Service (推荐用于开发调试)
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app:cached  # 代码热重载 - 修改代码后立即生效
+      - knowledge_data:/app/data/knowledge
+      - benchmark_data:/app/data/benchmarks
+      - results:/app/results
+      - logs:/app/logs
+    environment:
+      - PYTHONPATH=/app/src:/app
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
+      - DEEPSEEK_API_KEY=sk-6b1ae1bdb0e24c0189f0f0e9db43a94a
+      - LOG_LEVEL=DEBUG  # 开发模式更详细的日志
+    ports:
+      - "8000:8000"  # API service port
+      - "8501:8501"  # Streamlit interface (if used)
+    working_dir: /app
+    command: ["bash"]  # 启动bash，便于交互调试
+    depends_on:
+      - vector-db
+    profiles:
+      - dev
+
+  # Vector Database Service (for RAG)
+  vector-db:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - vector_db_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+
+
+  # Testing Service
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app:cached
+      - test_results:/app/test-results
+    environment:
+      - PYTHONPATH=/app/src:/app
+      - TEST_ENV=1
+    working_dir: /app
+    command: ["python3", "-m", "pytest", "tests/", "-v", "--tb=short", "--cov=src", "--cov-report=html:test-results/coverage"]
+    profiles:
+      - test
+
+volumes:
+  framework_cache:
+  knowledge_data:
+  benchmark_data:
+  results:
+  logs:
+  vector_db_data:
+  test_results:

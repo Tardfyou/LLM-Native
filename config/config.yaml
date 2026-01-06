@@ -1,0 +1,195 @@
+# LLM-Native Static Analysis Framework Configuration
+
+# Project Settings
+project:
+  name: "LLM-Native Static Analysis Framework"
+  version: "0.1.0"
+  description: "面向缺陷检测的大预言模型原生静态分析框架"
+
+# Directory Paths
+paths:
+  root_dir: "/app"
+  src_dir: "/app/src"
+  data_dir: "/app/data"
+  results_dir: "/app/results"
+  logs_dir: "/app/logs"
+  knowledge_dir: "/app/data/knowledge"
+  benchmarks_dir: "/app/data/benchmarks"
+  config_dir: "/app/config"
+  prompt_templates_dir: "/app/prompt_templates"
+
+# LLM Configuration
+llm:
+  # Primary model for generation (DeepSeek models)
+  primary_model: "deepseek-chat"
+  # Fallback models (暂时只支持DeepSeek)
+  fallback_models: ["deepseek-coder"]
+  # API keys configuration
+  keys:
+    deepseek_key: "sk-6b1ae1bdb0e24c0189f0f0e9db43a94a"
+  # Generation parameters
+  generation:
+    temperature: 0.1
+    max_tokens: 4096
+    top_p: 0.9
+    frequency_penalty: 0.0
+    presence_penalty: 0.0
+  # Request parameters
+  timeout: 60
+  max_retries: 3
+  # Rate limiting
+  rate_limit:
+    requests_per_minute: 60
+    tokens_per_minute: 100000
+
+# Knowledge Base Configuration
+knowledge_base:
+  # Vector database settings
+  vector_db:
+    type: "chromadb"  # Options: chromadb, milvus, qdrant
+    host: "localhost"
+    port: 8001
+    collection: "api_knowledge"
+    # Embedding model
+    embedding_model: "microsoft/unixcoder-base"
+    # Retrieval settings
+    top_k: 10
+    similarity_threshold: 0.7
+    # Hybrid retrieval weights
+    dense_weight: 0.7
+    sparse_weight: 0.3
+
+  # Data sources
+  data_sources:
+    frameworks:
+      - name: "clang"
+        enabled: true
+        docs_url: "https://clang.llvm.org/docs/"
+        api_docs_dir: "/data/knowledge/clang"
+      - name: "codeql"
+        enabled: true
+        docs_url: "https://codeql.github.com/docs/"
+        api_docs_dir: "/data/knowledge/codeql"
+    cwe_sources:
+      - name: "mitre_cwe"
+        enabled: true
+        base_url: "https://cwe.mitre.org/data/definitions/"
+        cache_dir: "/data/knowledge/cwe"
+
+# Generation Engine Configuration
+generator:
+  # Pipeline stages
+  pipeline:
+    - "pattern_extraction"
+    - "plan_generation"
+    - "code_generation"
+    - "syntax_repair"
+    - "validation"
+
+  # Maximum iterations for self-healing
+  max_iterations: 3
+
+  # Code generation settings
+  code_gen:
+    target_frameworks: ["clang", "codeql"]
+    supported_languages: ["cpp", "java", "python"]
+    # Template settings
+    use_templates: true
+    template_dir: "/app/prompt_templates"
+
+  # Compilation settings
+  compilation:
+    clang_version: "18"
+    llvm_dir: "/usr/lib/llvm-18"
+    timeout_seconds: 300
+
+# Validation Configuration
+validator:
+  # Validation layers
+  layers:
+    - "compilation"
+    - "semantic_consistency"
+    - "performance_test"
+
+  # Compilation validation
+  compilation:
+    enabled: true
+    clang_flags: ["-std=c++20", "-O0", "-g", "-Wall", "-Wextra"]
+    timeout_seconds: 60
+
+  # Semantic validation
+  semantic:
+    enabled: true
+    test_cases_dir: "/app/data/benchmarks/test_cases"
+    positive_samples: 10
+    negative_samples: 10
+
+  # Performance validation
+  performance:
+    enabled: true
+    max_execution_time: 30
+    memory_limit_mb: 512
+
+# Evaluator Configuration
+evaluator:
+  # Benchmark datasets
+  benchmarks:
+    - name: "juliet_suite"
+      enabled: true
+      path: "/data/benchmarks/juliet"
+      supported_cwes: ["CWE-119", "CWE-125", "CWE-416", "CWE-476"]
+    - name: "custom_dataset"
+      enabled: true
+      path: "/data/benchmarks/custom"
+      supported_cwes: ["CWE-22", "CWE-78", "CWE-79", "CWE-94"]
+
+  # Metrics to compute
+  metrics:
+    - "compilation_success_rate"
+    - "functional_correctness"
+    - "false_positive_rate"
+    - "precision"
+    - "recall"
+    - "f1_score"
+
+  # Statistical analysis
+  statistics:
+    confidence_level: 0.95
+    num_iterations: 5
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "/app/logs/llm_native.log"
+  max_file_size: "10 MB"
+  backup_count: 5
+
+  # Component-specific logging
+  components:
+    knowledge_base: "DEBUG"
+    generator: "INFO"
+    validator: "INFO"
+    evaluator: "INFO"
+
+# API Server Configuration
+api:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+  cors_origins: ["*"]
+
+  # API endpoints
+  endpoints:
+    generate_detector: "/api/v1/generate"
+    validate_detector: "/api/v1/validate"
+    evaluate_detector: "/api/v1/evaluate"
+    knowledge_search: "/api/v1/knowledge/search"
+
+# Development Settings
+development:
+  enable_debug: false
+  enable_profiling: false
+  mock_llm_responses: false
+  use_cache: true
+  cache_dir: "/app/.cache"
