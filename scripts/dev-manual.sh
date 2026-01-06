@@ -68,6 +68,7 @@ docker run -it \
     --network llm_native_network \
     -p 8000:8000 \
     -v "$PROJECT_ROOT:/app:cached" \
+    -v "$PROJECT_ROOT/pretrained_models:/root/.cache/huggingface/hub:cached" \
     -v llm_native_knowledge:/app/data/knowledge \
     -v llm_native_benchmarks:/app/data/benchmarks \
     -v llm_native_results:/app/results \
@@ -75,6 +76,8 @@ docker run -it \
     -e PYTHONPATH=/app/src:/app \
     -e DEEPSEEK_API_KEY=sk-6b1ae1bdb0e24c0189f0f0e9db43a94a \
     -e LOG_LEVEL=DEBUG \
+    -e HF_HUB_CACHE=/root/.cache/huggingface/hub \
+    -e TRANSFORMERS_CACHE=/root/.cache/huggingface/hub \
     --workdir /app \
     llm-native:dev \
     bash
@@ -91,3 +94,13 @@ echo ""
 echo "  # 停止环境"
 echo "  docker stop $DEV_CONTAINER_NAME $CONTAINER_NAME"
 echo "  docker rm $DEV_CONTAINER_NAME $CONTAINER_NAME"
+echo ""
+echo "  # 模型下载说明："
+echo "  # 下载预训练模型: python3 scripts/download_models.py"
+echo "  # 检查模型状态: python3 scripts/check_models.py"
+echo "  # 模型缓存位置: ./pretrained_models/"
+echo ""
+echo "  # 运行环境测试: python3 scripts/test_environment_comprehensive.py"
+
+
+

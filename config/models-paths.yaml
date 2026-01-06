@@ -1,0 +1,64 @@
+# LLM-Native 模型路径映射配置
+# 此文件定义了模型在文件系统中的路径映射，便于代码中引用
+
+# 基础路径配置
+paths:
+  models_base: "pretrained_models"
+  embedding_base: "pretrained_models/embedding"
+  generation_base: "pretrained_models/generation"
+  knowledge_base: "knowledge_base_models"
+  knowledge_embedding_base: "knowledge_base_models/embedding"
+  cache_base: "pretrained_models/cache"
+
+# 模型路径映射
+models:
+  # 嵌入模型
+  embedding:
+    unixcoder_base: "pretrained_models/embedding/microsoft_unixcoder-base"
+    bge_m3: "pretrained_models/embedding/BAAI_bge-m3"
+    paraphrase_minilm: "pretrained_models/embedding/sentence-transformers_paraphrase-MiniLM-L3-v2"
+
+  # 知识库专用模型
+  knowledge:
+    code_embedder: "knowledge_base_models/embedding/microsoft_unixcoder-base"
+    multilingual_embedder: "knowledge_base_models/embedding/BAAI_bge-m3"
+    lightweight_embedder: "knowledge_base_models/embedding/sentence-transformers_paraphrase-MiniLM-L3-v2"
+
+  # 生成模型
+  generation:
+    dialogpt_medium: "pretrained_models/generation/microsoft_DialoGPT-medium"
+    distilbert_base: "pretrained_models/generation/distilbert-base-uncased"
+
+  # API模型 (无需本地存储)
+  api:
+    deepseek_chat: "api://deepseek-chat"
+    deepseek_reasoner: "api://deepseek-reasoner"
+
+# 默认模型配置
+defaults:
+  embedding_model: "unixcoder_base"      # 默认代码嵌入模型
+  generation_model: "deepseek_chat"      # 默认文本生成模型
+  reranker_model: "bge_m3"               # 默认重排序模型
+
+# 模型别名 (便于代码中使用简短名称)
+aliases:
+  code_embedder: "unixcoder_base"
+  text_embedder: "bge_m3"
+  light_embedder: "paraphrase_minilm"
+  chat_model: "deepseek_chat"
+  reasoning_model: "deepseek_reasoner"
+  dialogue_model: "dialogpt_medium"
+
+# 环境变量配置
+environment:
+  HF_HOME: "pretrained_models"
+  KNOWLEDGE_MODELS_HOME: "knowledge_base_models"
+  TRANSFORMERS_CACHE: "pretrained_models/cache"
+  TOKENIZERS_PARALLELISM: "false"
+
+# 容器挂载配置
+volumes:
+  - "./pretrained_models:/app/pretrained_models:cached"        # 开发环境
+  - "./pretrained_models:/app/pretrained_models:ro"            # 生产环境 (只读)
+  - "./knowledge_base_models:/app/knowledge_base_models:cached"  # 知识库模型 (开发环境)
+  - "./knowledge_base_models:/app/knowledge_base_models:ro"      # 知识库模型 (生产环境，只读)

@@ -21,9 +21,12 @@ paths:
 # LLM Configuration
 llm:
   # Primary model for generation (DeepSeek models)
+  # Available models:
+  # - deepseek-chat: 通用对话模型，适合日常对话和文本生成
+  # - deepseek-reasoner: 推理增强模型，适合复杂推理和代码生成
   primary_model: "deepseek-chat"
   # Fallback models (暂时只支持DeepSeek)
-  fallback_models: ["deepseek-coder"]
+  fallback_models: ["deepseek-reasoner"]
   # API keys configuration
   keys:
     deepseek_key: "sk-6b1ae1bdb0e24c0189f0f0e9db43a94a"

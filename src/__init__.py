@@ -8,8 +8,8 @@ __author__ = "Your Name"
 __description__ = "An LLM-native framework for automatic static analysis detector generation"
 
 # Import main classes for easy access
-from core.config import Config
-from core.orchestrator import Orchestrator
+from .core.config import Config
+from .core.orchestrator import Orchestrator
 
 __all__ = [
     "Config",

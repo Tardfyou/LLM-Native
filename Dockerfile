@@ -5,8 +5,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Configure DNS and package sources
+RUN echo 'nameserver 8.8.8.8' > /etc/resolv.conf && \
+    echo 'nameserver 8.8.4.4' >> /etc/resolv.conf && \
+    sed -i 's|http://archive.ubuntu.com|http://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|http://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+
+# Install system dependencies with retry mechanism
+RUN apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get update --fix-missing && \
+    apt-get install -y \
     build-essential \
     cmake \
     git \
@@ -30,7 +39,12 @@ RUN apt-get update && apt-get install -y \
 # Install Python dependencies
 FROM base AS python-deps
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip3 install --no-cache-dir -r requirements.txt && \
+    python3 -c "import sentence_transformers; print('sentence-transformers installed successfully')" || \
+    (echo "Failed to install sentence-transformers, retrying..." && \
+     pip3 install --no-cache-dir sentence-transformers && \
+     python3 -c "import sentence_transformers; print('sentence-transformers installed successfully')")
 
 # LLVM Environment Stage
 FROM python-deps AS llvm-env

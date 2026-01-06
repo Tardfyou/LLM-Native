@@ -69,6 +69,7 @@ temp/
 
 # Docker
 .dockerignore
+docker-daemon-backup*.json
 
 # Node modules (if any)
 node_modules/
@@ -87,3 +88,9 @@ htmlcov/
 .pytest_cache/
 .tox/
 .cache
+
+# Pretrained models (large files)
+pretrained_models/
+
+# Test results and logs
+scripts/test_results/

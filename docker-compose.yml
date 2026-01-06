@@ -10,9 +10,12 @@ services:
       - PYTHONPATH=/app/src:/app
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
       - DEEPSEEK_API_KEY=sk-6b1ae1bdb0e24c0189f0f0e9db43a94a
+      - HF_HOME=/app/pretrained_models
+      - TRANSFORMERS_CACHE=/app/pretrained_models
     ports:
       - "8000:8000"  # API service port
     volumes:
+      - ./pretrained_models:/app/pretrained_models:ro  # 预训练模型挂载 (只读)
       - knowledge_data:/app/data/knowledge
       - benchmark_data:/app/data/benchmarks
       - results:/app/results
@@ -29,8 +32,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: llm_native_dev
     volumes:
       - .:/app:cached  # 代码热重载 - 修改代码后立即生效
+      - ./pretrained_models:/app/pretrained_models:cached  # 预训练模型挂载
       - knowledge_data:/app/data/knowledge
       - benchmark_data:/app/data/benchmarks
       - results:/app/results
@@ -40,6 +45,8 @@ services:
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
       - DEEPSEEK_API_KEY=sk-6b1ae1bdb0e24c0189f0f0e9db43a94a
       - LOG_LEVEL=DEBUG  # 开发模式更详细的日志
+      - HF_HOME=/app/pretrained_models
+      - TRANSFORMERS_CACHE=/app/pretrained_models
     ports:
       - "8000:8000"  # API service port
       - "8501:8501"  # Streamlit interface (if used)
@@ -53,6 +60,7 @@ services:
   # Vector Database Service (for RAG)
   vector-db:
     image: chromadb/chroma:latest
+    container_name: llm_native_vector_db
     ports:
       - "8001:8000"
     volumes:

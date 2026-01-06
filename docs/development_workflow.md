@@ -292,3 +292,42 @@ docker-compose --profile dev exec dev docker update --memory=4g --memory-swap=8g
 6. **定期清理容器**避免资源浪费
 
 按照这个工作流，您可以在Docker环境中高效地进行开发、调试和实验，而无需频繁重构镜像！ 🐳✨
+
+## 🧹 环境清理
+
+### 标准清理
+```bash
+# 使用清理脚本（推荐）
+./scripts/cleanup.sh
+
+# 脚本会自动：
+# - 停止所有相关容器
+# - 删除数据卷和网络
+# - 清理临时文件
+```
+
+### 深度清理
+```bash
+# 深度清理所有Docker资源
+./scripts/cleanup.sh --deep
+
+# 会额外执行：
+# - docker system prune -f
+# - docker volume prune -f
+# - docker network prune -f
+```
+
+### 手动清理
+```bash
+# 停止容器
+docker stop llm_native_dev llm_native_vector_db
+
+# 删除容器
+docker rm llm_native_dev llm_native_vector_db
+
+# 删除网络
+docker network rm llm_native_network
+
+# 删除数据卷（谨慎操作，会丢失数据）
+docker volume rm llm_native_vector_data llm_native_knowledge llm_native_benchmarks
+```

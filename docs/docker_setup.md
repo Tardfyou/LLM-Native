@@ -1,5 +1,22 @@
 # Docker环境设置指南
 
+## 🔍 网络诊断
+
+在运行环境搭建脚本前，建议先运行网络诊断：
+
+```bash
+# 运行网络诊断脚本
+./scripts/diagnose_network.sh
+```
+
+这个脚本会检查：
+- ✅ Docker运行状态
+- ✅ 网络连接情况
+- ✅ DNS解析功能
+- ✅ Ubuntu软件源可访问性
+- ✅ Docker网络功能
+- ✅ Docker构建功能
+
 ## 🔍 问题诊断
 
 如果运行 `./scripts/dev.sh` 时遇到以下错误：
@@ -84,6 +101,44 @@ docker info
 # 如果遇到权限错误
 sudo usermod -aG docker $USER
 # 重新登录或运行：newgrp docker
+```
+
+### 网络连接问题
+```bash
+# 运行网络诊断脚本
+./scripts/diagnose_network.sh
+
+# 检查DNS配置
+cat /etc/resolv.conf
+
+# 测试网络连接
+ping 8.8.8.8
+curl -I http://archive.ubuntu.com
+
+# 如果网络有问题，临时修改DNS
+echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
+
+# 检查防火墙
+sudo ufw status
+```
+
+### Docker构建失败
+```bash
+# 检查Docker磁盘空间
+docker system df
+
+# 清理Docker缓存
+docker system prune -f
+
+# 检查Dockerfile语法（不实际构建）
+docker build --no-cache --progress=plain -t test-build . 2>&1 | head -50
+
+# 如果仍然失败，使用备用Dockerfile
+docker build -f Dockerfile.alternative -t llm-native:dev .
+
+# 或者使用最小化Dockerfile
+docker build -f Dockerfile.minimal -t llm-native:dev .
 ```
 
 ### 端口冲突
