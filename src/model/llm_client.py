@@ -1,30 +1,71 @@
 """
 LLM Client Base Classes
-大语言模型客户端基础类
+大语言模型客户端基础类 - 增强版
+
+参考KNighter的model.py，提供:
+- 6次重试机制
+- 推理模型特殊处理
+- ``标签移除
+- 指数退避策略
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 import logging
+import re
+import time
 
 # 使用标准logging而不是loguru，以避免依赖问题
 logger = logging.getLogger(__name__)
 
 
+def remove_think_tags(text: str) -> str:
+    """
+    移除DeepSeek推理模型的``标签内容
+
+    Args:
+        text: 包含``标签的文本
+
+    Returns:
+        移除后的文本
+    """
+    if not text:
+        return text
+
+    # 移除整个``块
+    pattern = r'<\|.*?\|>'
+    cleaned = re.sub(pattern, '', text, flags=re.DOTALL)
+
+    # 清理多余空行
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+    return cleaned.strip()
+
+
 @dataclass
 class LLMConfig:
-    """LLM配置类"""
+    """LLM配置类 - 增强版，支持推理模型和更强重试机制"""
     model_name: str
     api_key: str
     base_url: str = "https://api.deepseek.com/v1"
     temperature: float = 0.7
     max_tokens: int = 2000
     timeout: int = 30
-    max_retries: int = 3
+    max_retries: int = 6  # 增加到6次重试 (参考KNighter)
     top_p: float = 0.9
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    backoff_factor: float = 2.0  # 指数退避因子
+    handle_think_tags: bool = True  # 处理``标签
+
+    # 不支持temperature的推理模型列表
+    REASONING_MODELS = ["o1", "o3-mini", "o4-mini", "o1-preview", "gpt-5"]
+
+    def supports_temperature(self, model_name: str = None) -> bool:
+        """检查模型是否支持temperature参数"""
+        check_model = model_name or self.model_name
+        return not any(reasoning_model in check_model for reasoning_model in self.REASONING_MODELS)
 
 
 class LLMClient(ABC):

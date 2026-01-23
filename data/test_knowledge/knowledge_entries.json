@@ -1,0 +1,29 @@
+{
+  "entries": [
+    {
+      "id": "test_1",
+      "content": "这是一个测试条目1",
+      "title": "测试条目1",
+      "category": "expert_knowledge",
+      "framework": "general",
+      "language": "general",
+      "metadata": {},
+      "embedding": null,
+      "created_at": "2026-01-09T05:40:11.446565",
+      "updated_at": "2026-01-09T05:40:06.089168"
+    },
+    {
+      "id": "test_2",
+      "content": "这是一个测试条目2",
+      "title": "测试条目2",
+      "category": "code_examples",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {},
+      "embedding": null,
+      "created_at": "2026-01-09T05:40:11.446578",
+      "updated_at": "2026-01-09T05:40:06.089179"
+    }
+  ],
+  "last_updated": "2026-01-09T05:40:11.446587"
+}

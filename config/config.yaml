@@ -20,30 +20,90 @@ paths:
 
 # LLM Configuration
 llm:
-  # Primary model for generation (DeepSeek models)
-  # Available models:
-  # - deepseek-chat: 通用对话模型，适合日常对话和文本生成
-  # - deepseek-reasoner: 推理增强模型，适合复杂推理和代码生成
-  primary_model: "deepseek-chat"
-  # Fallback models (暂时只支持DeepSeek)
-  fallback_models: ["deepseek-reasoner"]
-  # API keys configuration
+  # Primary model for generation
+  # Supported providers and models:
+  #
+  # DeepSeek:
+  #   - deepseek-chat: 通用对话模型
+  #   - deepseek-reasoner: 推理增强模型
+  #   - deepseek-coder: 代码生成模型
+  #
+  # OpenAI:
+  #   - gpt-4, gpt-4-turbo, gpt-4o, gpt-4o-mini
+  #   - o1, o1-preview, o3-mini, o4-mini (推理模型)
+  #
+  # 智谱AI (GLM):
+  #   - glm-4.7: 最新旗舰模型 (推荐)
+  #   - glm-4, glm-4-air, glm-4-flash, glm-3-turbo
+  #
+  # 自定义/本地:
+  #   - 使用 UniversalClient，需要配置 base_url
+  primary_model: "deepseek-reasoner"
+
+  # 快速模型 - 用于 repair 等需要快速响应的场景
+  # deepseek-reasoner: DeepSeek 推理模型（推荐用于修复，避免GLM并发限制）
+  # glm-4-flash: GLM 快速模型
+  # glm-4-air: GLM 中等速度，平衡性能
+  fast_model: "deepseek-reasoner"
+
+  # 可选: 自定义 API 端点 (如果需要)
+  # base_url: "https://your-custom-endpoint.com/v1"
+
+  # API keys configuration - 支持多个提供商
   keys:
+    # DeepSeek API Key
     deepseek_key: "sk-6b1ae1bdb0e24c0189f0f0e9db43a94a"
+
+    # OpenAI API Key (如果使用 OpenAI 模型)
+    # openai_key: "sk-your-openai-api-key"
+
+    # 智谱AI API Key (如果使用 GLM 模型)
+    # 获取方式: https://open.bigmodel.cn/usercenter/apikeys
+    glm_key: "357fccd9856d47a8856640683f6513f9.mWjMS8XVD6HEKYP3"  # 标准API Key格式
+
+    # 通用 API Key (用于自定义端点)
+    # api_key: "your-api-key"
+
   # Generation parameters
   generation:
-    temperature: 0.1
-    max_tokens: 4096
-    top_p: 0.9
+    temperature: 0.3
+    max_tokens: 9192  # 增加到16000以生成更完整的代码
+    top_p: 0.95
     frequency_penalty: 0.0
     presence_penalty: 0.0
+
   # Request parameters
-  timeout: 60
-  max_retries: 3
+  timeout: 120
+  max_retries: 6
+
   # Rate limiting
   rate_limit:
     requests_per_minute: 60
     tokens_per_minute: 100000
+
+  # 模型切换示例:
+  #
+  # 使用 DeepSeek:
+  #   primary_model: "deepseek-chat"
+  #   keys.deepseek_key: "sk-xxx"
+  #
+  # 使用 OpenAI GPT-4o:
+  #   primary_model: "gpt-4o"
+  #   keys.openai_key: "sk-xxx"
+  #
+  # 使用 智谱AI GLM-4.7:
+  #   primary_model: "glm-4.7"
+  #   keys.glm_key: "your-glm-api-key"
+  #
+  # 使用自定义/本地模型 (如 Ollama):
+  #   primary_model: "llama3"  # 或任何模型名
+  #   base_url: "http://localhost:11434/v1"
+  #   keys.api_key: "ollama"  # 某些服务可能不需要
+  #
+  # 使用 Azure OpenAI:
+  #   primary_model: "gpt-4"
+  #   base_url: "https://your-resource.openai.azure.com/openai/deployments/your-deployment"
+  #   keys.openai_key: "your-azure-api-key"
 
 # Knowledge Base Configuration
 knowledge_base:
@@ -52,7 +112,8 @@ knowledge_base:
     type: "chromadb"  # Options: chromadb, milvus, qdrant
     host: "localhost"
     port: 8001
-    collection: "api_knowledge"
+    collection: "llm_native_knowledge"  # 修复：与import_knowledge.py保持一致
+    persist_directory: "/app/data/knowledge/vector_cache"  # 修复：使用实际的ChromaDB数据目录
     # Embedding model
     embedding_model: "microsoft/unixcoder-base"
     # Retrieval settings
@@ -102,8 +163,9 @@ generator:
 
   # Compilation settings
   compilation:
-    clang_version: "18"
-    llvm_dir: "/usr/lib/llvm-18"
+    clang_version: "14"
+    llvm_dir: "/usr/lib/llvm-14"
+    clangd_path: "/usr/lib/llvm-14/bin/clangd"
     timeout_seconds: 300
 
 # Validation Configuration
@@ -194,5 +256,5 @@ development:
   enable_debug: false
   enable_profiling: false
   mock_llm_responses: false
-  use_cache: true
+  use_cache: false
   cache_dir: "/app/.cache"

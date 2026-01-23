@@ -1,0 +1,22 @@
+详细阅读并掌握项目LLM-Native（包括整个结构，配置，变量，功能等等），并且注意后续，项目在容器内运行，容器/app和此项目根目录挂载，实现代码热更新，你执行指令都在宿主机上看不到所需信息的。后面我若提交其中脚本执行的问题，给出诊断指令即可，你无法在容器运行，我会运行完把结果给你。
+
+分析，下面指令执行后完整工作流程：
+python3 ./src/main.py generate_detector \
+  --vulnerability_desc "buffer overflow" \
+  --target_framework clang \
+  --output_dir ./results \
+  --verbose
+
+python3 ./src/main.py generate_detector \
+  --vulnerability_desc "buffer overflow" \
+  --target_framework clang \
+  --output_dir ./results \
+  --verbose
+
+
+# 在容器内验证LLVM21环境
+llvm-config --version
+clang --version
+ls -la /usr/lib/llvm-21/include/clang/StaticAnalyzer/Core/
+
+

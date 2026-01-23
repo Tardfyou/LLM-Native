@@ -6,6 +6,9 @@ transformers>=4.40.0
 torch>=2.0.0
 accelerate>=0.20.0
 
+# Zhipu AI GLM SDK (官方SDK，用于调用GLM-4.7等模型)
+zai-sdk>=0.2.0
+
 # HuggingFace Hub for model downloads
 huggingface-hub>=0.23.0
 datasets>=2.15.0
@@ -17,6 +20,9 @@ chromadb>=0.4.0
 llama-index>=0.10.0
 langchain>=0.1.0
 langchain-community>=0.0.10
+langchain-openai>=0.0.8
+langchain-anthropic>=0.0.2
+langgraph>=0.0.32
 sentence-transformers>=2.2.0,<3.0.0
 faiss-cpu>=1.7.0
 instructor>=0.4.0
@@ -27,6 +33,8 @@ tree-sitter-cpp>=0.21.3
 tree-sitter-java>=0.21.3
 clang>=14.0.0
 pycparser>=2.21
+
+# LSP (Language Server Protocol) - 使用系统clangd
 
 # HTTP Client for LLM APIs
 httpx>=0.25.0
@@ -39,6 +47,7 @@ scikit-learn>=1.3.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 plotly>=5.15.0
+pydantic>=2.0.0
 
 # Web Framework & API
 fastapi>=0.104.0
@@ -55,6 +64,7 @@ python-dotenv>=1.0.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 html2text>=2020.1.16
+pyjwt>=2.8.0  # For GLM API JWT token generation
 
 # Testing & Quality
 pytest>=7.4.0
@@ -80,3 +90,6 @@ httpx>=0.25.0
 # Code Quality & Linting
 pylint>=3.0.0
 bandit>=1.7.0
+
+# CLI Tools
+fire>=0.7.0

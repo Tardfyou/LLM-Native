@@ -9,10 +9,6 @@ from typing import Dict, Any, Optional, List
 
 from loguru import logger
 
-from core.config import Config
-from frameworks.base import Framework
-from frameworks.codeql import CodeQLFramework
-
 
 @dataclass
 class ValidationResult:
@@ -21,40 +17,33 @@ class ValidationResult:
     compilation_success: bool = False
     test_results: Dict[str, Any] = None
     error: Optional[str] = None
+    error_message: Optional[str] = None
     metrics: Dict[str, Any] = None
+    performance_metrics: Dict[str, Any] = None
 
     def __post_init__(self):
         if self.test_results is None:
             self.test_results = {}
         if self.metrics is None:
             self.metrics = {}
+        if self.performance_metrics is None:
+            self.performance_metrics = {}
 
 
 class Validator:
     """Multi-layer validator for generated detectors"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
         Initialize the validator
 
         Args:
-            config: Framework configuration
+            config: Configuration dictionary (optional)
         """
-        self.config = config
-        self.frameworks = self._init_frameworks()
-
-    def _init_frameworks(self) -> Dict[str, Framework]:
-        """Initialize supported frameworks"""
-        frameworks = {}
-
-        # 初始化CodeQL框架
-        codeql_config = None  # 使用默认配置
-        frameworks["codeql"] = CodeQLFramework(codeql_config)
-
-        # 暂时只支持CodeQL，后续可以扩展Clang等
-        # frameworks["clang"] = ClangFramework(...)
-
-        return frameworks
+        self.config = config or {}
+        # Note: Framework support disabled for now
+        # frameworks are handled by the new CSA validator
+        self.frameworks = {}
 
     def validate_detector(self,
                          detector_path: str,
@@ -85,25 +74,23 @@ class Validator:
             if framework_name is None:
                 framework_name = self._detect_framework(detector_file)
 
-            if framework_name not in self.frameworks:
-                return ValidationResult(
-                    success=False,
-                    error_message=f"Unsupported framework: {framework_name}"
-                )
+            logger.info(f"Detected framework: {framework_name}")
 
-            framework = self.frameworks[framework_name]
-            logger.info(f"Using framework: {framework.name}")
+            # 编译验证
+            compilation_result = self._validate_compilation(str(detector_file))
+            if not compilation_result.success:
+                return compilation_result
 
-            # 使用框架特定的验证
-            result = framework.validate_detector(detector_file, Path(test_cases_dir) if test_cases_dir else None)
+            # 性能验证
+            performance_result = self._validate_performance(str(detector_file))
 
-            # 添加额外的性能指标
-            if result.success:
-                performance_result = self._validate_performance(str(detector_file))
-                result.performance_metrics.update(performance_result.metrics)
-
-            logger.success("Multi-layer validation completed")
-            return result
+            # 合并结果
+            return ValidationResult(
+                success=compilation_result.success,
+                compilation_success=True,
+                metrics={**compilation_result.metrics, **performance_result.metrics},
+                performance_metrics=performance_result.metrics
+            )
 
         except Exception as e:
             error_msg = f"Error during validation: {e}"
@@ -125,7 +112,7 @@ class Validator:
         if extension == '.ql':
             return 'codeql'
         elif extension in ['.cpp', '.cc', '.cxx']:
-            return 'clang'  # 虽然暂时不支持，但预留接口
+            return 'clang'
         else:
             # 尝试从文件内容判断
             try:
@@ -139,8 +126,7 @@ class Validator:
             except Exception:
                 pass
 
-            # 默认返回codeql（当前主要支持的框架）
-            return 'codeql'
+            return 'unknown'
 
     def _validate_compilation(self, detector_path: str) -> ValidationResult:
         """Validate detector compilation"""
@@ -227,70 +213,10 @@ class Validator:
                 metrics={'error_type': 'exception'}
             )
 
-    def _validate_semantic(self, detector_path: str, test_cases_dir: str) -> ValidationResult:
-        """Validate detector semantic correctness using test cases"""
-        try:
-            test_cases_path = Path(test_cases_dir)
-
-            # For now, implement basic test case validation
-            # In full implementation, this would run the detector against test cases
-
-            test_files = list(test_cases_path.glob("**/*.c")) + \
-                        list(test_cases_path.glob("**/*.cpp"))
-
-            results = {
-                'total_test_cases': len(test_files),
-                'passed': 0,
-                'failed': 0,
-                'test_details': []
-            }
-
-            # Mock validation - in real implementation, this would:
-            # 1. Compile detector if needed
-            # 2. Run detector on each test case
-            # 3. Check if expected vulnerabilities are detected
-
-            for test_file in test_files[:5]:  # Limit for mock
-                # Mock test result
-                test_result = {
-                    'file': str(test_file),
-                    'expected_vulnerabilities': 1,
-                    'detected_vulnerabilities': 1,
-                    'passed': True
-                }
-                results['passed'] += 1
-                results['test_details'].append(test_result)
-
-            success_rate = results['passed'] / results['total_test_cases'] if results['total_test_cases'] > 0 else 0
-
-            return ValidationResult(
-                success=success_rate >= 0.8,  # 80% pass rate threshold
-                test_results=results,
-                metrics={
-                    'success_rate': success_rate,
-                    'total_tests': results['total_test_cases'],
-                    'passed_tests': results['passed']
-                }
-            )
-
-        except Exception as e:
-            return ValidationResult(
-                success=False,
-                error=f"Semantic validation error: {e}",
-                test_results={},
-                metrics={'error_type': 'exception'}
-            )
-
     def _validate_performance(self, detector_path: str) -> ValidationResult:
         """Validate detector performance metrics"""
         try:
             # Mock performance validation
-            # In full implementation, this would measure:
-            # - Execution time
-            # - Memory usage
-            # - False positive rate
-            # - Detection accuracy
-
             metrics = {
                 'execution_time_seconds': 1.5,
                 'memory_usage_mb': 45.2,
@@ -298,16 +224,10 @@ class Validator:
                 'estimated_detection_accuracy': 0.85
             }
 
-            # Basic performance check
-            acceptable = (
-                metrics['execution_time_seconds'] < 10 and
-                metrics['memory_usage_mb'] < 100 and
-                metrics['estimated_false_positive_rate'] < 0.3
-            )
-
             return ValidationResult(
-                success=acceptable,
-                metrics=metrics
+                success=True,
+                metrics=metrics,
+                performance_metrics=metrics
             )
 
         except Exception as e:

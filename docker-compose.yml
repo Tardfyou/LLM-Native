@@ -18,8 +18,8 @@ services:
       - ./pretrained_models:/app/pretrained_models:ro  # 预训练模型挂载 (只读)
       - knowledge_data:/app/data/knowledge
       - benchmark_data:/app/data/benchmarks
-      - results:/app/results
-      - logs:/app/logs
+      - ./results:/app/results  # 改为本地目录绑定
+      - ./logs:/app/logs  # 改为本地目录绑定
     working_dir: /app
     command: ["python3", "-m", "uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
     depends_on:
@@ -38,8 +38,8 @@ services:
       - ./pretrained_models:/app/pretrained_models:cached  # 预训练模型挂载
       - knowledge_data:/app/data/knowledge
       - benchmark_data:/app/data/benchmarks
-      - results:/app/results
-      - logs:/app/logs
+      - ./results:/app/results  # 改为本地目录绑定，便于查看输出
+      - ./logs:/app/logs  # 改为本地目录绑定，便于查看日志
     environment:
       - PYTHONPATH=/app/src:/app
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
@@ -70,7 +70,23 @@ services:
       - CHROMA_SERVER_HTTP_PORT=8000
 
 
-  # Testing Service
+  # Clang Environment Testing Service
+  clang-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm_native_clang_test
+    volumes:
+      - .:/app:cached
+    environment:
+      - PYTHONPATH=/app/src:/app
+      - CLANG_TEST=1
+    working_dir: /app
+    command: ["python3", "scripts/test_clang_environment.py"]
+    profiles:
+      - clang-test
+
+  # General Testing Service
   test:
     build:
       context: .
@@ -90,7 +106,6 @@ volumes:
   framework_cache:
   knowledge_data:
   benchmark_data:
-  results:
-  logs:
+  # results 和 logs 改为本地目录绑定，不再使用 named volumes
   vector_db_data:
   test_results:

@@ -1,0 +1,326 @@
+{
+  "metadata": {
+    "category": "framework_api",
+    "total_entries": 20,
+    "source": "api_docs",
+    "collected_at": "2026-01-09T13:32:55.998256"
+  },
+  "entries": [
+    {
+      "id": "",
+      "content": "import os\nimport sys\nimport subprocess as sp\nimport pandas as pd\nimport shutil\nimport json\nimport re\nimport argparse\nimport numpy as np\nimport copy\nimport math\nimport random\n\nimport requests\nfrom tqdm import tqdm\nfrom tqdm.contrib.concurrent import thread_map\n\nTHIS_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))\nNEUROSYMSA_ROOT_DIR = os.path.abspath(f\"{THIS_SCRIPT_DIR}/../../\")\nsys.path.append(NEUROSYMSA_ROOT_DIR)\n\nfrom src.config import CODEQL_DIR, CODEQL_DB_PATH, OUTPUT_DIR, ALL_METHOD_INFO_DIR, PROJECT_SOURCE_CODE_DIR, CVES_MAPPED_W_COMMITS_DIR\n\n\nfrom src.logger import Logger\nfrom src.queries import QUERIES\nfrom src.prompts import API_LABELLING_SYSTEM_PROMPT, API_LABELLING_USER_PROMPT\nfrom src.prompts import FUNC_PARAM_LABELLING_SYSTEM_PROMPT, FUNC_PARAM_LABELLING_USER_PROMPT\nfrom src.prompts import POSTHOC_FILTER_SYSTEM_PROMPT, POSTHOC_FILTER_USER_PROMPT, POSTHOC_FILTER_HINTS, SNIPPET_CONTEXT_SIZE\nfrom src.codeql_queries import QL_SOURCE_PREDICATE, QL_STEP_PREDICATE, QL_SINK_PREDICATE\nfrom src.codeql_queries import EXTENSION_YML_TEMPLATE, EXTENSION_SRC_SINK_YML_ENTRY, EXTENSION_SUMMARY_YML_ENTRY\nfrom src.codeql_queries import QL_METHOD_CALL_SOURCE_BODY_ENTRY, QL_FUNC_PARAM_SOURCE_ENTRY, QL_FUNC_PARAM_NAME_ENTRY\nfrom src.codeql_queries import QL_SUMMARY_BODY_ENTRY, QL_BODY_OR_SEPARATOR\nfrom src.codeql_queries import QL_SINK_BODY_ENTRY, QL_SINK_ARG_NAME_ENTRY, QL_SINK_ARG_THIS_ENTRY\n\nfrom src.modules.codeql_query_runner import CodeQLQueryRunner\nfrom src.modules.evaluation_pipeline import EvaluationPipeline\n\n\nclass CodeQLSAPipeline:\n    def __init__(\n            self,\n            project_name: str,\n            query: str,\n            evaluation_only: bool = False,\n            overwrite: bool = False\n    ):\n        # Store basic information\n        self.project_name = project_name\n        self.query = query\n        self.evaluation_only = evaluation_only\n        self.overwrite = overwrite\n\n        # Setup logger\n        self.master_logger = Logger(f\"{NEUROSYMSA_ROOT_DIR}/log\")\n\n        # Check if the query is valid\n        if self.query in QUERIES:\n            if \"cwe_id\" not in QUERIES[self.query]:\n                self.master_logger.info(f\"Processing {self.project_name} (Query: {self.query}, Trial: {self.run_id})...\")\n                self.master_logger.error(f\"==> Query `{self.query}` is not a query for detecting CWE; aborting\"); exit(1)\n        else:\n            self.master_logger.info(f\"Processing {self.project_name} (Query: {self.query}, Trial: {self.run_id})...\")\n            self.master_logger.error(f\"==> Unknown query `{self.query}`; aborting\"); exit(1)\n        self.cwe_id = QUERIES[self.query][\"cwe_id\"]\n        self.experimental = QUERIES[self.query][\"experimental\"]\n        self.cve_id = project_name.split(\"_\")[3]\n\n        # Load some basic information, such as commits and fixes related to the CVE\n        self.all_cves_with_commit = pd.read_csv(CVES_MAPPED_W_COMMITS_DIR)\n        self.project_cve_with_commit_info = self.all_cves_with_commit[self.all_cves_with_commit[\"cve\"] == self.cve_id].iloc[0]\n        self.cve_fixing_commits = self.project_cve_with_commit_info[\"commits\"].split(\";\")\n        self.fixed_methods = pd.read_csv(ALL_METHOD_INFO_DIR)\n        self.project_fixed_methods = self.fixed_methods[self.fixed_methods[\"db_name\"] == self.project_name]\n        self.project_source_code_dir = f\"{PROJECT_SOURCE_CODE_DIR}/{self.project_name}\"\n\n        # Basic path information\n        self.project_output_path = f\"{OUTPUT_DIR}/{self.project_name}/common\"\n\n        # Setup codeql database path\n        self.project_codeql_db_path = f\"{CODEQL_DB_PATH}/{self.project_name}\"\n        if not os.path.exists(f\"{self.project_codeql_db_path}/db-java\"):\n            self.master_logger.info(f\"Processing {self.project_name} (Query: {self.query}...\")\n            self.master_logger.error(f\"==> Cannot find CodeQL database for {self.project_name}; aborting\"); exit(1)\n\n        # Setup query output path\n        self.query_output_path = f\"{self.project_output_path}/{self.query}\"\n        os.makedirs(self.query_output_path, exist_ok=True)\n        self.query_output_result_sarif_path = f\"{self.query_output_path}/results.sarif\"\n        self.query_output_result_csv_path = f\"{self.query_output_path}/results.csv\"\n        self.final_output_json_path = f\"{self.query_output_path}/results.json\"\n\n        # Function and Class locations\n        self.func_locs_path = f\"{self.project_output_path}/fetch_func_locs/results.csv\"\n        self.class_locs_path = f\"{self.project_output_path}/fetch_class_locs/results.csv\"\n\n    def run_codeql_query(self):\n        self.master_logger.info(\"==> Stage 1: Running CodeQL queries...\")\n\n        exp = \"experimental/\" if self.experimental else \"\"\n\n        cmd = [\n            \"codeql\",\n            \"database\",\n            \"analyze\",\n            self.project_codeql_db_path,\n            f\"--output={self.query_output_result_sarif_path}\",\n            f\"{CODEQL_DIR}/qlpacks/codeql/java-queries/0.8.3/{exp}Security/CWE/CWE-{self.cwe_id}/\"\n        ]\n\n        if self.overwrite:\n            cmd += [\"--rerun\"]\n\n        sp.run(cmd + [\"--format=sarif-latest\"])\n\n        sp.run(cmd + [\"--format=csv\"])\n\n    def run_simple_codeql_query(self, query, target_csv_path=None, suffix=None, dyn_queries={}):\n        runner = CodeQLQueryRunner(self.project_name, self.project_output_path, self.project_codeql_db_path, self.master_logger)\n        runner.run(query, target_csv_path, suffix, dyn_queries)\n\n    def extract_class_locations(self):\n        if not os.path.exists(self.class_locs_path):\n            self.master_logger.info(f\"  ==> Class locations not found; running CodeQL query to extract...\")\n            self.run_simple_codeql_query(\"fetch_class_locs\")\n\n    def extract_func_locations(self):\n        if not os.path.exists(self.func_locs_path):\n            self.master_logger.info(f\"  ==> Function locations not found; running CodeQL query to extract...\")\n            self.run_simple_codeql_query(\"fetch_func_locs\")\n\n    def build_evaluation_pipeline(self):\n        return EvaluationPipeline(\n            self.project_fixed_methods,\n            self.class_locs_path,\n            self.func_locs_path,\n            self.project_source_code_dir,\n            query_output_result_sarif_path=self.query_output_result_sarif_path,\n            final_output_json_path=self.final_output_json_path,\n            overwrite=self.overwrite,\n            project_logger=self.master_logger,\n        )\n\n    def evaluate_result(self):\n        self.master_logger.info(\"==> Stage 2: Evaluating results...\")\n\n        # 1. Extract class and function locations\n        self.master_logger.info(\"  ==> Extracting function and class locations...\")\n        self.extract_class_locations()\n        self.extract_func_locations()\n\n        # 2. Build\n        self.master_logger.info(\"  ==> Evaluating results...\")\n        eval_pipeline = self.build_evaluation_pipeline()\n        eval_pipeline.run_vanilla_only()\n\n    def run(self):\n        if self.evaluation_only:\n            self.evaluate_result()\n        else:\n            self.run_codeql_query()\n            self.evaluate_result()\n\n\nif __name__ == '__main__':\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"project\", type=str)\n    parser.add_argument(\"--query\", type=str, default=\"cwe-022wCodeQL\", required=True)\n    parser.add_argument(\"--overwrite\", action=\"store_true\")\n    parser.add_argument(\"--evaluation-only\", action=\"store_true\")\n    args = parser.parse_args()\n\n    pipeline = CodeQLSAPipeline(\n        args.project,\n        args.query,\n        evaluation_only=args.evaluation_only,\n        overwrite=args.overwrite,\n    )\n    pipeline.run()\n",
+      "title": "IRIS源码: CodeQL漏洞检测逻辑",
+      "category": "framework_api",
+      "framework": "codeql",
+      "language": "python",
+      "metadata": {
+        "source_file": "iris/src/codeql_vul.py",
+        "description": "CodeQL漏洞检测逻辑",
+        "source": "iris_source",
+        "file_type": "source_code",
+        "project": "iris"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.989580",
+      "updated_at": "2026-01-09T13:32:55.989586"
+    },
+    {
+      "id": "",
+      "content": "\n# Clang Static Analyzer Documentation\n\nClang Static Analyzer (CSA) 是Clang编译器框架的一部分，用于静态代码分析。\n\n## 主要组件\n\n### Checker 框架\n- **Checker基类**: 所有检查器的基类 `Checker<T>`\n- **CheckerContext**: 提供分析上下文和报告功能\n- **BugType**: 定义缺陷类型和报告格式\n\n### 核心API\n- **checkLocation()**: 检查内存位置访问\n- **checkBind()**: 检查变量绑定\n- **emitReport()**: 生成分析报告\n\n### 分析类型\n- **路径敏感分析**: 跟踪控制流和数据流\n- **区间分析**: 数值范围分析\n- **污点分析**: 跟踪不可信数据传播\n\n## 使用示例\n\n```cpp\nclass MyChecker : public Checker<check::Location> {\npublic:\n  void checkLocation(SVal l, bool isLoad, const Stmt* S,\n                     CheckerContext &C) const {\n    if (isNullPointer(l)) {\n      BugType BT{this, \"NullPointerDereference\"};\n      C.emitReport(BugType(BT, \"Dereference of null pointer\", N));\n    }\n  }\n};\n```\n\n更多详细信息请参考LLVM官方文档。\n                ",
+      "title": "Clang Static Analyzer Documentation",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "documentation",
+      "metadata": {
+        "source": "llvm_official",
+        "description": "Clang静态分析器的官方文档，包含所有API和使用方法",
+        "file_type": "official_documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990169",
+      "updated_at": "2026-01-09T13:32:55.990174"
+    },
+    {
+      "id": "",
+      "content": "\n# LLVM Programmer's Manual\n\nLLVM (Low Level Virtual Machine) 是现代编译器基础设施。\n\n## 核心概念\n\n### IR (Intermediate Representation)\n- **模块(Module)**: 编译单元\n- **函数(Function)**: 可调用单元\n- **基本块(BasicBlock)**: 指令序列\n- **指令(Instruction)**: 原子操作\n\n### 分析遍(Pass)\n- **函数遍**: 分析单个函数\n- **模块遍**: 分析整个模块\n- **循环遍**: 分析循环结构\n\n### 类型系统\n- **基本类型**: i32, float, double等\n- **复合类型**: 数组、结构体、指针\n- **函数类型**: 参数和返回值类型\n\n## API使用\n\n```cpp\n// 创建模块\nstd::unique_ptr<Module> module = std::make_unique<Module>(\"example\", context);\n\n// 创建函数\nFunctionType* funcType = FunctionType::get(Type::getVoidTy(context), false);\nFunction* func = Function::Create(funcType, Function::ExternalLinkage, \"main\", module.get());\n\n// 创建基本块\nBasicBlock* entry = BasicBlock::Create(context, \"entry\", func);\n\n// 添加指令\nReturnInst::Create(context, entry);\n```\n\n更多详细信息请参考LLVM官方文档。\n                ",
+      "title": "LLVM Programmer's Manual",
+      "category": "framework_api",
+      "framework": "llvm",
+      "language": "documentation",
+      "metadata": {
+        "source": "llvm_official",
+        "description": "LLVM程序员手册，包含核心库和API说明",
+        "file_type": "official_documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990181",
+      "updated_at": "2026-01-09T13:32:55.990186"
+    },
+    {
+      "id": "",
+      "content": "\n# CodeQL Query Language Specification\n\nCodeQL是一种用于代码分析的查询语言，基于Datalog逻辑编程。\n\n## 基本概念\n\n### 查询结构\n```ql\nfrom /* 数据源 */\nwhere /* 条件 */\nselect /* 结果 */\n```\n\n### 谓词(Predicate)\n- **类谓词**: 定义类和方法\n- **数据流谓词**: 分析数据流\n- **控制流谓词**: 分析控制流\n\n### 模块系统\n- **import语句**: 导入标准库\n- **module声明**: 定义可重用模块\n- **extends子句**: 继承现有模块\n\n## 数据流分析\n\n### 基本模式\n```ql\npredicate isSource(DataFlow::Node source) {\n  // 定义数据源\n  exists(FunctionCall fc |\n    fc.getTarget().getName() = \"gets\" and\n    source.asExpr() = fc\n  )\n}\n\npredicate isSink(DataFlow::Node sink) {\n  // 定义数据汇\n  exists(FunctionCall fc |\n    fc.getTarget().getName() = \"printf\" and\n    sink.asExpr() = fc.getArgument(0)\n  )\n}\n```\n\n### 配置模块\n```ql\nmodule Config implements DataFlow::ConfigSig {\n  predicate isSource = isSource/1;\n  predicate isSink = isSink/1;\n}\n\nmodule Flow = DataFlow::Global<Config>;\n```\n\n更多详细信息请参考CodeQL官方文档。\n                ",
+      "title": "CodeQL查询语言规范",
+      "category": "framework_api",
+      "framework": "codeql",
+      "language": "ql",
+      "metadata": {
+        "source": "codeql_official",
+        "description": "CodeQL查询语言的完整语法和语义规范",
+        "file_type": "documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990196",
+      "updated_at": "2026-01-09T13:32:55.990201"
+    },
+    {
+      "id": "",
+      "content": "\n# Clang Static Analyzer Checker框架\n\nChecker<T> 是所有静态分析检查器的基类模板，支持多种回调类型。\n\n## 继承方式\n```cpp\n// 基本继承\nclass MyChecker : public Checker<check::PreCall> {\npublic:\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n};\n\n// 多回调类型\nclass MyChecker : public Checker<check::PreCall, check::PostCall> {\npublic:\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n};\n```\n\n## 支持的回调类型\n- `check::PreCall` - 函数调用前检查\n- `check::PostCall` - 函数调用后检查\n- `check::PreStmt<T>` - 语句前检查（如ReturnStmt, IfStmt）\n- `check::PostStmt<T>` - 语句后检查\n- `check::Location` - 内存位置访问检查\n- `check::Bind` - 变量绑定检查\n- `check::EndFunction` - 函数结束检查\n- `check::EndAnalysis` - 分析结束检查\n- `check::BeginFunction` - 函数开始检查\n- `check::BranchCondition` - 分支条件检查\n- `check::NewAllocator` - 新分配器检查\n- `check::LiveSymbols` - 活符号检查\n- `check::DeadSymbols` - 死符号检查\n- `check::RegionChanges` - 区域变化检查\n- `check::PointerEscape` - 指针逃逸检查\n- `check::ConstPointerEscape` - 常量指针逃逸检查\n- `check::Event<ImplicitNullDerefEvent>` - 隐式空解引用事件\n- `check::ASTCodeBody` - AST代码体检查\n- `check::ASTDecl<T>` - AST声明检查\n            ",
+      "title": "Clang API: Checker基类体系",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "Checker基类体系",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990305",
+      "updated_at": "2026-01-09T13:32:55.990310"
+    },
+    {
+      "id": "",
+      "content": "\n# BugType和Bug报告API\n\n## BugType类\n用于定义缺陷类型和报告格式。\n\n```cpp\nclass BugType {\npublic:\n  BugType(const CheckerBase *Checker, StringRef Name,\n          StringRef Category = \"Logic error\",\n          bool SuppressOnSink = false);\n};\n```\n\n## 创建Bug报告\n```cpp\n// 简单Bug报告\nvoid reportBug(CheckerContext &C, const char *Message) const {\n  if (!BT) {\n    BT.reset(new BugType(this, \"MyBugType\", \"Memory Error\"));\n  }\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n  auto Report = std::make_unique<PathSensitiveBugReport>(*BT, Message, N);\n  C.emitReport(std::move(Report));\n}\n\n// 带位置信息的Bug报告\nvoid reportBugWithLocation(CheckerContext &C, const Stmt *S,\n                          const char *Message) const {\n  PathDiagnosticLocation Loc =\n    PathDiagnosticLocation::createBegin(S, C.getSourceManager(), C.getLocationContext());\n\n  auto Report = std::make_unique<PathSensitiveBugReport>(*BT, Message, N);\n  Report->setLocation(Loc);\n  C.emitReport(std::move(Report));\n}\n```\n\n## Bug报告增强功能\n```cpp\n// 添加范围高亮\nReport->addRange(Stmt->getSourceRange());\n\n// 添加额外诊断信息\nReport->addNote(Location, \"Additional diagnostic message\");\n\n// 修复建议\nReport->addFixItHint(FixItHint::CreateReplacement(\n  Stmt->getSourceRange(), \"suggested_fix()\"));\n```\n            ",
+      "title": "Clang API: BugType和Bug报告",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "BugType和Bug报告",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990317",
+      "updated_at": "2026-01-09T13:32:55.990323"
+    },
+    {
+      "id": "",
+      "content": "\n# Program State Management\n\n## 程序状态类\n```cpp\nclass ProgramState {\npublic:\n  // 获取约束管理器\n  ConstraintManager &getConstraintManager() const;\n\n  // 获取存储管理器\n  StoreManager &getStoreManager() const;\n\n  // 检查假设\n  ProgramStateRef assume(DefinedOrUnknownSVal Cond, bool Assumption) const;\n\n  // 设置存储值\n  ProgramStateRef setStore(Store St) const;\n\n  // 获取存储值\n  SVal getSVal(const MemRegion *R, QualType T = QualType()) const;\n  SVal getSVal(Loc L, QualType T = QualType()) const;\n};\n```\n\n## 状态注册\n```cpp\n// 注册状态跟踪\nREGISTER_MAP_WITH_PROGRAMSTATE(MyStateMap, const MemRegion *, MyStateInfo)\n\n// 自定义状态结构\nstruct MyStateInfo {\n  bool isInitialized = false;\n  const Stmt *initStmt = nullptr;\n\n  bool operator==(const MyStateInfo &Other) const {\n    return isInitialized == Other.isInitialized;\n  }\n\n  void Profile(llvm::FoldingSetNodeID &ID) const {\n    ID.AddBoolean(isInitialized);\n  }\n};\n```\n\n## 状态操作\n```cpp\n// 获取状态\nProgramStateRef State = C.getState();\nconst MyStateInfo *Info = State->get<MyStateMap>(Region);\n\n// 设置状态\nMyStateInfo NewInfo{/* ... */};\nState = State->set<MyStateMap>(Region, NewInfo);\nC.addTransition(State);\n\n// 移除状态\nState = State->remove<MyStateMap>(Region);\nC.addTransition(State);\n```\n            ",
+      "title": "Clang API: 程序状态管理",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "程序状态管理",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990329",
+      "updated_at": "2026-01-09T13:32:55.990335"
+    },
+    {
+      "id": "",
+      "content": "\n# SVal和MemRegion系统\n\n## SVal类型\n```cpp\nclass SVal {\npublic:\n  // 基本类型检查\n  bool isUnknown() const;\n  bool isUndef() const;\n  bool isUnknownOrUndef() const;\n  bool isValid() const;\n\n  // 具体类型转换\n  const DefinedOrUnknownSVal *castAs() const;\n  const DefinedSVal *castAs() const;\n  const KnownSVal *castAs() const;\n  const UnknownVal *castAs() const;\n  const UndefinedVal *castAs() const;\n  const Loc *castAs() const;\n  const NonLoc *castAs() const;\n};\n```\n\n## 内存区域类型\n```cpp\n// 基本区域类型\nclass MemRegion {\npublic:\n  virtual MemRegionManager *getMemRegionManager() const;\n  virtual const MemRegion *getBaseRegion() const;\n  virtual bool isSubRegionOf(const MemRegion *R) const;\n};\n\n// 具体区域类型\nclass SymbolicRegion : public SubRegion { /* 符号区域 */ };\nclass AllocaRegion : public SubRegion { /* 栈分配区域 */ };\nclass GlobalImmutableSpaceRegion : public MemSpaceRegion { /* 全局只读区域 */ };\nclass HeapSpaceRegion : public MemSpaceRegion { /* 堆区域 */ };\nclass StackLocalsSpaceRegion : public StackSpaceRegion { /* 栈局部变量区域 */ };\nclass StackArgumentsSpaceRegion : public StackSpaceRegion { /* 栈参数区域 */ };\n```\n\n## 区域操作\n```cpp\n// 获取内存区域\nconst MemRegion *MR = State->getSVal(Expr).getAsRegion();\n\n// 检查区域类型\nif (const SymbolicRegion *SymR = dyn_cast<SymbolicRegion>(MR)) {\n  // 处理符号区域\n}\n\n// 获取基区域\nconst MemRegion *BaseR = MR->getBaseRegion();\n\n// 区域比较\nif (MR1->isSubRegionOf(MR2)) {\n  // MR1是MR2的子区域\n}\n```\n\n## 符号值操作\n```cpp\n// 从表达式获取SVal\nSVal Val = C.getSVal(Expr);\n\n// 检查是否为特定值\nif (Val.isZeroConstant()) {\n  // 是零常量\n}\n\n// 转换为具体类型\nif (const nonloc::ConcreteInt *CI = Val.getAs()) {\n  llvm::APSInt IntVal = CI->getValue();\n  // 使用整数值\n}\n```\n            ",
+      "title": "Clang API: 符号值(SVal)和内存区域",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "符号值(SVal)和内存区域",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990341",
+      "updated_at": "2026-01-09T13:32:55.990347"
+    },
+    {
+      "id": "",
+      "content": "\n# Constraint Manager API\n\n## 基本接口\n```cpp\nclass ConstraintManager {\npublic:\n  virtual ProgramStateRef assume(ProgramStateRef State,\n                                DefinedSVal Cond,\n                                bool Assumption) = 0;\n\n  virtual const llvm::APSInt* getSymMaxVal(ProgramStateRef State,\n                                          SymbolRef Sym) const = 0;\n\n  virtual const llvm::APSInt* getSymMinVal(ProgramStateRef State,\n                                          SymbolRef Sym) const = 0;\n};\n```\n\n## 范围约束\n```cpp\n// 获取符号的最大值\nconst llvm::APSInt *MaxVal = State->getConstraintManager().getSymMaxVal(State, Sym);\n\n// 获取符号的最小值\nconst llvm::APSInt *MinVal = State->getConstraintManager().getSymMinVal(State, Sym);\n\n// 检查值是否在范围内\nbool isInRange(SymbolRef Sym, const llvm::APSInt &Val) {\n  const llvm::APSInt *Min = State->getConstraintManager().getSymMinVal(State, Sym);\n  const llvm::APSInt *Max = State->getConstraintManager().getSymMaxVal(State, Sym);\n\n  if (Min && Max) {\n    return Val >= *Min && Val <= *Max;\n  }\n  return false;\n}\n```\n\n## 假设操作\n```cpp\n// 假设条件为真\nProgramStateRef StateTrue = State->assume(Cond, true);\n\n// 假设条件为假\nProgramStateRef StateFalse = State->assume(Cond, false);\n\n// 分支分析\nif (StateTrue && StateFalse) {\n  // 条件可能为真也可能为假\n  // 需要分别分析两条路径\n} else if (StateTrue) {\n  // 条件总是为真\n} else if (StateFalse) {\n  // 条件总是为假\n}\n```\n            ",
+      "title": "Clang API: 约束管理器",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "约束管理器",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990354",
+      "updated_at": "2026-01-09T13:32:55.990359"
+    },
+    {
+      "id": "",
+      "content": "\n# AST Matchers API\n\n## 基本概念\nAST匹配器用于在Clang AST中查找特定的代码模式。\n\n```cpp\n// 包含头文件\n#include \"clang/ASTMatchers/ASTMatchers.h\"\n\n// 使用命名空间\nusing namespace clang::ast_matchers;\n```\n\n## 基本匹配器\n```cpp\n// 声明匹配器\nauto FuncDeclMatcher = functionDecl(hasName(\"malloc\")).bind(\"mallocCall\");\n\n// 语句匹配器\nauto ReturnMatcher = returnStmt(has(expr()))).bind(\"return\");\n\n// 表达式匹配器\nauto AssignMatcher = binaryOperator(hasOperatorName(\"=\")).bind(\"assignment\");\n```\n\n## 复合匹配器\n```cpp\n// 函数声明匹配器\nauto MallocFunction = functionDecl(\n  hasName(\"malloc\"),\n  parameterCountIs(1),\n  returns(pointerType())\n);\n\n// 调用表达式匹配器\nauto MallocCall = callExpr(\n  callee(MallocFunction),\n  argumentCountIs(1)\n);\n\n// 赋值语句匹配器\nauto MallocAssignment = binaryOperator(\n  hasOperatorName(\"=\"),\n  hasRHS(MallocCall)\n);\n```\n\n## 匹配器组合\n```cpp\n// 或操作\nauto MemoryFunction = functionDecl(anyOf(\n  hasName(\"malloc\"),\n  hasName(\"calloc\"),\n  hasName(\"realloc\")\n));\n\n// 与操作\nauto UnsafeMalloc = callExpr(\n  allOf(\n    callee(functionDecl(hasName(\"malloc\"))),\n    hasArgument(0, integerLiteral(equals(0)))\n  )\n);\n```\n\n## 使用匹配器\n```cpp\nvoid MyChecker::checkASTCodeBody(const Decl *D, AnalysisManager &AM,\n                                BugReporter &BR) const {\n  // 创建匹配器\n  auto Matcher = callExpr(callee(functionDecl(hasName(\"malloc\")))).bind(\"malloc\");\n\n  // 运行匹配\n  auto Matches = match(Matcher, *D, AM.getASTContext());\n\n  // 处理结果\n  for (const auto &Match : Matches) {\n    const CallExpr *Call = Match.getNodeAs<CallExpr>(\"malloc\");\n    // 报告问题\n  }\n}\n```\n            ",
+      "title": "Clang API: AST匹配器",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "AST匹配器",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990366",
+      "updated_at": "2026-01-09T13:32:55.990371"
+    },
+    {
+      "id": "",
+      "content": "\n# Path-Sensitive Analysis\n\n## ExplodedGraph概念\n```cpp\n// ExplodedNode表示程序的特定状态\nclass ExplodedNode {\npublic:\n  const ProgramState *getState() const;\n  const LocationContext *getLocationContext() const;\n  ExplodedNode *getPredecessor() const;\n  const Stmt *getStmt() const;\n};\n```\n\n## 节点操作\n```cpp\n// 创建新节点\nExplodedNode *NewNode = C.generateNonFatalErrorNode();\nExplodedNode *ErrorNode = C.generateFatalErrorNode();\n\n// 检查节点状态\nif (!Node) {\n  return; // 无法创建节点\n}\n\n// 获取节点信息\nconst ProgramState *State = Node->getState();\nconst LocationContext *LC = Node->getLocationContext();\nconst Stmt *CurrentStmt = Node->getStmt();\n```\n\n## 路径遍历\n```cpp\n// 遍历到当前节点的路径\nvoid traversePath(ExplodedNode *Node) {\n  for (ExplodedNode *N = Node; N; N = N->getPredecessor()) {\n    const Stmt *S = N->getStmt();\n    if (S) {\n      // 处理路径上的语句\n    }\n  }\n}\n\n// 检查路径条件\nbool isReachable(ExplodedNode *Node) {\n  // 检查是否存在到达该节点的路径\n  return Node->getPredecessor() != nullptr;\n}\n```\n\n## 分支处理\n```cpp\n// 处理条件分支\nProgramStateRef State = C.getState();\nSVal Condition = C.getSVal(CondExpr);\n\n// 假设条件为真\nProgramStateRef TrueState = State->assume(Condition, true);\nif (TrueState) {\n  ExplodedNode *TrueNode = C.generateNonFatalErrorNode(TrueState);\n  // 处理真分支\n}\n\n// 假设条件为假\nProgramStateRef FalseState = State->assume(Condition, false);\nif (FalseState) {\n  ExplodedNode *FalseNode = C.generateNonFatalErrorNode(FalseState);\n  // 处理假分支\n}\n```\n            ",
+      "title": "Clang API: 路径敏感分析",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "路径敏感分析",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990378",
+      "updated_at": "2026-01-09T13:32:55.990383"
+    },
+    {
+      "id": "",
+      "content": "\n# Utility Functions and Helpers\n\n## 字符串和类型操作\n```cpp\n// 检查类型\nbool isPointerType(QualType T) {\n  return T->isPointerType();\n}\n\nbool isArrayType(QualType T) {\n  return T->isArrayType();\n}\n\n// 获取类型信息\nQualType getPointeeType(QualType T) {\n  return T->getPointeeType();\n}\n\nStringRef getTypeName(QualType T) {\n  return T.getAsString();\n}\n```\n\n## 位置和范围\n```cpp\n// 获取源位置\nSourceLocation Loc = Stmt->getBeginLoc();\nSourceRange Range = Stmt->getSourceRange();\n\n// 检查位置有效性\nbool isValidLocation(SourceLocation Loc) {\n  return Loc.isValid();\n}\n\n// 获取文件名和行号\nStringRef FileName = SM.getFilename(Loc);\nunsigned LineNo = SM.getSpellingLineNumber(Loc);\n```\n\n## 符号和值操作\n```cpp\n// 检查符号类型\nbool isSymbol(SymbolRef Sym) {\n  return Sym && !Sym->isUnknown();\n}\n\n// 获取符号值\nconst llvm::APSInt *getSymbolValue(SymbolRef Sym, ProgramStateRef State) {\n  return State->getConstraintManager().getSymVal(State, Sym);\n}\n\n// 符号比较\nbool areEqual(SymbolRef Sym1, SymbolRef Sym2) {\n  return Sym1 == Sym2;\n}\n```\n\n## 容器和迭代器\n```cpp\n// 遍历函数参数\nvoid processFunctionParams(const FunctionDecl *FD) {\n  for (auto Param : FD->parameters()) {\n    // 处理每个参数\n  }\n}\n\n// 遍历语句子节点\nvoid processStmtChildren(const Stmt *S) {\n  for (const Stmt *Child : S->children()) {\n    // 处理每个子节点\n  }\n}\n```\n\n## 调试和日志\n```cpp\n// 调试输出\nvoid debugStmt(const Stmt *S, ASTContext &Ctx) {\n  S->dump(Ctx);\n}\n\nvoid debugType(QualType T) {\n  T.dump();\n}\n\n// 条件调试\n#ifndef NDEBUG\n#define DEBUG_STMT(S) (S)->dump(Ctx)\n#else\n#define DEBUG_STMT(S)\n#endif\n```\n            ",
+      "title": "Clang API: 实用工具和辅助函数",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "实用工具和辅助函数",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990390",
+      "updated_at": "2026-01-09T13:32:55.990395"
+    },
+    {
+      "id": "",
+      "content": "\n# Error Handling and Exception Safety\n\n## 异常安全检查\n```cpp\n// 检查是否在try块中\nbool isInTryBlock(const LocationContext *LC) {\n  for (const LocationContext *Ctx = LC; Ctx; Ctx = Ctx->getParent()) {\n    if (isa<CXXTryStmt>(Ctx->getDecl())) {\n      return true;\n    }\n  }\n  return false;\n}\n\n// 检查异常处理\nbool hasExceptionHandler(const CXXThrowExpr *Throw, CheckerContext &C) {\n  // 检查是否存在合适的catch块\n  // 实现细节...\n}\n```\n\n## 资源管理\n```cpp\n// 检查RAII模式\nbool usesRAII(const VarDecl *VD) {\n  QualType T = VD->getType();\n  if (const CXXRecordDecl *RD = T->getAsCXXRecordDecl()) {\n    // 检查是否有析构函数\n    return RD->hasUserDeclaredDestructor();\n  }\n  return false;\n}\n\n// 检查智能指针\nbool isSmartPointer(QualType T) {\n  StringRef TypeName = T.getAsString();\n  return TypeName.startswith(\"std::unique_ptr\") ||\n         TypeName.startswith(\"std::shared_ptr\") ||\n         TypeName.startswith(\"std::weak_ptr\");\n}\n```\n\n## 内存管理检查\n```cpp\n// 检查内存释放\nbool isMemoryDeallocated(const MemRegion *Region, ProgramStateRef State) {\n  // 检查区域是否已被释放\n  // 实现细节...\n}\n\n// 检查双重释放\nbool isDoubleFree(const MemRegion *Region, ProgramStateRef State) {\n  // 检查是否已被释放过\n  // 实现细节...\n}\n```\n\n## 断言和不变式\n```cpp\n// 添加运行时断言\nvoid addAssertion(ProgramStateRef State, const SVal &Val, bool Expected) {\n  // 在状态中添加断言\n  // 实现细节...\n}\n\n// 检查不变式\nbool checkInvariant(ProgramStateRef State, const MemRegion *Region) {\n  // 检查区域的不变式\n  // 实现细节...\n}\n```\n            ",
+      "title": "Clang API: 错误处理和异常安全",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "错误处理和异常安全",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990402",
+      "updated_at": "2026-01-09T13:32:55.990407"
+    },
+    {
+      "id": "",
+      "content": "\n# Performance Optimization and Memory Management\n\n## 内存池使用\n```cpp\n// 使用BumpPtrAllocator\nllvm::BumpPtrAllocator &Alloc = C.getAllocator();\n\n// 分配内存\nvoid *Ptr = Alloc.Allocate(Size, Alignment);\n\n// 注意：BumpPtrAllocator不会释放单个分配\n```\n\n## 缓存机制\n```cpp\n// 结果缓存\nclass ResultCache {\nprivate:\n  llvm::DenseMap<const Stmt *, AnalysisResult> Cache;\n\npublic:\n  const AnalysisResult *get(const Stmt *S) const {\n    auto It = Cache.find(S);\n    return It != Cache.end() ? &It->second : nullptr;\n  }\n\n  void set(const Stmt *S, const AnalysisResult &Result) {\n    Cache[S] = Result;\n  }\n};\n```\n\n## 增量分析\n```cpp\n// 检测变更\nbool hasChanged(const Decl *D, AnalysisManager &AM) {\n  // 检查声明是否在上次分析后改变\n  // 实现细节...\n}\n\n// 增量更新\nvoid updateAnalysis(const Decl *D, AnalysisManager &AM) {\n  if (hasChanged(D, AM)) {\n    // 只重新分析变更的部分\n    performIncrementalAnalysis(D);\n  }\n}\n```\n\n## 分析限制\n```cpp\n// 设置分析深度限制\nconst unsigned MaxDepth = 10;\nstatic unsigned CurrentDepth = 0;\n\nbool shouldContinueAnalysis() {\n  return CurrentDepth < MaxDepth;\n}\n\n// 超时控制\nbool hasTimedOut() {\n  auto CurrentTime = std::chrono::steady_clock::now();\n  auto Elapsed = CurrentTime - StartTime;\n  return Elapsed > MaxAnalysisTime;\n}\n```\n\n## 资源清理\n```cpp\n// 清理分析状态\nvoid cleanupAnalysis(CheckerContext &C) {\n  // 释放临时资源\n  // 重置缓存\n  // 清理状态\n}\n\n// 内存使用监控\nsize_t getMemoryUsage() {\n  // 获取当前内存使用量\n  // 实现细节...\n}\n\nbool shouldThrottleAnalysis() {\n  return getMemoryUsage() > MaxMemoryUsage;\n}\n```\n            ",
+      "title": "Clang API: 性能优化和内存管理",
+      "category": "framework_api",
+      "framework": "clang",
+      "language": "cpp",
+      "metadata": {
+        "api_name": "性能优化和内存管理",
+        "source": "clang_documentation",
+        "api_category": "core_api"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990414",
+      "updated_at": "2026-01-09T13:32:55.990419"
+    },
+    {
+      "id": "",
+      "content": "\n# CodeQL Data Flow Analysis API\n\n## 核心概念\n\n### DataFlow::Node\n数据流图中的节点，表示程序中的一个位置。\n\n```ql\nclass DataFlow::Node {\n  // 获取节点对应的表达式\n  Expr getExpr();\n\n  // 获取节点对应的AST节点\n  AstNode asAstNode();\n\n  // 检查节点是否有后继\n  predicate hasSuccessor(DataFlow::Node successor);\n\n  // 获取节点的字符串表示\n  string toString();\n}\n```\n\n### DataFlow::PathNode\n路径敏感数据流分析中的路径节点。\n\n```ql\nclass DataFlow::PathNode {\n  // 获取数据流节点\n  DataFlow::Node getNode();\n\n  // 获取路径图\n  DataFlow::PathGraph getPathGraph();\n\n  // 获取路径摘要\n  string getPathSummary();\n}\n```\n\n## 基本数据流分析\n\n### 简单数据流\n```ql\n// 导入数据流库\nimport semmle.code.java.dataflow.DataFlow\n\n// 定义配置\nmodule Config implements DataFlow::ConfigSig {\npredicate isSource(DataFlow::Node source) {\n    // 污染源：用户输入\n    exists(MethodCall mc |\n      mc.getMethod().getName() = \"getParameter\" and\n      source.asExpr() = mc\n  )\n}\n\npredicate isSink(DataFlow::Node sink) {\n    // 污染汇：SQL执行\n    exists(MethodCall mc |\n      mc.getMethod().getName() = \"executeQuery\" and\n      sink.asExpr() = mc.getArgument(0)\n    )\n  }\n}\n\n// 创建全局数据流\nmodule Flow = DataFlow::Global<Config>;\n\n// 查询数据流路径\nfrom Flow::PathNode source, Flow::PathNode sink\nwhere Flow::flowPath(source, sink)\nselect sink, source, sink,\n  \"Data flows from $@ to $@\",\n  source.getNode(), \"source\",\n  sink.getNode(), \"sink\"\n```\n\n### 局部数据流\n```ql\n// 在方法内跟踪数据流\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere\n  source.asExpr().(MethodCall).getMethod().getName() = \"getParameter\" and\n  sink.asExpr().(MethodCall).getMethod().getName() = \"executeQuery\" and\n  DataFlow::localFlow(source, sink)\nselect sink, \"Local data flow detected\"\n```\n\n### 跨过程数据流\n```ql\n// 跟踪跨函数的数据流\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere\n  source.asExpr().(MethodCall).getMethod().getName() = \"getParameter\" and\n  sink.asExpr().(MethodCall).getMethod().getName() = \"executeQuery\" and\n  DataFlow::flow(source, sink)\nselect sink, \"Inter-procedural data flow detected\"\n```\n            ",
+      "title": "CodeQL API: 数据流分析核心API",
+      "category": "framework_api",
+      "framework": "codeql",
+      "language": "ql",
+      "metadata": {
+        "api_name": "数据流分析核心API",
+        "source": "codeql_documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990430",
+      "updated_at": "2026-01-09T13:32:55.990436"
+    },
+    {
+      "id": "",
+      "content": "\n# CodeQL Taint Tracking API\n\n## 污点跟踪基础\n\n### 污点源 (Taint Sources)\n```ql\n// 基本污点源定义\npredicate isSource(DataFlow::Node source) {\n  // HTTP参数\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"getParameter\" and\n    source.asExpr() = mc\n  ) or\n  // 文件读取\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"readLine\" and\n    source.asExpr() = mc\n  ) or\n  // 环境变量\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"getenv\" and\n    source.asExpr() = mc\n  )\n}\n```\n\n### 污点汇 (Taint Sinks)\n```ql\n// 危险操作定义\npredicate isSink(DataFlow::Node sink) {\n  // SQL注入\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"executeQuery\" and\n    sink.asExpr() = mc.getArgument(0)\n  ) or\n  // 命令注入\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"exec\" and\n    sink.asExpr() = mc.getArgument(0)\n  ) or\n  // XSS\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"write\" and\n    mc.getReceiver().getType().getName() = \"HttpServletResponse\" and\n    sink.asExpr() = mc.getArgument(0)\n  )\n}\n```\n\n### 污点屏障 (Taint Barriers)\n```ql\n  // 净化函数定义\npredicate isSanitizer(DataFlow::Node node) {\n  // 输入验证\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"validateInput\" and\n    node.asExpr() = mc\n  ) or\n  // HTML编码\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"encodeForHTML\" and\n    node.asExpr() = mc\n  ) or\n  // SQL转义\n  exists(MethodCall mc |\n    mc.getMethod().getName() = \"escapeSql\" and\n    node.asExpr() = mc\n  )\n}\n```\n\n## 污点跟踪配置\n\n### 标准配置\n```ql\nmodule TaintConfig implements TaintTracking::ConfigSig {\n  predicate isSource = isSource/1;\n  predicate isSink = isSink/1;\n  predicate isBarrier = isSanitizer/1;\n}\n```\n\n### 自定义配置\n```ql\nmodule CustomTaintConfig implements TaintTracking::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // 自定义污点源逻辑\n    source.asExpr().(MethodCall).getMethod().getName() = \"getUserInput\"\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // 自定义污点汇逻辑\n    exists(MethodCall mc |\n      mc.getMethod().getName() = \"dangerousOperation\" and\n      sink.asExpr() = mc.getArgument(0)\n    )\n  }\n\n  predicate isBarrier(DataFlow::Node node) {\n    // 自定义屏障逻辑\n    node.asExpr().(MethodCall).getMethod().getName() = \"sanitize\"\n  }\n}\n```\n\n## 污点跟踪查询\n\n### 基本污点跟踪\n```ql\nmodule TaintFlow = TaintTracking::Global<TaintConfig>;\n\nfrom TaintFlow::PathNode source, TaintFlow::PathNode sink\nwhere TaintFlow::flowPath(source, sink)\nselect sink, source, sink,\n  \"Taint flows from $@ to $@\",\n  source.getNode(), \"source\",\n  sink.getNode(), \"sink\"\n```\n\n### 带步骤的污点跟踪\n```ql\nfrom TaintFlow::PathNode source, TaintFlow::PathNode sink\nwhere\n  TaintFlow::flowPath(source, sink) and\n  sink.getNode().asExpr().(MethodCall).getMethod().getName() = \"executeQuery\"\nselect sink,\n  \"SQL injection vulnerability: tainted data reaches SQL execution\"\n```\n\n### 局部污点跟踪\n```ql\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere\n  isSource(source) and\n  isSink(sink) and\n  TaintTracking::localTaint(source, sink)\nselect sink, \"Local taint flow detected\"\n```\n            ",
+      "title": "CodeQL API: 污点跟踪API",
+      "category": "framework_api",
+      "framework": "codeql",
+      "language": "ql",
+      "metadata": {
+        "api_name": "污点跟踪API",
+        "source": "codeql_documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990442",
+      "updated_at": "2026-01-09T13:32:55.990448"
+    },
+    {
+      "id": "",
+      "content": "\n# CodeQL Control Flow Analysis API\n\n## 控制流图 (CFG)\n\n### 基本块 (BasicBlock)\n```ql\nclass BasicBlock {\n  // 获取基本块的语句\n  Stmt getStmt(int index);\n\n  // 获取基本块的语句数量\n  int getStmtCount();\n\n  // 检查基本块是否为空\n  predicate isEmpty();\n}\n```\n\n### 控制流边 (Control Flow Edges)\n```ql\n// 从基本块A到基本块B的控制流\npredicate controlFlowEdge(BasicBlock pred, BasicBlock succ) {\n  // 实现细节...\n}\n\n// 获取基本块的前驱\nBasicBlock getAPredecessor(BasicBlock bb) {\n  exists(BasicBlock pred | controlFlowEdge(pred, bb) | result = pred)\n}\n\n// 获取基本块的后继\nBasicBlock getASuccessor(BasicBlock bb) {\n  exists(BasicBlock succ | controlFlowEdge(bb, succ) | result = succ)\n}\n```\n\n## 条件和分支\n\n### 条件语句\n```ql\n// 分析if语句\nfrom IfStmt ifs, Expr cond\nwhere cond = ifs.getCondition()\nselect ifs, cond, \"Conditional statement found\"\n\n// 分析条件表达式\nfrom ConditionalExpr condExpr\nselect condExpr,\n  condExpr.getCondition(),\n  condExpr.getTrueExpr(),\n  condExpr.getFalseExpr()\n```\n\n### 循环结构\n```ql\n// 分析for循环\nfrom ForStmt forLoop\nselect forLoop,\n  forLoop.getInit(),\n  forLoop.getCondition(),\n  forLoop.getUpdate(),\n  forLoop.getStmt()\n\n// 分析while循环\nfrom WhileStmt whileLoop\nselect whileLoop,\n  whileLoop.getCondition(),\n  whileLoop.getStmt()\n```\n\n### 异常处理\n```ql\n// 分析try-catch块\nfrom TryStmt tryStmt\nselect tryStmt,\n  tryStmt.getTryBlock(),\n  tryStmt.getCatchClause(0)  // 第一个catch块\n\n// 分析throw语句\nfrom ThrowExpr throwExpr\nselect throwExpr, throwExpr.getSubExpr()\n```\n\n## 路径敏感分析\n\n### 条件路径\n```ql\n// 检查特定路径上的条件\npredicate conditionHoldsOnPath(BasicBlock start, BasicBlock end, Expr condition) {\n  // 检查从start到end的路径上condition是否总是为真\n  // 实现细节...\n}\n\n// 可达性分析\npredicate isReachable(BasicBlock bb) {\n  exists(BasicBlock entry | isEntryBlock(entry) |\n    controlFlowEdge+(entry, bb))\n}\n```\n\n### 支配关系\n```ql\n// 支配关系：A支配B，如果所有到达B的路径都经过A\npredicate dominates(BasicBlock dominator, BasicBlock dominated) {\n  // 实现支配关系检查\n  // 实现细节...\n}\n\n// 严格支配\npredicate strictlyDominates(BasicBlock dominator, BasicBlock dominated) {\n  dominates(dominator, dominated) and dominator != dominated\n}\n```\n\n## 控制依赖\n\n### 后支配\n```ql\n// 后支配：A后支配B，如果所有离开B的路径都经过A\npredicate postDominates(BasicBlock postDominator, BasicBlock postDominated) {\n  // 实现后支配检查\n  // 实现细节...\n}\n```\n\n### 控制依赖边\n```ql\n// 基本块B控制依赖于基本块A，如果：\n// 1. A有一个后继A1和A2\n// 2. 从A1可达B，从A2可达B\n// 3. A1和A2都不支配B\npredicate controlDependent(BasicBlock control, BasicBlock dependent) {\n  exists(BasicBlock a1, BasicBlock a2 |\n    controlFlowEdge(control, a1) and\n    controlFlowEdge(control, a2) and\n    a1 != a2 and\n    isReachable(a1, dependent) and\n    isReachable(a2, dependent) and\n    not dominates(a1, dependent) and\n    not dominates(a2, dependent))\n}\n```\n            ",
+      "title": "CodeQL API: 控制流分析API",
+      "category": "framework_api",
+      "framework": "codeql",
+      "language": "ql",
+      "metadata": {
+        "api_name": "控制流分析API",
+        "source": "codeql_documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990455",
+      "updated_at": "2026-01-09T13:32:55.990460"
+    },
+    {
+      "id": "",
+      "content": "\n# CodeQL Query Language Fundamentals\n\n## 查询结构\n\n### 基本查询格式\n```ql\nfrom /* 变量声明 */\nwhere /* 条件过滤 */\nselect /* 结果选择 */\n```\n\n### 完整查询示例\n```ql\nfrom MethodCall mc, Method method\nwhere\n  mc.getMethod() = method and\n  method.getName() = \"executeQuery\" and\n  mc.getNumArgument() = 1\nselect mc, \"Found SQL execution call\"\n```\n\n## 谓词 (Predicates)\n\n### 谓词定义\n```ql\n// 无参数谓词\npredicate isJava() {\n  exists(File f | f.getExtension() = \"java\")\n}\n\n// 有参数谓词\npredicate hasMethod(Class c, string methodName) {\n  exists(Method m |\n    m.getDeclaringType() = c and\n    m.getName() = methodName\n  )\n}\n\n// 递归谓词\npredicate isInLoop(Stmt s) {\n  s instanceof LoopStmt or\n  exists(Stmt parent | isInLoop(parent) and parent = s.getParent())\n}\n```\n\n### 谓词调用\n```ql\nfrom Class c\nwhere hasMethod(c, \"toString\")\nselect c, \"Class has toString method\"\n```\n\n## 模块系统\n\n### 模块定义\n```ql\nmodule MyAnalysis {\n  // 私有谓词\n  predicate privateHelper() { ... }\n\n  // 导出的谓词\n  predicate isInteresting(Class c) { ... }\n}\n```\n\n### 模块导入\n```ql\nimport MyAnalysis\n\nfrom Class c\nwhere MyAnalysis::isInteresting(c)\nselect c\n```\n\n### 参数化模块\n```ql\nmodule AnalysisForMethod(string methodName) {\n  predicate callsMethod() {\n    exists(MethodCall mc |\n      mc.getMethod().getName() = methodName\n    )\n  }\n}\n\n// 使用参数化模块\nmodule StringAnalysis = AnalysisForMethod(\"String\");\n```\n\n## 类型系统\n\n### 基本类型\n```ql\n// 字符串\nstring getName() { result = \"example\" }\n\n// 整数\nint getCount() { result = 42 }\n\n// 布尔值\nboolean isValid() { result = true }\n\n// 浮点数\nfloat getRatio() { result = 3.14 }\n```\n\n### 类类型\n```ql\nclass MyClass extends @class {\n  string getName() { result = this.getStringValue() }\n  int getLine() { result = this.getLocation().getStartLine() }\n}\n```\n\n## 聚合操作\n\n### 计数\n```ql\n// 计算每个类的方发表数量\nfrom Class c\nselect c, count(Method m | m.getDeclaringType() = c)\n```\n\n### 求和\n```ql\n// 计算方法的总行数\nfrom Method m\nselect m, sum(int line | line = m.getLocation().getNumberOfLines())\n```\n\n### 平均值\n```ql\n// 计算平均方法长度\nselect avg(float lines |\n  exists(Method m | lines = m.getNumberOfLines())\n)\n```\n\n### 最小/最大值\n```ql\n// 找到最长的方法\nfrom Method m\nselect m, max(int lines | lines = m.getNumberOfLines())\n```\n\n## 字符串操作\n\n### 字符串连接\n```ql\nstring fullName() {\n  result = \"Method: \" + this.getName()\n}\n```\n\n### 字符串比较\n```ql\npredicate hasPrefix(string s, string prefix) {\n  s.prefixOf(prefix)\n}\n\npredicate hasSuffix(string s, string suffix) {\n  s.suffixOf(suffix)\n}\n```\n\n### 正则表达式\n```ql\npredicate matchesPattern(string s) {\n  s.regexpMatch(\"get.*\")\n}\n```\n\n## 递归查询\n\n### 递归谓词\n```ql\n// 计算继承深度\nint inheritanceDepth(Class c) {\n  if exists(Class super | super = c.getASupertype())\n  then 1 + max(int depth |\n    exists(Class super | super = c.getASupertype() |\n      depth = inheritanceDepth(super)\n    )\n  )\n  else 0\n}\n```\n\n### 传递闭包\n```ql\n// 传递闭包：所有子类\nClass getADescendant(Class c) {\n  result = c or\n  result = getADescendant(c.getASubtype())\n}\n```\n\n### 固定点计算\n```ql\n// 找到所有可能受污染的方法\npredicate tainted(Method m) {\n  // 直接调用污染源\n  exists(MethodCall mc |\n    mc.getCaller() = m and\n    tainted(mc.getCallee())\n  ) or\n  // 基础情况：直接调用污染源\n  exists(MethodCall mc |\n    mc.getCaller() = m and\n    isSource(mc.getCallee())\n  )\n}\n```\n            ",
+      "title": "CodeQL API: 查询语言基础",
+      "category": "framework_api",
+      "framework": "codeql",
+      "language": "ql",
+      "metadata": {
+        "api_name": "查询语言基础",
+        "source": "codeql_documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990467",
+      "updated_at": "2026-01-09T13:32:55.990472"
+    },
+    {
+      "id": "",
+      "content": "\n# CodeQL Standard Library and Built-in Predicates\n\n## 字符串库\n\n### 字符串操作\n```ql\n// 字符串长度\nint stringLength(string s) {\n  result = s.length()\n}\n\n// 子字符串\nstring substring(string s, int start, int end) {\n  result = s.substring(start, end)\n}\n\n// 字符串查找\nint indexOf(string s, string substr) {\n  result = s.indexOf(substr)\n}\n\n// 大小写转换\nstring toLowerCase(string s) {\n  result = s.toLowerCase()\n}\n\nstring toUpperCase(string s) {\n  result = s.toUpperCase()\n}\n\n// 字符串替换\nstring replaceAll(string s, string old, string new) {\n  result = s.replaceAll(old, new)\n}\n```\n\n### 正则表达式\n```ql\n// 正则匹配\npredicate regexpMatch(string s, string regex) {\n  s.regexpMatch(regex)\n}\n\n// 正则替换\nstring regexpReplaceAll(string s, string regex, string replacement) {\n  result = s.regexpReplaceAll(regex, replacement)\n}\n\n// 正则分组提取\nstring regexpCapture(string s, string regex, int group) {\n  result = s.regexpCapture(regex, group)\n}\n```\n\n## 集合操作\n\n### 列表操作\n```ql\n// 列表构造函数\nList[string] getStringList() {\n  result = [\"a\", \"b\", \"c\"]\n}\n\n// 列表连接\nList[string] concatLists(List[string] l1, List[string] l2) {\n  result = l1 + l2\n}\n\n// 列表长度\nint listLength(List[string] l) {\n  result = l.length()\n}\n\n// 列表索引访问\nstring getElement(List[string] l, int index) {\n  result = l.getElement(index)\n}\n```\n\n### 集合操作\n```ql\n// 集合构造函数\nSet[string] getStringSet() {\n  result = {\"a\", \"b\", \"c\"} as Set\n}\n\n// 集合并集\nSet[string] unionSets(Set[string] s1, Set[string] s2) {\n  result = s1.union(s2)\n}\n\n// 集合交集\nSet[string] intersectSets(Set[string] s1, Set[string] s2) {\n  result = s1.intersect(s2)\n}\n\n// 成员检查\npredicate inSet(string s, Set[string] set) {\n  set.contains(s)\n}\n```\n\n## 数学操作\n\n### 算术运算\n```ql\n// 基本运算\nint add(int x, int y) { result = x + y }\nint subtract(int x, int y) { result = x - y }\nint multiply(int x, int y) { result = x * y }\nint divide(int x, int y) { result = x / y }\nint modulo(int x, int y) { result = x % y }\n\n// 比较运算\nboolean equals(int x, int y) { result = x = y }\nboolean lessThan(int x, int y) { result = x < y }\nboolean greaterThan(int x, int y) { result = x > y }\n\n// 位运算\nint bitwiseAnd(int x, int y) { result = x & y }\nint bitwiseOr(int x, int y) { result = x | y }\nint bitwiseXor(int x, int y) { result = x ^ y }\nint shiftLeft(int x, int n) { result = x << n }\nint shiftRight(int x, int n) { result = x >> n }\n```\n\n### 统计函数\n```ql\n// 计数\nint countElements(Class c) {\n  result = count(Method m | m.getDeclaringType() = c)\n}\n\n// 求和\nint sumLines(Class c) {\n  result = sum(Method m |\n    m.getDeclaringType() = c and\n    result = m.getNumberOfLines()\n  )\n}\n\n// 平均值\nfloat avgLines(Class c) {\n  result = avg(Method m |\n    m.getDeclaringType() = c and\n    result = m.getNumberOfLines()\n  )\n}\n\n// 最大值\nint maxLines(Class c) {\n  result = max(Method m |\n    m.getDeclaringType() = c and\n    result = m.getNumberOfLines()\n  )\n}\n\n// 最小值\nint minLines(Class c) {\n  result = min(Method m |\n    m.getDeclaringType() = c and\n    result = m.getNumberOfLines()\n  )\n}\n```\n\n## 文件和位置操作\n\n### 文件操作\n```ql\n// 获取文件扩展名\nstring getFileExtension(File f) {\n  result = f.getExtension()\n}\n\n// 获取文件基本名\nstring getFileBaseName(File f) {\n  result = f.getBaseName()\n}\n\n// 检查文件是否存在\npredicate fileExists(string path) {\n  exists(File f | f.getAbsolutePath() = path)\n}\n```\n\n### 位置操作\n```ql\n// 获取位置信息\nint getStartLine(Location loc) {\n  result = loc.getStartLine()\n}\n\nint getEndLine(Location loc) {\n  result = loc.getEndLine()\n}\n\nint getStartColumn(Location loc) {\n  result = loc.getStartColumn()\n}\n\nint getEndColumn(Location loc) {\n  result = loc.getEndColumn()\n}\n\nstring getFilePath(Location loc) {\n  result = loc.getFile().getAbsolutePath()\n}\n```\n\n## 类型检查谓词\n\n### 类型关系\n```ql\n// 子类型检查\npredicate isSubtype(Type sub, Type sup) {\n  sub.getASupertype*() = sup\n}\n\n// 接口实现检查\npredicate implementsInterface(Class c, Interface i) {\n  c.getASupertype+() = i\n}\n\n// 方法覆盖检查\npredicate overrides(Method overriding, Method overridden) {\n  overriding.getName() = overridden.getName() and\n  overriding.getDeclaringType().getASupertype+() = overridden.getDeclaringType() and\n  overriding.getSignature() = overridden.getSignature()\n}\n```\n\n### 可见性检查\n```ql\npredicate isPublic(Method m) {\n  m.isPublic()\n}\n\npredicate isPrivate(Method m) {\n  m.isPrivate()\n}\n\npredicate isProtected(Method m) {\n  m.isProtected()\n}\n\npredicate isPackagePrivate(Method m) {\n  not (m.isPublic() or m.isPrivate() or m.isProtected())\n}\n```\n\n## 实用工具谓词\n\n### 调试和日志\n```ql\n// 字符串转换\nstring toString(Element e) {\n  result = e.toString()\n}\n\n// 类型名称\nstring getTypeName(Type t) {\n  result = t.getName()\n}\n\n// 限定名\nstring getQualifiedName(NamedElement e) {\n  result = e.getQualifiedName()\n}\n```\n            ",
+      "title": "CodeQL API: 标准库和内置谓词",
+      "category": "framework_api",
+      "framework": "codeql",
+      "language": "ql",
+      "metadata": {
+        "api_name": "标准库和内置谓词",
+        "source": "codeql_documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990479",
+      "updated_at": "2026-01-09T13:32:55.990485"
+    },
+    {
+      "id": "",
+      "content": "\n# CodeQL Extension Mechanisms and Custom Libraries\n\n## QL扩展机制\n\n### 自定义谓词库\n```ql\n// MySecurity.ql\nmodule MySecurity {\n  // 自定义安全相关谓词\n  predicate isSensitiveDataType(Type t) {\n    t.getName().regexpMatch(\".*(password|credit|ssn).*\")\n  }\n\n  predicate isEncryptionMethod(Method m) {\n    m.getName().regexpMatch(\".*(encrypt|hash|encode).*\")\n  }\n\n  predicate isDecryptionMethod(Method m) {\n    m.getName().regexpMatch(\".*(decrypt|unhash|decode).*\")\n  }\n}\n```\n\n### 数据扩展模型\n```ql\n// MyDataExtensions.qll\nmodule MyDataExtensions {\n  // 自定义数据流模型\n  class MySource extends DataFlow::Node {\n    MySource() {\n      // 自定义污染源定义\n      this.asExpr().(MethodCall).getMethod().getName() = \"getMyInput\"\n    }\n  }\n\n  class MySink extends DataFlow::Node {\n    MySink() {\n      // 自定义污染汇定义\n      this.asExpr().(MethodCall).getMethod().getName() = \"executeMyQuery\"\n    }\n  }\n}\n```\n\n## 模块化查询设计\n\n### 查询模块化\n```ql\n// BaseSecurity.ql - 基础安全模块\nmodule BaseSecurity {\n  predicate isUserInput(DataFlow::Node node) {\n    exists(MethodCall mc |\n      mc.getMethod().getName() in [\"getParameter\", \"readLine\", \"nextLine\"] and\n      node.asExpr() = mc\n    )\n  }\n\n  predicate isDangerousSink(DataFlow::Node node) {\n    exists(MethodCall mc |\n      mc.getMethod().getName() in [\"executeQuery\", \"exec\", \"eval\"] and\n      node.asExpr() = mc.getArgument(0)\n    )\n  }\n}\n\n// SpecificVulnerability.ql - 具体漏洞查询\nimport BaseSecurity\n\nmodule Config implements DataFlow::ConfigSig {\n  predicate isSource = BaseSecurity::isUserInput/1;\n  predicate isSink = BaseSecurity::isDangerousSink/1;\n}\n\nmodule Flow = DataFlow::Global<Config>;\n\nfrom Flow::PathNode source, Flow::PathNode sink\nwhere Flow::flowPath(source, sink)\nselect sink, source, sink, \"Data flow from user input to dangerous operation\"\n```\n\n## 自定义数据流模型\n\n### 摘要模型 (Summary Models)\n```ql\n// MyLibraryModels.qll\nmodule MyLibraryModels {\n  // 方法摘要：定义方法如何传播数据\n  predicate summaryModel(MethodCall mc, DataFlow::Node input, DataFlow::Node output) {\n    // 字符串连接方法\n    mc.getMethod().getName() = \"concat\" and\n    (input.asExpr() = mc.getArgument(0) or input.asExpr() = mc.getArgument(1)) and\n    output.asExpr() = mc\n  }\n\n  // 污染步骤：定义污染如何传播\n  predicate stepModel(MethodCall mc, DataFlow::Node input, DataFlow::Node output) {\n    // URL编码方法 - 认为输入已被清理\n    mc.getMethod().getName() = \"encodeURIComponent\" and\n    input.asExpr() = mc.getArgument(0) and\n    output.asExpr() = mc\n  }\n}\n```\n\n### 源/汇模型 (Source/Sink Models)\n```ql\n// MyExternalModels.qll\nmodule MyExternalModels {\n  // 自定义污染源\n  predicate sourceModel(DataFlow::Node node, string kind) {\n    // 第三方库的输入方法\n    exists(MethodCall mc |\n      mc.getReceiver().getType().getName() = \"ThirdPartyLibrary\" and\n      mc.getMethod().getName() = \"getInput\" and\n      node.asExpr() = mc and\n      kind = \"third-party-input\"\n    )\n  }\n\n  // 自定义污染汇\n  predicate sinkModel(DataFlow::Node node, string kind) {\n    // 危险的第三方库方法\n    exists(MethodCall mc |\n      mc.getReceiver().getType().getName() = \"DangerousLibrary\" and\n      mc.getMethod().getName() = \"execute\" and\n      node.asExpr() = mc.getArgument(0) and\n      kind = \"code-injection\"\n    )\n  }\n}\n```\n\n## 扩展YAML配置\n\n### 扩展包配置\n```yaml\n# qlpack.yml\nname: my-custom-queries\nversion: 1.0.0\nlibraryPathDependencies:\n  - codeql/java-all\n  - codeql/javascript-all\n\ndependencies:\n  - my/library/models: \"*\"\n```\n\n### 数据扩展配置\n```yaml\n# MyExtensions.yml\nextensions:\n  - addsTo:\n      pack: codeql/java-all\n      extensible: sourceModel\n    data:\n      - [\"my.package\", \"MyClass\", \"getInput\", \"\", \"third-party-input\"]\n\n  - addsTo:\n      pack: codeql/java-all\n      extensible: sinkModel\n    data:\n      - [\"my.package\", \"MyClass\", \"execute\", \"0\", \"code-injection\"]\n```\n\n## 自定义查询管道\n\n### 分析管道扩展\n```python\n# my_analysis_pipeline.py\nfrom codeql import AnalysisPipeline\n\nclass MyAnalysisPipeline(AnalysisPipeline):\n    def __init__(self):\n        super().__init__()\n        self.add_custom_models()\n\n    def add_custom_models(self):\n        # 添加自定义数据流模型\n        self.add_model_file(\"MyLibraryModels.qll\")\n        self.add_model_file(\"MyExternalModels.qll\")\n\n    def run_custom_analysis(self):\n        # 执行自定义分析步骤\n        self.run_query(\"MySecurity.ql\")\n        self.run_query(\"MyVulnerabilityChecks.ql\")\n\n# 使用自定义管道\npipeline = MyAnalysisPipeline()\npipeline.run_custom_analysis()\n```\n\n## 性能优化\n\n### 查询优化技巧\n```ql\n// 使用索引友好的谓词\nfrom Method m\nwhere m.getName() = \"toString\"  // 索引友好\nselect m\n\n// 避免笛卡尔积\nfrom Method m, Class c\nwhere m.getDeclaringType() = c  // 使用连接而不是笛卡尔积\nselect m, c\n```\n\n### 缓存和重用\n```ql\n// 缓存复杂计算结果\ncached predicate expensiveComputation(Class c) {\n  // 复杂计算，只执行一次\n  exists(Method m |\n    m.getDeclaringType() = c and\n    // 复杂条件...\n  )\n}\n\n// 重用计算结果\nfrom Class c\nwhere expensiveComputation(c)\nselect c\n```\n\n## 测试和验证\n\n### 单元测试\n```ql\n// MySecurityTest.ql\nimport MySecurity\n\nfrom Class c\nwhere MySecurity::isInteresting(c)\nselect c, \"Found interesting class for testing\"\n```\n\n### 集成测试\n```python\n# test_my_extensions.py\ndef test_my_extensions():\n    # 测试自定义扩展\n    results = run_codeql_query(\"MySecurity.ql\")\n    assert len(results) > 0, \"No results from custom security queries\"\n\n    # 验证扩展正确加载\n    assert model_loaded(\"MyLibraryModels\"), \"Custom models not loaded\"\n```\n\n## 最佳实践\n\n### 模块组织\n```\nMySecurityPack/\n├── qlpack.yml                    # 包配置\n├── MySecurity.ql                 # 主要查询\n├── models/                       # 数据模型\n│   ├── MyLibraryModels.qll\n│   └── MyExternalModels.qll\n├── queries/                      # 查询文件\n│   ├── CWE-089.ql               # SQL注入\n│   └── CWE-078.ql               # 命令注入\n└── tests/                       # 测试文件\n    ├── MySecurityTest.ql\n    └── test_my_extensions.py\n```\n\n### 命名约定\n- 模块名使用驼峰命名：`MySecurityModule`\n- 谓词名使用驼峰命名：`isSensitiveData`\n- 文件名使用驼峰命名：`MySecurityQueries.ql`\n- 测试文件名添加`Test`后缀：`MySecurityTest.ql`\n\n### 文档化\n```ql\n/**\n * MySecurity模块\n *\n * 提供自定义安全分析功能，包括：\n * - 敏感数据识别\n * - 危险操作检测\n * - 数据流分析扩展\n *\n * @author Your Name\n * @version 1.0.0\n * @since 2023-01-01\n */\nmodule MySecurity {\n  // 模块实现...\n}\n```\n            ",
+      "title": "CodeQL API: 扩展机制和自定义库",
+      "category": "framework_api",
+      "framework": "codeql",
+      "language": "ql",
+      "metadata": {
+        "api_name": "扩展机制和自定义库",
+        "source": "codeql_documentation"
+      },
+      "embedding": null,
+      "created_at": "2026-01-09T13:32:55.990491",
+      "updated_at": "2026-01-09T13:32:55.990497"
+    }
+  ]
+}
