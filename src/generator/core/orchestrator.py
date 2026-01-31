@@ -56,7 +56,11 @@ class GeneratorOrchestrator:
         llm_client = self.config.get("llm_client", None)
 
         return {
-            "analysis": AnalysisAgent(lsp_client=self.lsp_client),
+            "analysis": AnalysisAgent(
+                lsp_client=self.lsp_client,
+                prompt_manager=self.prompt_manager,
+                llm_client=llm_client  # 传入LLM客户端用于模式提取
+            ),
             "generation": GenerationAgent(
                 prompt_manager=self.prompt_manager,
                 lsp_client=self.lsp_client,
@@ -134,6 +138,9 @@ class GeneratorOrchestrator:
             # 第二阶段：知识检索
             await self._stage_knowledge_retrieval()
 
+            # 第二阶段半：基于RAG结果精化plan和pattern
+            await self._stage_plan_pattern_refinement()
+
             # 第三阶段：代码生成
             await self._stage_code_generation()
 
@@ -198,6 +205,9 @@ class GeneratorOrchestrator:
 
         analysis_result = await analysis_agent.execute_task(task_data)
 
+        # 保存分析结果到状态中，供后续修复阶段使用
+        self.current_state.analysis_result = analysis_result
+
         # 更新状态 - 根据分析类型处理结果
         analysis_type = analysis_result.get("analysis_type", "patch_based")
         inferred_type = None  # 初始化变量
@@ -248,7 +258,7 @@ class GeneratorOrchestrator:
 
         logger.debug(f"Knowledge retrieval query: {search_query[:100]}...")
 
-        # 检索相关知识
+        # 检索相关知识 - 增加top_k以获取更多Knighter示例
         knowledge_agent = self.agents["knowledge"]
         knowledge_result = await knowledge_agent.execute_task({
             "query": search_query,
@@ -257,7 +267,8 @@ class GeneratorOrchestrator:
                 "framework": self.current_state.input_data.framework,
                 "language": self.current_state.input_data.language
             },
-            "task_type": "knowledge_retrieval"
+            "task_type": "knowledge_retrieval",
+            "top_k": 3  # 增加到3以获取更多Knighter示例（pattern, plan, checker）
         })
 
         # 存储检索结果用于后续使用
@@ -269,12 +280,12 @@ class GeneratorOrchestrator:
 
         logger.info(f"Retrieved {len(knowledge_result.get('knowledge', []))} knowledge items")
 
-    async def _stage_code_generation(self):
-        """第三阶段：代码生成"""
-        logger.info("Stage 3: Code Generation")
-        self.current_state.update_stage("code_generation")
+    async def _stage_plan_pattern_refinement(self):
+        """第二阶段半：基于 patch 生成漏洞模式和实现计划（参考 RAG 范式）"""
+        logger.info("Stage 2.5: Plan/Pattern Generation (LLM-based with RAG paradigm)")
+        self.current_state.update_stage("plan_pattern_refinement")
 
-        # 修复：从 agent_messages 中获取检索到的知识
+        # 从知识检索阶段获取RAG结果（用于范式参考）
         retrieved_knowledge = []
         for msg in self.current_state.agent_messages:
             if msg.get("stage") == "knowledge_retrieval":
@@ -282,9 +293,84 @@ class GeneratorOrchestrator:
                 retrieved_knowledge = knowledge_result.get("knowledge", [])
                 break
 
-        logger.info(f"Using {len(retrieved_knowledge)} retrieved knowledge items for code generation")
+        # 收集 RAG 上下文（用于参考 Knighter 范式）
+        rag_context_list = []
+        if retrieved_knowledge:
+            logger.info(f"Collected {len(retrieved_knowledge)} RAG entries for paradigm reference")
 
-        # 生成初始代码 - 传递检索到的知识
+            for item in retrieved_knowledge:
+                entry = item.entry if hasattr(item, 'entry') else item
+                content = getattr(entry, 'content', '')
+                title = getattr(entry, 'title', '')
+                metadata = getattr(entry, 'metadata', {})
+
+                if content:
+                    rag_context_list.append({
+                        'title': title,
+                        'content': content,
+                        'metadata': metadata
+                    })
+
+        # 存储 RAG 上下文到状态中（供代码生成阶段使用）
+        self.current_state.rag_context = rag_context_list
+
+        # 调用 LLM 生成 pattern 和 plan（基于 patch，参考 RAG 范式）
+        logger.info("Generating pattern and plan from patch using LLM...")
+
+        generation_agent = self.agents["generation"]
+
+        # 构建生成任务
+        generation_task = {
+            "task_type": "generate_plan_pattern_from_patch",
+            "patch": self.current_state.input_data.patch,
+            "vulnerability_description": self.current_state.input_data.vulnerability_description,
+            "vulnerability_type": self.current_state.input_data.vulnerability_type,
+            "rag_context": rag_context_list  # 传递 RAG 上下文作为范式参考
+        }
+
+        # 调用 LLM 生成
+        generation_result = await generation_agent.execute_task(generation_task)
+
+        # 保存生成的 pattern 和 plan
+        generated_pattern = generation_result.get("pattern", "")
+        generated_plan = generation_result.get("plan", "")
+
+        self.current_state.vulnerability_pattern = generated_pattern
+        # 存储为 DetectionPlan 对象
+        self.current_state.detection_plan = DetectionPlan(
+            vulnerability_pattern=generated_pattern,
+            detection_strategy=generated_plan
+        )
+
+        logger.info(f"Pattern generated: {len(generated_pattern)} chars")
+        logger.info(f"Plan generated: {len(generated_plan)} chars")
+
+        # 存储到消息历史
+        self.current_state.agent_messages.append({
+            "stage": "plan_pattern_refinement",
+            "result": {
+                "pattern": generated_pattern,
+                "plan": generated_plan,
+                "rag_context_count": len(rag_context_list)
+            },
+            "timestamp": datetime.now().isoformat()
+        })
+
+        logger.info("Plan/Pattern generation completed")
+
+    async def _stage_code_generation(self):
+        """第三阶段：代码生成"""
+        logger.info("Stage 3: Code Generation")
+        self.current_state.update_stage("code_generation")
+
+        # 获取 RAG 上下文（已收集的完整 RAG 条目）
+        rag_context = getattr(self.current_state, 'rag_context', [])
+        vulnerability_pattern = self.current_state.vulnerability_pattern or ""
+
+        logger.info(f"Using vulnerability pattern ({len(vulnerability_pattern)} chars) for code generation")
+        logger.info(f"Using {len(rag_context)} RAG entries as reference context")
+
+        # 生成初始代码 - 传递漏洞模式和完整 RAG 上下文
         generation_agent = self.agents["generation"]
         generation_result = await generation_agent.execute_task({
             "analysis": {
@@ -293,9 +379,12 @@ class GeneratorOrchestrator:
                 "description_summary": {
                     "summary": self.current_state.input_data.vulnerability_description,
                     "technical_terms": []
-                }
+                },
+                # 漏洞模式
+                "vulnerability_pattern": vulnerability_pattern
             },
-            "retrieved_knowledge": retrieved_knowledge,  # 修复：传递检索到的知识
+            # 完整的 RAG 上下文（包含 pattern、plan、checker code 等）
+            "rag_context": rag_context,
             "task_type": "initial_generation"
         })
 
@@ -350,15 +439,31 @@ class GeneratorOrchestrator:
                 if issues_count > 5:
                     logger.warning(f"   ... and {issues_count - 5} more issue(s)")
 
-                # 修复代码
+                # 修复代码 - 传递上下文信息以保持对话历史
                 logger.info("")
                 logger.info(f"🔧 Attempting repair (Iteration {iter_num})...")
                 repair_agent = self.agents["repair"]
-                repair_result = await repair_agent.execute_task({
+
+                # 获取 RAG 上下文用于修复
+                rag_context = getattr(self.current_state, 'rag_context', [])
+                vulnerability_pattern = self.current_state.vulnerability_pattern or ""
+
+                repair_context = {
                     "code": self.current_state.generated_code,
                     "issues": validation_result["issues"],
-                    "task_type": "error_repair"
-                })
+                    "task_type": "error_repair",
+                    # 添加原始漏洞上下文
+                    "vulnerability_type": self.current_state.input_data.vulnerability_type,
+                    "vulnerability_description": self.current_state.input_data.vulnerability_description,
+                    # 使用漏洞模式
+                    "vulnerability_pattern": vulnerability_pattern,
+                    # 传递 RAG 上下文用于修复参考
+                    "rag_context": rag_context,
+                    # 如果有分析结果，也传递过去
+                    "analysis_context": getattr(self.current_state, 'analysis_result', None)
+                }
+
+                repair_result = await repair_agent.execute_task(repair_context)
 
                 # 更新代码
                 old_code = self.current_state.generated_code
@@ -385,8 +490,112 @@ class GeneratorOrchestrator:
             logger.warning("")
             logger.warning("=" * 60)
             logger.warning(f"⚠️  Reached maximum iterations ({max_iterations})")
-            logger.warning(f"   Code may still have issues")
+            logger.warning(f"   Attempting final verification and salvage...")
             logger.warning("=" * 60)
+
+            # 最终验证：尝试最后一次规则修复
+            await self._final_salvage_attempt(iteration)
+
+    async def _final_salvage_attempt(self, iteration: int):
+        """达到最大迭代次数后的最终挽救尝试"""
+        logger.info("")
+        logger.info("🔧 FINAL SALVAGE ATTEMPT")
+        logger.info("-" * 60)
+
+        # 获取最后一次验证结果
+        if not self.current_state.validation_results:
+            logger.warning("No validation results available for salvage")
+            return
+
+        last_validation = self.current_state.validation_results[-1]
+        remaining_issues = last_validation.errors + last_validation.warnings
+
+        if not remaining_issues:
+            logger.success("No remaining issues - code is salvageable")
+            return
+
+        logger.info(f"Remaining issues: {len(remaining_issues)}")
+
+        # 尝试最后一次规则修复（不带LLM，只使用规则）
+        repair_agent = self.agents["repair"]
+
+        # 提取上下文信息
+        vuln_desc = self.current_state.input_data.vulnerability_description
+        vuln_type = self.current_state.input_data.vulnerability_type
+        vuln_pattern = self.current_state.vulnerability_pattern or ""
+        rag_context = getattr(self.current_state, 'rag_context', [])
+        analysis_context = getattr(self.current_state, 'analysis_result', None)
+
+        salvage_context = {
+            "vulnerability_type": vuln_type or "",
+            "vulnerability_description": vuln_desc or "",
+            "vulnerability_pattern": vuln_pattern,
+            "analysis_context": analysis_context,
+            "attempt": iteration + 1
+        }
+
+        # 只使用规则修复（快速）
+        logger.info("Attempting rule-only salvage repair...")
+        repair_result = await repair_agent.execute_task({
+            "code": self.current_state.generated_code,
+            "issues": remaining_issues,
+            "task_type": "error_repair",
+            **salvage_context
+        })
+
+        if repair_result.get("code_changed", False):
+            self.current_state.generated_code = repair_result.get("repaired_code", self.current_state.generated_code)
+
+            # 最终验证
+            logger.info("Validating salvaged code...")
+            validation_agent = self.agents["validation"]
+            final_validation = await validation_agent.execute_task({
+                "code": self.current_state.generated_code,
+                "vulnerability_type": vuln_type or "",
+                "task_type": "full_validation"
+            })
+
+            self.current_state.add_validation_result(final_validation["validation_result"])
+
+            if final_validation.get("success", False):
+                logger.success("=" * 60)
+                logger.success("✅ SALVAGE SUCCESSFUL - Code compiled after final attempt!")
+                logger.success("=" * 60)
+            else:
+                remaining = len(final_validation.get("issues", []))
+                logger.warning(f"⚠️  Salvage partially successful - {remaining} issue(s) remain")
+        else:
+            logger.warning("⚠️  Salvage attempt did not change code")
+
+        # 生成诊断报告
+        self._generate_diagnostic_report(iteration, remaining_issues)
+
+    def _generate_diagnostic_report(self, iteration: int, issues: list):
+        """生成诊断报告用于调试"""
+        logger.info("")
+        logger.info("📋 DIAGNOSTIC REPORT")
+        logger.info("-" * 60)
+
+        # 按错误类型分组
+        error_types = {}
+        for issue in issues:
+            # 提取错误类型
+            if "error:" in issue:
+                error_msg = issue.split("error:", 1)[1].strip() if "error:" in issue else issue
+                error_type = error_msg.split()[0] if error_msg else "unknown"
+                error_types[error_type] = error_types.get(error_type, 0) + 1
+
+        logger.info("Remaining error breakdown:")
+        for error_type, count in sorted(error_types.items(), key=lambda x: -x[1])[:10]:
+            logger.info(f"  {error_type}: {count}")
+
+        # 建议
+        logger.info("")
+        logger.info("💡 RECOMMENDATIONS:")
+        logger.info("  1. Review the generated checker code for complex state tracking")
+        logger.info("  2. Consider simplifying to avoid REGISTER_MAP_WITH_PROGRAMSTATE")
+        logger.info("  3. Use SVal constraint checking instead of state maps where possible")
+        logger.info("  4. Check LLM output for hallucinated APIs (e.g., makeNull)")
 
     async def _stage_final_optimization(self):
         """第五阶段：最终优化"""
@@ -415,14 +624,21 @@ class GeneratorOrchestrator:
         if self.current_state.validation_results:
             final_validation = self.current_state.validation_results[-1]
 
+        # 使用存储的 detection_plan（如果有的话）
+        detection_plan = self.current_state.detection_plan
+        if not detection_plan:
+            # 如果没有生成 plan，使用默认值
+            vulnerability_pattern = self.current_state.vulnerability_pattern or ""
+            detection_plan = DetectionPlan(
+                vulnerability_pattern=vulnerability_pattern,
+                detection_strategy="static_analysis"
+            )
+
         return GenerationOutput(
             checker_code=self.current_state.generated_code,
             success=final_validation.success,
-            pattern=self.current_state.vulnerability_pattern,
-            plan=DetectionPlan(
-                vulnerability_pattern=self.current_state.vulnerability_pattern,
-                detection_strategy="static_analysis"
-            ),  # 从状态中提取
+            pattern=detection_plan.vulnerability_pattern or "",
+            plan=detection_plan,
             final_validation=final_validation,
             confidence_score=self.current_state.confidence_score,
             generation_time=self.current_state.get_elapsed_time(),

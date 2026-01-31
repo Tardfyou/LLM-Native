@@ -103,14 +103,30 @@ const llvm::APSInt *inferSymbolMinVal(SymbolRef Sym, CheckerContext &C) {
 }
 
 /// Infer if a symbol is equal to a specific value
-/// @param Sym The symbol to query
+/// @param Sym The symbol to query (SymExpr* in LLVM-21)
 /// @param Val The value to check against
 /// @param C The checker context
 /// @return true if the symbol is known to be equal to Val
+///
+/// ⚠️ LLVM-21 API NOTE: This is a simplified version.
+/// For production use with LLVM-21, prefer:
+/// - ProgramState::isNull() / isNonNull() for direct SVal checks
+/// - ConstraintManager API for symbolic value constraints
 bool isSymbolEqualTo(SymbolRef Sym, const llvm::APSInt &Val, CheckerContext &C) {
     ProgramStateRef State = C.getState();
-    const llvm::APSInt *KnownVal = State->getConstraintManager().getSymVal(State, Sym);
-    return KnownVal && *KnownVal == Val;
+
+    // LLVM-21: Use assume... methods instead of direct constraint inspection
+    DefinedOrUnknownSVal SymVal = C.getSValBuilder().makeSymbolVal(Sym);
+    if (SymVal.isUnknown())
+        return false;
+
+    // Try to prove equality via constraint assumption
+    ProgramStateRef StTrue, StFalse;
+    std::tie(StTrue, StFalse) = State->assume(SymVal, true);
+
+    // If symbol cannot be true, it's constrained to false (not equal to Val unless Val==0)
+    // This is a simplified approach - for complex cases, use full constraint analysis
+    return StFalse && !StTrue;
 }
 ```
 
@@ -460,18 +476,39 @@ bool isUndefined(SVal Val) {
 
 /// Check if a state has a constraint indicating null
 /// @param State The program state
-/// @param Sym The symbol to check
+/// @param Sym The symbol to check (SymExpr* in LLVM-21)
 /// @return true if the symbol is constrained to be null
+///
+/// ⚠️ LLVM-21 API NOTE: This is a simplified version.
+/// For production use, consider:
+/// - Using SValBuilder to create SVal from symbol, then check assumptions
+/// - Or using State->isNull() / isNonNull() for direct SVal checks
 bool isConstrainedNull(ProgramStateRef State, SymbolRef Sym) {
-    if (!Sym) return false;
+    if (!Sym || !State) return false;
 
-    // Check if symbol is constrained to equal 0
-    const llvm::APSInt *Zero = nullptr;
-    if (State->getConstraintManager().getSymVal(State, Sym, Zero)) {
-        return Zero && Zero->isZero();
-    }
+    // LLVM-21: Create SVal from symbol and use assume method
+    SValBuilder &SVB = C.getSValBuilder();
+    DefinedOrUnknownSVal SymVal = SVB.makeSymbolVal(Sym);
 
-    return false;
+    if (SymVal.isUnknown())
+        return false;
+
+    // Try to prove the value equals 0 (null)
+    llvm::APInt ZeroVal(32, 0);
+    DefinedOrUnknownSVal ZeroConst = SVB.makeIntConst(ZeroVal);
+
+    DefinedOrUnknownSVal EqualsZero = SVB.evalBinOp(
+        State, BO_EQ, SymVal, ZeroConst, SVB.getConditionType()
+    ).castAs<DefinedOrUnknownSVal>();
+
+    if (EqualsZero.isUnknown())
+        return false;
+
+    // Check if we can assume the value is zero
+    ProgramStateRef StTrue, StFalse;
+    std::tie(StTrue, StFalse) = State->assume(EqualsZero, true);
+
+    return StFalse && !StTrue;  // If it can't be true, it must be false (== 0)
 }
 
 /// Check if a state has a constraint indicating non-null

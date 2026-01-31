@@ -73,6 +73,8 @@ class GenerationState:
     iteration_count: int = 0                    # 迭代次数
     start_time: datetime = field(default_factory=datetime.now)
     last_update: datetime = field(default_factory=datetime.now)
+    analysis_result: Optional[Dict[str, Any]] = None  # 分析结果，供修复阶段使用
+    rag_context: List[Dict[str, Any]] = field(default_factory=list)  # RAG检索到的完整上下文
 
     def update_stage(self, new_stage: str):
         """更新阶段"""

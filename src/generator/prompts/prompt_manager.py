@@ -1,7 +1,7 @@
 """
 增强型提示词管理器 - 管理所有生成和修复的提示词模板
 
-支持：
+支持:
 1. 多种生成阶段的提示词模板
 2. 少样本示例加载和注入
 3. 自然语言漏洞描述和补丁两种输入模式
@@ -116,7 +116,8 @@ class EnhancedPromptManager:
                 "pattern_to_plan": self.template_dir / "pattern_to_plan.md",
                 "plan_to_checker": self.template_dir / "plan_to_checker.md",
                 "repair_syntax": self.template_dir / "repair_syntax.md",
-                "repair_semantic": self.template_dir / "repair_semantic.md"
+                "repair_semantic": self.template_dir / "repair_semantic.md",
+                "repair_knighter": self.template_dir / "repair_knighter.md"
             }
 
             for name, path in template_files.items():
@@ -195,7 +196,7 @@ class EnhancedPromptManager:
         构建模式提取提示词
 
         Args:
-            vulnerability_desc: 漏洞描述（自然语言或补丁）
+            vulnerability_desc: 漏洞描述(自然语言或补丁)
             context: 提示词上下文
             patch: 可选的补丁内容
             num_examples: 要包含的示例数量
@@ -225,7 +226,7 @@ class EnhancedPromptManager:
 
     def _select_examples_for_pattern(self, description: str, num: int) -> str:
         """选择最相关的示例用于模式提取"""
-        # 简单实现：返回前N个示例
+        # 简单实现: 返回前N个示例
         # 高级实现可以使用相似度匹配
         examples = list(self.examples.values())[:num]
         return self._format_pattern_examples(examples)
@@ -251,32 +252,62 @@ class EnhancedPromptManager:
         original_desc: Optional[str] = None,
         patch: Optional[str] = None,
         failed_plans: Optional[List[str]] = None,
-        no_tp_plans: Optional[List[str]] = None,  # 新增：无法检测TP的plans
-        no_fp_plans: Optional[List[str]] = None,  # 新增：无法正确处理FP的plans
-        num_examples: int = 2
+        no_tp_plans: Optional[List[str]] = None,  # 新增: 无法检测TP的plans
+        no_fp_plans: Optional[List[str]] = None,  # 新增: 无法正确处理FP的plans
+        num_examples: int = 2,
+        retrieved_knowledge: Optional[List] = None  # 新增: RAG检索的Knighter知识
     ) -> str:
         """
-        构建计划生成提示词 - 增强版，支持详细的反馈机制
+        构建计划生成提示词 - 增强版, 支持详细的反馈机制
 
         参考KNighter的agent.py pattern2plan实现:
         - 展示失败的plans作为负面示例
         - 区分无法检测TP和无法处理FP的plans
         - 限制反馈数量避免prompt过长
+        - 使用RAG检索的Knighter plan示例作为参考
 
         Args:
             bug_pattern: 提取的漏洞模式
             context: 提示词上下文
             original_desc: 原始漏洞描述
             patch: 可选的补丁
-            failed_plans: 之前失败的尝试（通用）
+            failed_plans: 之前失败的尝试(通用)
             no_tp_plans: 无法检测到目标漏洞的plans
             no_fp_plans: 正确标记非漏洞但有高误报的plans
             num_examples: 要包含的示例数量
+            retrieved_knowledge: RAG检索的Knighter知识
         """
         template = self.templates.get("pattern_to_plan", "")
 
-        # 选择相关示例
-        example_text = self._select_examples_for_plan(bug_pattern, num_examples)
+        # 格式化检索到的Knighter知识（优先使用RAG示例）
+        example_text = ""
+        if retrieved_knowledge:
+            example_text = "\n## Reference Plans from Knighter Database\n\n"
+            example_text += "Study these implementation plans from similar checkers:\n\n"
+
+            plan_count = 0
+            for item in retrieved_knowledge[:10]:
+                entry = item.entry if hasattr(item, 'entry') else item
+                metadata = getattr(entry, 'metadata', {})
+
+                if metadata.get('source') == 'knighter_checker_database':
+                    file_type = metadata.get('file_type', '')
+                    checker_name = metadata.get('checker_name', '')
+
+                    if file_type == 'implementation_plan' and plan_count < 3:
+                        content = getattr(entry, 'content', '')[:1500]
+                        example_text += f"### {checker_name} - Implementation Plan\n\n"
+                        example_text += f"{content}\n\n---\n\n"
+                        plan_count += 1
+
+            if plan_count > 0:
+                example_text += "\n**Follow the same style: numbered steps with bullet points (•) and specific API calls.**\n\n"
+            else:
+                # 回退到硬编码示例
+                example_text = self._select_examples_for_plan(bug_pattern, num_examples)
+        else:
+            # 回退到硬编码示例
+            example_text = self._select_examples_for_plan(bug_pattern, num_examples)
 
         # 构建增强的反馈部分 - 参考KNighter的实现
         feedback_section = self._build_feedback_section(failed_plans, no_tp_plans, no_fp_plans)
@@ -286,7 +317,7 @@ class EnhancedPromptManager:
         prompt = prompt.replace("{{utility_functions}}", self.utility_functions)
         prompt = prompt.replace("{{suggestions}}", self.suggestions)
         prompt = prompt.replace("{{checker_template}}", self.checker_template)
-        prompt = prompt.replace("{{examples}}", example_text)
+        prompt = prompt.replace("{{examples}}", example_text)  # 使用Knighter知识或硬编码示例
         prompt = prompt.replace("{{failed_plan_examples}}", feedback_section)
 
         # 处理可选字段
@@ -374,8 +405,8 @@ class EnhancedPromptManager:
         """
         构建代码生成提示词 - 支持两种调用方式
 
-        方式1（完整流水线）：build_code_generation_prompt(bug_pattern, implementation_plan, context, ...)
-        方式2（直接生成）：build_code_generation_prompt(vulnerability_type=..., framework=..., analysis_context=...)
+        方式1(完整流水线): build_code_generation_prompt(bug_pattern, implementation_plan, context, ...)
+        方式2(直接生成): build_code_generation_prompt(vulnerability_type=..., framework=..., analysis_context=...)
 
         Args:
             bug_pattern: 漏洞模式
@@ -384,18 +415,18 @@ class EnhancedPromptManager:
             original_desc: 原始描述
             patch: 可选的补丁
             num_examples: 要包含的示例数量
-            vulnerability_type: 漏洞类型（用于直接生成模式）
+            vulnerability_type: 漏洞类型(用于直接生成模式)
             framework: 目标框架
-            analysis_context: 分析上下文（用于直接生成模式）
+            analysis_context: 分析上下文(用于直接生成模式)
         """
-        # 检测调用方式：如果是直接生成模式
+        # 检测调用方式: 如果是直接生成模式
         if vulnerability_type is not None:
             return self._build_direct_generation_prompt(vulnerability_type, framework, analysis_context or {})
 
         # 否则使用完整的流水线模式
         template = self.templates.get("plan_to_checker", "")
 
-        # 选择相关示例（包含完整代码）
+        # 选择相关示例(包含完整代码)
         example_text = self._select_examples_for_code(bug_pattern, num_examples)
 
         # 构建提示词
@@ -417,7 +448,7 @@ class EnhancedPromptManager:
     def _build_direct_generation_prompt(self, vulnerability_type: str, framework: str,
                                        analysis_context: Dict[str, Any],
                                        retrieved_knowledge: Optional[List] = None) -> str:
-        """构建直接代码生成提示词（KNighter 风格）- 强调与具体漏洞的强相关性"""
+        """构建直接代码生成提示词(KNighter 风格) - 强调与具体漏洞的强相关性"""
         # 提取分析信息
         vuln_desc = analysis_context.get("description_summary", {}).get("summary", vulnerability_type)
         indicators = analysis_context.get("vulnerability_indicators", [])
@@ -430,19 +461,55 @@ class EnhancedPromptManager:
         utility_brief = self._get_utility_brief()
         suggestions_brief = self._get_suggestions_brief()
 
-        # 修复：格式化检索到的知识库内容
+        # 修复: 格式化检索到的知识库内容 - 特别处理Knighter示例
         knowledge_text = ""
         if retrieved_knowledge:
-            knowledge_text = "\n## Retrieved Knowledge (RAG)\n\n"
-            knowledge_text += "The following knowledge items were retrieved from the knowledge base and may help you understand similar vulnerabilities and detection patterns:\n\n"
-            for i, item in enumerate(retrieved_knowledge[:5], 1):  # 限制显示前5条
+            knowledge_text = "\n## Reference Examples from Knowledge Base (Knighter-style)\n\n"
+            knowledge_text += "The following are similar vulnerability detection patterns from Knighter database. Study them carefully:\n\n"
+
+            # 分类整理：pattern -> plan -> checker code
+            patterns = []
+            plans = []
+            checkers = []
+
+            for item in retrieved_knowledge[:10]:  # 获取更多示例以分类
                 entry = item.entry if hasattr(item, 'entry') else item
                 title = getattr(entry, 'title', 'Unknown')
-                content = getattr(entry, 'content', '')[:600]  # 限制长度
-                category = getattr(entry, 'category', 'general')
-                knowledge_text += f"**{i}. [{category}] {title}**\n"
-                knowledge_text += f"{content}...\n\n"
-            knowledge_text += "---\n\n"
+                content = getattr(entry, 'content', '')
+                category = getattr(entry, 'category', '')
+                metadata = getattr(entry, 'metadata', {})
+
+                # 根据Knighter数据结构分类
+                if metadata.get('source') == 'knighter_checker_database':
+                    file_type = metadata.get('file_type', '')
+                    checker_name = metadata.get('checker_name', '')
+
+                    if file_type == 'pattern_description':
+                        patterns.append((checker_name, title, content[:800]))
+                    elif file_type == 'implementation_plan':
+                        plans.append((checker_name, title, content[:1000]))
+                    elif file_type == 'checker_implementation':
+                        checkers.append((checker_name, title, content[:1500]))
+
+            # 按顺序展示：Pattern -> Plan -> Checker
+            if patterns:
+                knowledge_text += "### 📋 Vulnerability Patterns\n\n"
+                for name, title, content in patterns[:3]:
+                    knowledge_text += f"**Pattern: {name}**\n{content}\n\n---\n\n"
+
+            if plans:
+                knowledge_text += "### 📝 Implementation Plans\n\n"
+                for name, title, content in plans[:3]:
+                    knowledge_text += f"**Plan: {name}**\n{content}\n\n---\n\n"
+
+            if checkers:
+                knowledge_text += "### 💻 Checker Implementations\n\n"
+                for name, title, content in checkers[:2]:
+                    # 只显示核心部分（类定义和回调）
+                    code_preview = content[:2000]
+                    knowledge_text += f"**Checker: {name}**\n```cpp\n{code_preview}\n```\n\n---\n\n"
+
+            knowledge_text += "\n"
 
         # 构建提示词 - 强调与漏洞描述的强相关性
         prompt = f"""# Instruction
@@ -451,14 +518,22 @@ You are an expert in writing Clang Static Analyzer checkers using the **plugin-s
 
 Your task is to generate a **SPECIFIC, TARGETED checker** that detects **EXACTLY** the vulnerability described below.
 
-**CRITICAL REQUIREMENTS:**
+**Target Environment:** Clang-21 (LLVM-21)
 
-1. **MUST be directly related to the vulnerability description** - Do NOT generate generic utility checkers
-2. **Focus on the specific vulnerability pattern** - Every line of code should relate to detecting THIS vulnerability
-3. **DO NOT include generic utility functions** - Only include helpers that are ESSENTIAL for this specific vulnerability
-4. **Plugin-Style Architecture** - Use `clang_registerCheckers()`, NOT `BuiltinCheckerRegistration.h`
+## CRITICAL: Keep Code SIMPLE and CONCISE
 
-The version of the Clang environment is Clang-21.
+**CODE SIZE REQUIREMENT:** Generate 200-400 lines MAX, NOT 500+!
+
+**FOCUS RULES:**
+- ONLY implement callbacks necessary for the SPECIFIC vulnerability
+- DO NOT add generic features "just in case"
+- DO NOT implement complex alias tracking unless required
+- DO NOT use `REGISTER_MAP_WITH_PROGRAMSTATE` for simple checks
+
+**FOR SIMPLE NULL POINTER CHECKS:**
+- Use `check::PreCall` or `check::Location` callback
+- Check SVal constraints directly
+- Avoid complex state tracking with `REGISTER_MAP_WITH_PROGRAMSTATE`
 
 ## Target Vulnerability (THIS is what you MUST detect)
 
@@ -466,9 +541,9 @@ The version of the Clang environment is Clang-21.
 
 **Description:** {vuln_desc}
 
-**Key Indicators:** {', '.join(indicators) if indicators else 'None'}
+**Key Indicators:** {", ".join(indicators) if indicators else "None"}
 
-**Technical Terms:** {', '.join(technical_terms) if technical_terms else 'None'}
+**Technical Terms:** {", ".join(technical_terms) if technical_terms else "None"}
 
 {knowledge_text}{utility_brief}
 
@@ -477,26 +552,6 @@ The version of the Clang environment is Clang-21.
 # Examples
 
 {example_text}
-
-# CRITICAL: What NOT to Do
-
-❌ **DO NOT generate generic checkers like:**
-- "GenericChecker" that just logs function calls
-- "ExampleChecker" with placeholder detection logic
-- Checkers with TODO comments or "implement your logic here" placeholders
-- Checkers that copy entire utility.h or utility function collections
-
-✅ **DO generate SPECIFIC checkers like:**
-- "BufferOverflowChecker" that detects strcpy/memcpy without bounds checking
-- "UseAfterFreeChecker" that tracks freed pointers and detects their reuse
-- "NullDerefChecker" that checks pointer validity before dereference
-
-# What Your Checker MUST Do
-
-1. **Detect the EXACT vulnerability pattern described above**
-2. **Implement concrete detection logic** - No placeholders, no TODOs
-3. **Be compilable and ready to use** - Complete, working code
-4. **Keep it focused** (~50-200 lines) - Only what's needed for THIS vulnerability
 
 # Output Format
 
@@ -551,7 +606,72 @@ The following utility functions are available in `utility.h` (use: `#include "ut
 2. **Non-Fatal Errors**: Use `generateNonFatalErrorNode()` to allow finding multiple bugs
 3. **Short Messages**: Keep bug messages concise (e.g., "Potential buffer overflow on 'buf'")
 4. **Modern APIs (LLVM-21)**: Use `std::optional` instead of `llvm::Optional`, `dyn_cast_or_null` for potentially null pointers
-5. **Complete Code**: No TODO comments or placeholder logic"""
+5. **Complete Code**: No TODO comments or placeholder logic
+
+## CODE SIMPLICITY REQUIREMENT
+
+**KEEP CHECKER SIMPLE AND FOCUSED!**
+- Target: 200-400 lines of code (NOT 500+!)
+- Only implement callbacks that are NECESSARY for detecting the specific vulnerability
+- Avoid complex state tracking unless absolutely required
+- Focus on the SPECIFIC vulnerability pattern, not generic frameworks
+
+**For simple null pointer checks, AVOID:**
+- `REGISTER_MAP_WITH_PROGRAMSTATE` with MemRegion* keys (error-prone double pointer API)
+- Complex alias tracking
+- Multiple state maps
+
+**USE INSTEAD:**
+- Simple null checking with `checkBranchCondition`
+- Direct SVal constraint checking
+- Minimal state tracking
+
+## CRITICAL LLVM-21 Type Handling Rules (MUST FOLLOW)
+
+### Pointer Dereferencing (Most Common Error Source)
+
+**MANY types are pointers - you MUST dereference them:**
+
+```cpp
+// ❌ WRONG - method on pointer without dereference
+if (APSIntPtrVal.isZero()) ...
+if (MemRegionPtr->method()) ...
+
+// ✅ CORRECT - dereference with * or ->
+if (*APSIntPtrVal == 0) ...
+if (MemRegionPtr && MemRegionPtr->method()) ...
+
+// ✅ SAFEST - check null before dereference
+if (APSIntPtrVal && *APSIntPtrVal == 0) ...
+if (MemRegionPtr && MemRegionPtr->method()) { ... }
+```
+
+### std::optional Handling (getAsRegion, getAs)
+
+```cpp
+// ❌ WRONG - not checking if optional has value
+const MemRegion *MR = Val.getAsRegion();
+
+// ✅ CORRECT - proper optional handling
+if (auto MR = Val.getAsRegion(); MR && *MR) {
+    // Use *MR safely
+}
+```
+
+### No Deprecated APIs
+
+```cpp
+// ❌ WRONG - isZero() doesn't exist
+if (APSIntVal.isZero()) ...
+
+// ❌ WRONG - llvm::Optional is deprecated
+llvm::Optional<SVal> opt;
+
+// ✅ CORRECT
+if (*APSIntVal == 0) ...
+std::optional<SVal> opt = Val.getAs<SVal>();
+```
+"""
 
     def _select_examples_for_code_generation(self, vulnerability_type: str) -> str:
         """选择最相关的示例用于代码生成"""
@@ -577,7 +697,7 @@ The following utility functions are available in `utility.h` (use: `#include "ut
         return text
 
     def _select_examples_for_code(self, pattern: str, num: int) -> str:
-        """选择最相关的示例用于代码生成（包含完整代码）"""
+        """Select most relevant examples for code generation (including complete code)"""
         examples = list(self.examples.values())[:num]
         return self._format_code_examples(examples)
 
@@ -596,6 +716,161 @@ The following utility functions are available in `utility.h` (use: `#include "ut
             text += "\n```\n\n"
             text += "---\n\n"
         return text
+
+    def build_refine_plan_pattern_prompt(
+        self,
+        initial_pattern: str,
+        rag_pattern: Optional[str],
+        rag_plan: Optional[str],
+        rag_checker: Optional[str],
+        patch: Optional[str],
+        vulnerability_description: Optional[str],
+        vulnerability_type: Optional[str]
+    ) -> str:
+        """
+        构建精化plan和pattern的提示词
+
+        基于RAG检索到的Knighter示例，结合当前patch/vulnerability_description，
+        精化生成更准确的pattern和plan
+
+        Args:
+            initial_pattern: 初始分析得到的漏洞模式
+            rag_pattern: RAG检索到的Knighter pattern
+            rag_plan: RAG检索到的Knighter plan
+            rag_checker: RAG检索到的Knighter checker示例
+            patch: 原始patch
+            vulnerability_description: 漏洞描述
+            vulnerability_type: 漏洞类型
+
+        Returns:
+            精化prompt
+        """
+        prompt = """# Task: Refine Vulnerability Pattern and Implementation Plan
+
+You are given:
+1. An initial vulnerability pattern extracted from a patch
+2. Similar vulnerability patterns and implementation plans from Knighter (a high-quality static analyzer checker database)
+3. The original patch that needs to be detected
+
+Your task is to **refine and improve** the initial pattern and plan by incorporating insights from the Knighter examples, while keeping the content specific to the target patch.
+
+## Input Data
+
+### Initial Vulnerability Pattern (from patch analysis)
+```
+{initial_pattern}
+```
+
+### Target Patch (what we need to detect)
+```diff
+{patch}
+```
+
+### Vulnerability Description
+{vulnerability_description}
+
+### Vulnerability Type
+{vulnerability_type}
+
+## Knighter Reference Examples
+
+Study these examples carefully to understand the expected quality and style:
+
+### Knighter Vulnerability Pattern
+{rag_pattern_section}
+
+### Knighter Implementation Plan
+{rag_plan_section}
+
+### Knighter Checker Code (reference)
+{rag_checker_section}
+
+## Your Task
+
+Based on the Knighter examples above, create refined versions of the pattern and plan for the target vulnerability:
+
+### 1. Refined Vulnerability Pattern
+
+Write a clear, concise vulnerability pattern following the Knighter style:
+- Start with "## Bug Pattern" header
+- Describe the bug in 2-4 sentences
+- Include specific indicators of the vulnerability
+- Mention the dangerous operations or conditions
+
+Example format:
+```markdown
+## Bug Pattern
+
+[2-4 sentences describing the bug]
+
+Key indicators:
+- [specific indicator 1]
+- [specific indicator 2]
+- [specific indicator 3]
+```
+
+### 2. Refined Implementation Plan
+
+Write a detailed implementation plan following the Knighter style:
+- Use numbered steps (1. 2. 3...)
+- Use bullet points (•) for sub-items
+- Include specific API calls and function names
+- Be concrete and actionable
+
+Example format:
+```markdown
+### Implementation Plan
+
+1. [Step Name with Clear Purpose]
+   • [First specific action with API call]
+   • [Second specific action with API call]
+
+2. [Next Step Name]
+   • [Action description]
+   • [More details]
+
+3. [Continue with steps...]
+```
+
+## Output Format
+
+Provide your output in this exact format:
+
+```markdown
+## Refined Vulnerability Pattern
+
+[Your refined pattern here]
+
+## Refined Implementation Plan
+
+[Your refined plan here]
+```
+
+**Important Guidelines:**
+- Follow the Knighter style shown in the examples
+- Keep content specific to the target patch (don't just copy Knighter)
+- Make the plan concrete and implementable
+- Use specific Clang Static Analyzer API names
+- Include actual callback names and method calls
+
+Generate the refined pattern and plan now:"""
+
+        # 填充模板
+        rag_pattern_section = f"```{rag_pattern}```" if rag_pattern else "(No Knighter pattern available)"
+        rag_plan_section = f"```\n{rag_plan}\n```" if rag_plan else "(No Knighter plan available)"
+        rag_checker_section = f"```cpp\n{rag_checker}\n```" if rag_checker else "(No Knighter checker available)"
+
+        prompt = prompt.format(
+            initial_pattern=initial_pattern,
+            patch=patch or "No patch provided",
+            vulnerability_description=vulnerability_description or "No description provided",
+            vulnerability_type=vulnerability_type or "Unknown",
+            rag_pattern_section=rag_pattern_section,
+            rag_plan_section=rag_plan_section,
+            rag_checker_section=rag_checker_section
+        )
+
+        return prompt
 
     # ========================================================================
     # 修复阶段
@@ -651,7 +926,7 @@ The following utility functions are available in `utility.h` (use: `#include "ut
             bug_pattern: 漏洞模式
             implementation_plan: 实现计划
             context: 提示词上下文
-            issues: 问题字典（false_positives, false_negatives, crashes）
+            issues: 问题字典(false_positives, false_negatives, crashes)
             reference_patch: 参考补丁
             working_example: 工作示例代码
         """
@@ -708,7 +983,7 @@ The following utility functions are available in `utility.h` (use: `#include "ut
         end_unless_pattern = r"{{{/unless}}}"
 
         if condition:
-            # 保留 if 块内容，移除 unless 块
+            # 保留 if 块内容, 移除 unless 块
             result = template.replace(if_pattern, "")
             result = result.replace(end_if_pattern, "")
 
@@ -722,7 +997,7 @@ The following utility functions are available in `utility.h` (use: `#include "ut
             for key, value in kwargs.items():
                 result = result.replace(f"{{{{ {key} }}}}", value)
         else:
-            # 移除 if 块，保留 unless 块内容（如果存在）
+            # 移除 if 块, 保留 unless 块内容(如果存在)
             if_match = re.search(rf"{{{{#if {name}}}}}.*?{{{{/if}}}}",
                                template, flags=re.DOTALL)
             if if_match:
@@ -736,7 +1011,7 @@ The following utility functions are available in `utility.h` (use: `#include "ut
         return result
 
     def get_prompt_hash(self, prompt: str) -> str:
-        """获取提示词的哈希值，用于缓存"""
+        """获取提示词的哈希值, 用于缓存"""
         return hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
     def save_prompt_history(
@@ -812,7 +1087,7 @@ def get_default_prompt_manager() -> EnhancedPromptManager:
 
 # 保持向后兼容 - 旧的 PromptManager 类
 class PromptManager:
-    """向后兼容的提示词管理器（委托给 EnhancedPromptManager）"""
+    """向后兼容的提示词管理器(委托给 EnhancedPromptManager)"""
 
     def __init__(self, template_dir: Optional[Path] = None):
         self._enhanced = EnhancedPromptManager(template_dir)
@@ -840,8 +1115,17 @@ class PromptManager:
 
     def build_code_generation_prompt(self, vulnerability_type: str, framework: str,
                                    analysis_context: Dict[str, Any],
+                                   rag_context: Optional[List] = None,
                                    retrieved_knowledge: Optional[List] = None) -> str:
-        """构建代码生成提示词 - KNighter 风格，使用插件式架构"""
+        """构建代码生成提示词 - KNighter 风格, 使用插件式架构
+
+        Args:
+            rag_context: 新参数 - RAG 检索到的完整上下文（包含 pattern、plan、code）
+            retrieved_knowledge: 旧参数 - 向后兼容
+        """
+        # 支持 rag_context (新) 和 retrieved_knowledge (旧) 两种参数名
+        context_items = rag_context or retrieved_knowledge or []
+
         # 加载知识库内容
         utility_functions = self.utility_functions if self.utility_functions else ""
         suggestions = self.suggestions if self.suggestions else ""
@@ -855,19 +1139,39 @@ class PromptManager:
         # 选择最相关的示例
         example_text = self._select_examples_for_code_generation(vulnerability_type)
 
-        # 修复：格式化检索到的知识库内容
+        # 格式化 RAG 上下文 - 完整的 Knighter 条目（包含 pattern、plan、code）
         knowledge_text = ""
-        if retrieved_knowledge:
-            knowledge_text = "\n# Retrieved Knowledge (RAG)\n\n"
-            knowledge_text += "The following knowledge items were retrieved from the knowledge base and may help you understand similar vulnerabilities and detection patterns:\n\n"
-            for i, item in enumerate(retrieved_knowledge[:5], 1):  # 限制显示前5条
-                entry = item.entry if hasattr(item, 'entry') else item
-                title = getattr(entry, 'title', 'Unknown')
-                content = getattr(entry, 'content', '')[:800]  # 限制长度
-                category = getattr(entry, 'category', 'general')
-                knowledge_text += f"**{i}. [{category}] {title}**\n"
-                knowledge_text += f"{content}...\n\n"
-            knowledge_text += "---\n\n"
+        if context_items:
+            knowledge_text = "\n# Reference Examples from Knighter Database\n\n"
+            knowledge_text += "The following are complete examples from Knighter's checker database. "
+            knowledge_text += "Each example includes the vulnerability pattern, implementation plan, and checker code. "
+            knowledge_text += "Study these to understand the structure and approach:\n\n"
+
+            for i, item in enumerate(context_items[:5], 1):
+                # 如果是字典格式（新 RAG 上下文）
+                if isinstance(item, dict):
+                    title = item.get('title', 'Unknown')
+                    content = item.get('content', '')
+                    metadata = item.get('metadata', {})
+                    knowledge_text += f"**{i}. {title}**\n"
+                    knowledge_text += f"Source: {metadata.get('source', 'unknown')}\n\n"
+                    # 限制长度但保留关键部分
+                    if len(content) > 2000:
+                        content = content[:2000] + "\n... (truncated)"
+                    knowledge_text += f"{content}\n\n"
+                else:
+                    # 如果是旧格式（带 entry 属性）
+                    entry = item.entry if hasattr(item, 'entry') else item
+                    title = getattr(entry, 'title', 'Unknown')
+                    content = getattr(entry, 'content', '')
+                    metadata = getattr(entry, 'metadata', {})
+                    knowledge_text += f"**{i}. {title}**\n"
+                    knowledge_text += f"Source: {metadata.get('source', 'unknown')}\n\n"
+                    if len(content) > 2000:
+                        content = content[:2000] + "\n... (truncated)"
+                    knowledge_text += f"{content}\n\n"
+
+                knowledge_text += "---\n\n"
 
         # 构建 KNighter 风格的提示词
         prompt = f"""# Instruction
@@ -890,9 +1194,9 @@ The version of the Clang environment is Clang-21. You should consider the API co
 
 **Description:** {vuln_desc}
 
-**Key Indicators:** {', '.join(indicators) if indicators else 'None'}
+**Key Indicators:** {", ".join(indicators) if indicators else "None"}
 
-**Technical Terms:** {', '.join(technical_terms) if technical_terms else 'None'}
+**Technical Terms:** {", ".join(technical_terms) if technical_terms else "None"}
 
 {knowledge_text}{utility_functions}
 
@@ -952,6 +1256,183 @@ Generate the checker code now:"""
 
     def build_code_repair_prompt(self, original_code: str, issues: List[str]) -> str:
         return f"Fix issues in:\n{original_code}\n\nIssues:\n{chr(10).join(issues)}"
+
+    def build_plan_pattern_generation_prompt(
+        self,
+        patch: str,
+        vulnerability_description: str,
+        vulnerability_type: str,
+        rag_context: Optional[List] = None
+    ) -> str:
+        """
+        构建 patch 到 pattern/plan 的生成提示词
+        参考 Knighter 的范式模板
+
+        Args:
+            patch: 代码补丁
+            vulnerability_description: 漏洞描述
+            vulnerability_type: 漏洞类型
+            rag_context: RAG 检索的 Knighter 上下文（作为范式参考）
+
+        Returns:
+            生成 prompt
+        """
+        # 格式化 RAG 上下文为 Knighter 范式示例
+        rag_examples = ""
+        if rag_context:
+            rag_examples = "\n## Reference Examples from Knighter Database\n\n"
+            rag_examples += "Study these examples to understand the format and structure:\n\n"
+
+            for i, item in enumerate(rag_context[:3], 1):  # 限制3个示例
+                title = item.get('title', 'Unknown')
+                content = item.get('content', '')
+                rag_examples += f"### Example {i}: {title}\n\n"
+
+                # 限制长度但保留关键部分
+                if len(content) > 1500:
+                    content = content[:1500] + "\n... (truncated)"
+                rag_examples += f"{content}\n\n"
+                rag_examples += "---\n\n"
+
+        # 构建 prompt
+        prompt = f"""# Task: Generate Vulnerability Pattern and Implementation Plan
+
+You are an expert in static analysis checker design. Your task is to analyze a code patch and generate:
+
+1. **Vulnerability Pattern** - A clear description of the vulnerability pattern
+2. **Implementation Plan** - Step-by-step plan for implementing a checker to detect this vulnerability
+
+## Format Requirements
+
+### Vulnerability Pattern Format
+
+```
+## Vulnerability Pattern
+
+[Pattern Name]
+
+Description:
+- [Point 1 describing what the vulnerability is]
+- [Point 2 describing how it manifests]
+- [Point 3 describing the consequences]
+
+Code Example:
+```cpp
+// Vulnerable code example
+void example() {{
+    // Shows the vulnerability
+}}
+```
+
+Fix Example:
+```cpp
+// Fixed code example
+void example() {{
+    // Shows the fix
+}}
+```
+```
+
+### Implementation Plan Format
+
+```
+## Implementation Plan
+
+1. [Step Name]
+   • [Specific action 1]
+   • [Specific action 2]
+
+2. [Step Name]
+   • [Specific action 1]
+   • [Action 2 with specific API/callback]
+
+3. [Step Name]
+   • [Action 1]
+   • [Action 2]
+
+...
+
+Each step should include:
+- Clear objectives
+- Specific Clang Static Analyzer callbacks to use (e.g., check::PreCall, check::Location)
+- State tracking requirements (if any)
+- Error detection logic
+```
+
+## Input Data
+
+**Vulnerability Type:** {vulnerability_type}
+
+**Vulnerability Description:**
+{vulnerability_description}
+
+**Code Patch to Analyze:**
+```diff
+{patch}
+```
+
+{rag_examples}
+
+## Your Task
+
+Based on the patch above, generate:
+
+### 1. Vulnerability Pattern
+Analyze the patch and describe:
+- What vulnerability does this patch fix?
+- What is the root cause?
+- What code pattern leads to this vulnerability?
+
+### 2. Implementation Plan
+Design a step-by-step plan to implement a Clang Static Analyzer checker that can detect similar vulnerabilities:
+
+**Step 1: [Name]**
+   • Which Clang callback to use?
+   • What state to track?
+   • What conditions to check for?
+
+**Step 2: [Name]**
+   • ...
+
+**Step 3: [Name]**
+   • ...
+
+**Important considerations:**
+- Use appropriate callbacks (check::PreCall, check::Location, check::Bind, etc.)
+- Track necessary program state
+- Report bugs using PathSensitiveBugReport
+- Use plugin-style registration (clang_registerCheckers)
+
+## Output Format
+
+Your response must follow this exact format:
+
+## Vulnerability Pattern
+
+[Your pattern description here]
+
+## Implementation Plan
+
+1. [Step name]
+   • [Action 1]
+   • [Action 2]
+
+2. [Step name]
+   • [Action 1]
+   • [Action 2]
+
+...
+
+**IMPORTANT:**
+- Start with "## Vulnerability Pattern" section
+- Follow with "## Implementation Plan" section
+- Use numbered steps with bullet points
+- Be specific about Clang Static Analyzer APIs and callbacks
+- Keep the plan actionable and implementation-focused
+
+Generate the pattern and plan now:"""
+
+        return prompt
 
     def get_template_stats(self) -> Dict[str, Any]:
         return self._enhanced.get_template_stats()

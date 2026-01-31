@@ -15,10 +15,14 @@ from ..prompts.prompt_manager import PromptManager
 class AnalysisAgent(BaseAgent):
     """分析Agent - 负责补丁分析和漏洞模式提取"""
 
-    def __init__(self, lsp_client: Optional[ClangdClient] = None, prompt_manager: Optional[PromptManager] = None):
+    def __init__(self,
+                 lsp_client: Optional[ClangdClient] = None,
+                 prompt_manager: Optional[PromptManager] = None,
+                 llm_client: Optional[Any] = None):
         super().__init__("analysis_agent", "patch_analysis")
         self.lsp_client = lsp_client
         self.prompt_manager = prompt_manager
+        self.llm_client = llm_client  # LLM客户端，用于模式提取
 
     async def handle_message(self, message: AgentMessage) -> Optional[AgentMessage]:
         """处理接收到的消息"""
@@ -136,15 +140,64 @@ class AnalysisAgent(BaseAgent):
             inferred_vuln_type = self._infer_vulnerability_type(patch, vulnerability_indicators)
             logger.info(f"Inferred vulnerability type for 0day: {inferred_vuln_type}")
 
-        # 5. 结合分析结果
+        # 5. LLM 模式提取 (参考 Knighter patch2pattern)
+        pattern = None
+        pattern_source = "rule_based"
+
+        if self.llm_client and self.prompt_manager:
+            try:
+                logger.info("Using LLM for pattern extraction from patch...")
+                # 构建 prompt（使用项目统一的 invoke_llm 接口）
+                extraction_prompt = self._build_patch2pattern_prompt(patch, inferred_vuln_type)
+
+                # 调用 LLM（使用 asyncio.to_thread 避免阻塞）
+                import asyncio
+                # 分析阶段使用高温度激发创造力 (temperature=1.0)
+                llm_response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.llm_client.generate,
+                        extraction_prompt,
+                        temperature=1.0
+                    ),
+                    timeout=300.0  # 5分钟超时
+                )
+
+                # 从响应中提取 pattern
+                if llm_response:
+                    pattern = self._extract_pattern_from_llm_response(llm_response)
+                    if pattern:
+                        pattern_source = "llm_based"
+                        logger.success(f"LLM extracted pattern: {pattern[:100]}...")
+                    else:
+                        logger.warning("LLM response did not contain valid pattern, falling back to rule-based")
+                        pattern = self._rule_based_pattern_extraction(patch)
+                else:
+                    logger.warning("LLM returned empty response, falling back to rule-based")
+                    pattern = self._rule_based_pattern_extraction(patch)
+
+            except asyncio.TimeoutError:
+                logger.warning("LLM pattern extraction timed out, falling back to rule-based")
+                pattern = self._rule_based_pattern_extraction(patch)
+            except Exception as e:
+                logger.warning(f"LLM pattern extraction failed: {e}, falling back to rule-based")
+                pattern = self._rule_based_pattern_extraction(patch)
+        else:
+            # 回退到规则-based模式提取
+            pattern = self._rule_based_pattern_extraction(patch)
+            logger.info("Using rule-based pattern extraction (no LLM client available)")
+
+        # 6. 结合分析结果
         analysis_result = {
             "patch_summary": basic_analysis,
             "lsp_analysis": lsp_analysis,
             "vulnerability_indicators": vulnerability_indicators,
             "inferred_vulnerability_type": inferred_vuln_type,
+            "pattern": pattern,
+            "pattern_source": pattern_source,
             "code_changes": self._extract_code_changes(patch),
             "complexity_score": self._calculate_patch_complexity(patch),
-            "confidence_score": 0.8  # 基础置信度
+            "confidence_score": 0.9 if pattern_source == "llm_based" else 0.7,
+            "analysis_type": "patch_based"
         }
 
         return analysis_result
@@ -155,14 +208,78 @@ class AnalysisAgent(BaseAgent):
         vulnerability_type = task_data.get("vulnerability_type")
         context = task_data.get("context", {})
 
-        # 基于描述进行语义分析
+        # 1. 基于描述的规则分析
+        description_summary = self._analyze_description_text(description)
+        vulnerability_indicators = self._extract_indicators_from_description(description)
+
+        # 2. LLM 模式提取
+        pattern = None
+        pattern_source = "rule_based"
+        inferred_type = vulnerability_type
+
+        if self.llm_client:
+            try:
+                logger.info("Using LLM for pattern extraction from description...")
+                extraction_prompt = self._build_desc2pattern_prompt(description, vulnerability_type)
+
+                import asyncio
+                # 分析阶段使用高温度激发创造力 (temperature=1.0)
+                llm_response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.llm_client.generate,
+                        extraction_prompt,
+                        temperature=1.0
+                    ),
+                    timeout=300.0
+                )
+
+                if llm_response:
+                    pattern = self._extract_pattern_from_llm_response(llm_response)
+                    if pattern:
+                        pattern_source = "llm_based"
+                        logger.success(f"LLM extracted pattern from description: {pattern[:100]}...")
+
+                        # 尝试从 LLM 响应中提取漏洞类型
+                        if not vulnerability_type:
+                            inferred_type = self._extract_vuln_type_from_llm_response(llm_response)
+                            logger.info(f"Inferred vulnerability type from LLM: {inferred_type}")
+                    else:
+                        logger.warning("LLM response did not contain valid pattern")
+                        pattern = self._infer_patterns_from_description(description, vulnerability_type)
+                        if pattern:
+                            pattern = pattern[0] if isinstance(pattern, list) else pattern
+                else:
+                    logger.warning("LLM returned empty response")
+                    pattern = self._infer_patterns_from_description(description, vulnerability_type)
+                    if pattern:
+                        pattern = pattern[0] if isinstance(pattern, list) else pattern
+
+            except asyncio.TimeoutError:
+                logger.warning("LLM pattern extraction timed out")
+                pattern = self._infer_patterns_from_description(description, vulnerability_type)
+                if pattern:
+                    pattern = pattern[0] if isinstance(pattern, list) else pattern
+            except Exception as e:
+                logger.warning(f"LLM pattern extraction failed: {e}")
+                pattern = self._infer_patterns_from_description(description, vulnerability_type)
+                if pattern:
+                    pattern = pattern[0] if isinstance(pattern, list) else pattern
+        else:
+            # 回退到规则-based
+            rule_patterns = self._infer_patterns_from_description(description, vulnerability_type)
+            pattern = rule_patterns[0] if rule_patterns else "通用漏洞检测模式"
+
+        # 3. 结合分析结果
         analysis_result = {
-            "description_summary": self._analyze_description_text(description),
-            "vulnerability_indicators": self._extract_indicators_from_description(description),
-            "potential_patterns": self._infer_patterns_from_description(description, vulnerability_type),
+            "description_summary": description_summary,
+            "vulnerability_indicators": vulnerability_indicators,
+            "inferred_vulnerability_type": inferred_type or vulnerability_type,
+            "pattern": pattern,
+            "pattern_source": pattern_source,
+            "potential_patterns": [pattern] if pattern else [],
             "suggested_detection_approaches": self._suggest_detection_methods(description, vulnerability_type),
             "analysis_type": "description_based",
-            "confidence_score": 0.6  # 描述分析置信度较低
+            "confidence_score": 0.8 if pattern_source == "llm_based" else 0.5
         }
 
         return analysis_result
@@ -173,14 +290,75 @@ class AnalysisAgent(BaseAgent):
         vulnerability_type = task_data.get("vulnerability_type")
         context = task_data.get("context", {})
 
-        # 分析PoC代码结构
+        # 1. 基础 PoC 结构分析
+        code_structure = self._analyze_poc_structure(poc_code)
+        vulnerability_indicators = self._extract_vuln_indicators_from_poc(poc_code)
+        attack_vector = self._identify_attack_vector(poc_code)
+
+        # 2. LLM 模式提取
+        pattern = None
+        pattern_source = "rule_based"
+        inferred_type = vulnerability_type
+
+        if self.llm_client:
+            try:
+                logger.info("Using LLM for pattern extraction from PoC...")
+                extraction_prompt = self._build_poc2pattern_prompt(poc_code, vulnerability_type)
+
+                import asyncio
+                # 分析阶段使用高温度激发创造力 (temperature=1.0)
+                llm_response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.llm_client.generate,
+                        extraction_prompt,
+                        temperature=1.0
+                    ),
+                    timeout=300.0
+                )
+
+                if llm_response:
+                    pattern = self._extract_pattern_from_llm_response(llm_response)
+                    if pattern:
+                        pattern_source = "llm_based"
+                        logger.success(f"LLM extracted pattern from PoC: {pattern[:100]}...")
+
+                        # 尝试从 LLM 响应中提取漏洞类型
+                        if not vulnerability_type:
+                            inferred_type = self._extract_vuln_type_from_llm_response(llm_response)
+                            logger.info(f"Inferred vulnerability type from PoC analysis: {inferred_type}")
+                    else:
+                        logger.warning("LLM response did not contain valid pattern")
+                        rule_patterns = self._derive_patterns_from_poc(poc_code, vulnerability_type)
+                        pattern = rule_patterns[0] if rule_patterns else "基于PoC的模式分析"
+                else:
+                    logger.warning("LLM returned empty response")
+                    rule_patterns = self._derive_patterns_from_poc(poc_code, vulnerability_type)
+                    pattern = rule_patterns[0] if rule_patterns else "基于PoC的模式分析"
+
+            except asyncio.TimeoutError:
+                logger.warning("LLM pattern extraction timed out")
+                rule_patterns = self._derive_patterns_from_poc(poc_code, vulnerability_type)
+                pattern = rule_patterns[0] if rule_patterns else "基于PoC的模式分析"
+            except Exception as e:
+                logger.warning(f"LLM pattern extraction failed: {e}")
+                rule_patterns = self._derive_patterns_from_poc(poc_code, vulnerability_type)
+                pattern = rule_patterns[0] if rule_patterns else "基于PoC的模式分析"
+        else:
+            # 回退到规则-based
+            rule_patterns = self._derive_patterns_from_poc(poc_code, vulnerability_type)
+            pattern = rule_patterns[0] if rule_patterns else "基于PoC的模式分析"
+
+        # 3. 结合分析结果
         poc_analysis = {
-            "code_structure": self._analyze_poc_structure(poc_code),
-            "vulnerability_indicators": self._extract_vuln_indicators_from_poc(poc_code),
-            "attack_vector": self._identify_attack_vector(poc_code),
-            "detection_patterns": self._derive_patterns_from_poc(poc_code, vulnerability_type),
+            "code_structure": code_structure,
+            "vulnerability_indicators": vulnerability_indicators,
+            "inferred_vulnerability_type": inferred_type or vulnerability_type,
+            "attack_vector": attack_vector,
+            "pattern": pattern,
+            "pattern_source": pattern_source,
+            "detection_patterns": [pattern] if pattern else [],
             "analysis_type": "poc_based",
-            "confidence_score": 0.7  # PoC分析置信度中等
+            "confidence_score": 0.85 if pattern_source == "llm_based" else 0.6
         }
 
         return poc_analysis
@@ -509,3 +687,304 @@ class AnalysisAgent(BaseAgent):
                 break
 
         return {"level": severity, "confidence": 0.7}
+
+    # ============================================================
+    # LLM 模式提取辅助方法 (参考 Knighter patch2pattern)
+    # ============================================================
+
+    def _build_patch2pattern_prompt(self, patch: str, vuln_type: Optional[str] = None) -> str:
+        """
+        构建 patch2pattern prompt (参考 Knighter 模板)
+
+        Args:
+            patch: 补丁内容
+            vuln_type: 推断的漏洞类型（可选）
+
+        Returns:
+            构建好的 prompt
+        """
+        # Knighter 风格的简洁模板
+        prompt = """# Instruction
+
+You will be provided with a patch in C/C++ code.
+Please analyze the patch and find out the **bug pattern** in this patch.
+
+A **bug pattern** is the root cause of this bug, meaning that programs with this pattern will have a great possibility of having the same bug.
+Note that the bug pattern should be specific and accurate, which can be used to identify the buggy code provided in the patch.
+
+# Target Patch
+
+```diff
+{patch}
+```
+
+# Formatting
+
+Please tell me the **bug pattern** of the provided patch.
+Please try not to wrap your response in functions if several lines of code are enough to express this pattern.
+
+Your response should be like:
+
+```
+## Bug Pattern
+
+{{describe the bug pattern here}}
+```
+"""
+
+        # 替换占位符
+        prompt = prompt.replace("{patch}", patch)
+
+        # 如果有漏洞类型，添加上下文
+        if vuln_type:
+            prompt = f"""# Context
+
+The vulnerability type is: {vuln_type}
+
+""" + prompt
+
+        return prompt
+
+    def _build_desc2pattern_prompt(self, description: str, vuln_type: Optional[str] = None) -> str:
+        """
+        构建 description-to-pattern prompt (0day 支持)
+
+        Args:
+            description: 漏洞描述
+            vuln_type: 漏洞类型（可选）
+
+        Returns:
+            构建好的 prompt
+        """
+        prompt = """# Instruction
+
+You are an expert security analyst specializing in static analysis.
+Your task is to analyze a vulnerability description and extract a structured bug pattern.
+
+# What is a Bug Pattern?
+
+A **bug pattern** is the root cause and characteristic signature of a vulnerability. It should:
+- Describe the specific conditions that lead to the bug
+- Identify the key code elements involved (functions, operations, types)
+- Be specific enough to distinguish buggy code from similar safe code
+- Be general enough to detect the same pattern in different contexts
+
+# Vulnerability Description
+
+{description}
+"""
+
+        # 替换占位符
+        prompt = prompt.replace("{description}", description)
+
+        # 如果有漏洞类型，添加上下文
+        if vuln_type:
+            prompt += f"\n# Vulnerability Type\n\n{vuln_type}\n"
+
+        prompt += """
+# Output Format
+
+Provide your response in the following format:
+
+```
+## Bug Pattern
+
+### Vulnerability Type
+[type of vulnerability]
+
+### Trigger Conditions
+[what conditions trigger the bug]
+
+### Key Code Elements
+- **Functions/APIs**: [relevant functions]
+- **Types**: [relevant data types]
+- **Operations**: [key operations]
+
+### Detection Strategy
+[how to detect this pattern in code]
+
+### Root Cause
+[fundamental reason this bug occurs]
+```
+"""
+        return prompt
+
+    def _build_poc2pattern_prompt(self, poc_code: str, vuln_type: Optional[str] = None) -> str:
+        """
+        构建 poc-to-pattern prompt
+
+        Args:
+            poc_code: PoC 代码
+            vuln_type: 漏洞类型（可选）
+
+        Returns:
+            构建好的 prompt
+        """
+        prompt = """# Instruction
+
+You are an expert security analyst specializing in vulnerability detection.
+Your task is to analyze a Proof-of-Concept (PoC) code and extract the vulnerability pattern that should be detected.
+
+# PoC Code
+
+```cpp
+{poc_code}
+```
+"""
+
+        # 替换占位符
+        prompt = prompt.replace("{poc_code}", poc_code)
+
+        # 如果有漏洞类型，添加上下文
+        if vuln_type:
+            prompt += f"\n# Vulnerability Type\n\n{vuln_type}\n"
+
+        prompt += """
+# Output Format
+
+Analyze the PoC and extract:
+
+```
+## Bug Pattern
+
+### Vulnerability Type
+[type demonstrated by PoC]
+
+### Attack Vector
+[how the PoC exploits the vulnerability]
+
+### Detection Strategy
+[how to detect code vulnerable to this attack]
+
+### Key Code Elements
+- Functions/APIs to monitor
+- Patterns to look for
+- Conditions that indicate vulnerability
+```
+"""
+        return prompt
+
+    def _extract_pattern_from_llm_response(self, response: str) -> Optional[str]:
+        """
+        从 LLM 响应中提取 Bug Pattern
+
+        支持 Knighter 风格的 "## Bug Pattern" 格式
+
+        Args:
+            response: LLM 响应文本
+
+        Returns:
+            提取的 pattern，失败返回 None
+        """
+        if not response:
+            return None
+
+        # 移除 think 标签（推理模型特殊输出）
+        try:
+            from ..utils.code_utils import remove_think_tags
+            response = remove_think_tags(response)
+        except:
+            pass
+
+        import re
+
+        # 模式 1: Knighter 风格 - "## Bug Pattern"
+        pattern1_match = re.search(r'##\s*Bug\s*Pattern\s*\n+(.*?)(?=\n##|\n\n\n|$)', response, re.DOTALL | re.IGNORECASE)
+        if pattern1_match:
+            pattern = pattern1_match.group(1).strip()
+            # 清理多余内容，保留核心 pattern
+            lines = pattern.split('\n')
+            core_lines = []
+            for line in lines:
+                line = line.strip()
+                # 跳过空行和明显的标记行
+                if not line or line.startswith('###') or line.startswith('#'):
+                    continue
+                # 跳过 "Vulnerability Type:" 等标记
+                if line.endswith(':'):
+                    continue
+                core_lines.append(line)
+            if core_lines:
+                return '\n'.join(core_lines[:20])  # 最多 20 行
+
+        # 模式 2: 直接寻找包含关键描述的段落
+        # 匹配 "root cause", "trigger", "detect" 等关键词附近的段落
+        keywords = ['root cause', 'trigger', 'detect', 'vulnerability', 'bug occurs']
+        for keyword in keywords:
+            pattern_match = re.search(rf'.*?{keyword}.*?:?\s*([^\n]+(?:\n[^\n#]+)*?)(?=\n\n|\n#|$)', response, re.IGNORECASE)
+            if pattern_match:
+                candidate = pattern_match.group(1).strip()
+                if len(candidate) > 20:  # 确保不是太短
+                    return candidate
+
+        # 模式 3: 没有明确标记，提取前几段有意义的文本
+        paragraphs = response.split('\n\n')
+        for para in paragraphs[:5]:
+            para = para.strip()
+            # 跳过标题和空段落
+            if para.startswith('#') or len(para) < 50:
+                continue
+            # 确保包含一些关键词
+            if any(kw in para.lower() for kw in ['bug', 'vulnerability', 'pattern', 'detect', 'check']):
+                return para[:500]  # 最多 500 字符
+
+        return None
+
+    def _extract_vuln_type_from_llm_response(self, response: str) -> Optional[str]:
+        """
+        从 LLM 响应中提取漏洞类型
+
+        Args:
+            response: LLM 响应文本
+
+        Returns:
+            提取的漏洞类型，失败返回 None
+        """
+        if not response:
+            return None
+
+        import re
+
+        # 常见漏洞类型映射
+        vuln_type_mapping = {
+            'buffer overflow': 'buffer_overflow',
+            'buffer overflow': 'buffer_overflow',
+            'use after free': 'use_after_free',
+            'use-after-free': 'use_after_free',
+            'null pointer': 'null_pointer',
+            'null pointer dereference': 'null_pointer',
+            'double free': 'double_free',
+            'double-free': 'double_free',
+            'memory leak': 'memory_leak',
+            'memory leak': 'memory_leak',
+            'race condition': 'race_condition',
+            'integer overflow': 'integer_overflow',
+            'format string': 'format_string',
+            'format string': 'format_string',
+        }
+
+        response_lower = response.lower()
+
+        # 匹配 "Vulnerability Type: xxx" 或 "### Vulnerability Type\nxxx" 格式
+        type_patterns = [
+            r'(?:vulnerability\s+type|vulnerability)\s*[:\s]\s*([^\n#]+?)(?:\n|$|###)',
+            r'###?\s*vulnerability\s+type\s*\n\s*([^\n#]+?)(?:\n|$|###)',
+        ]
+
+        for pattern in type_patterns:
+            match = re.search(pattern, response, re.IGNORECASE)
+            if match:
+                extracted = match.group(1).strip().lower()
+                # 映射到标准类型名
+                for key, value in vuln_type_mapping.items():
+                    if key in extracted:
+                        return value
+                # 如果没有映射，返回原始值（清理后）
+                return extracted.replace(' ', '_').replace('-', '_')[:50]
+
+        # 如果没有找到明确标记，尝试从响应中推断
+        for key, value in vuln_type_mapping.items():
+            if key in response_lower:
+                return value
+
+        return None

@@ -20,7 +20,7 @@ python scripts/test_knowledge_base.py [模式] [参数]
 
 示例：
 python scripts/test_knowledge_base.py embedding
-python scripts/test_knowledge_base.py search "buffer overflow" --top-k 5
+python3 scripts/test_knowledge_base.py search "null ptr dereference" --top-k 2
 python scripts/test_knowledge_base.py full
 """
 

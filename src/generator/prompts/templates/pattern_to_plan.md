@@ -4,6 +4,8 @@ You are an expert in developing Clang Static Analyzer checkers with decades of e
 
 Your task is to create a detailed, step-by-step implementation plan for a Clang Static Analyzer checker that detects the specified bug pattern.
 
+**IMPORTANT**: Write your plan in the style of Knighter checker implementation plans - clear, concrete steps with bullet points and specific API calls.
+
 ## Input
 
 ### Bug Pattern
@@ -24,9 +26,69 @@ Your task is to create a detailed, step-by-step implementation plan for a Clang 
 ```
 {{/if}}
 
-### Available Resources
+## Knighter Reference Examples
 
-You have access to the following utility functions that are already implemented:
+Study these example plans from Knighter to understand the expected style and detail level:
+
+### Example 1: ArrayBoundChecker Plan
+
+```
+1. Register for the Location event:
+   • The checker listens for memory load/store events via the check::Location callback.
+
+2. Identify element accesses:
+   • In checkLocation, obtain the memory region from the passed SVal.
+   • Ensure the region is an ElementRegion (which represents an array element access). If not, ignore the event.
+
+3. Extract the index used for the array access:
+   • Retrieve the element index from the ElementRegion as a DefinedOrUnknownSVal.
+   • If the index is a known zero constant (which is always safe), simply return without further action.
+
+4. Determine the array bounds:
+   • Use getDynamicElementCount() with the ElementRegion's super region and the element type to obtain the total number of elements in the array.
+   • This function accounts for run-time size information.
+
+5. Check index against the array size:
+   • Use the program state method assumeInBoundDual() with the index and element count. This will yield two possible states: one where the index is in-bound (StInBound) and one where it is out-of-bound (StOutBound).
+   • If you can prove that the index is out-of-bound (StOutBound exists) and not in-bound (StInBound does not exist), then this access is unsafe.
+
+6. Report the bug:
+   • Generate an error node for the out-of-bound case.
+   • Create and populate a PathSensitiveBugReport with a clear message ("Access out-of-bound array element (buffer overflow)").
+   • Use the source range from the load statement to highlight the error.
+   • Emit the report so that the analyzer later presents it to the user.
+
+7. Transition the state:
+   • If the index is in-bound, update the state by transitioning to StInBound. This helps avoid duplicate warnings along different paths.
+```
+
+### Example 2: MallocChecker Plan (Memory Management)
+
+```
+1. Initialization and Modeling of Memory Regions
+   • Set up program–state maps (for example, a RegionState map keyed by the allocation's "symbol") that hold a "RefState" value representing whether memory is allocated, released, relinquished, escaped, or zero allocated.
+   • Register the checker with the CheckerRegistry and initialize bug types for various reports (double free, leak, use–after–free, mismatched deallocation, etc).
+
+2. Modeling Memory Allocation
+   • In callbacks for allocation calls (e.g. for malloc, calloc, new, new[]), intercept the call (via checkPostCall or EvalCall).
+   • Create a symbolic heap region for the returned pointer using helper functions (like MallocMemAux). This binds the allocation site (the call's expression) to a conjured symbol.
+   • Initialize the region's state by storing a RefState showing that the memory has been allocated (or allocated with size zero in special cases).
+
+3. Modeling Memory Deallocation
+   • Intercept deallocation calls (free, delete, delete[] and other custom free functions) in checkPreCall or checkPostCall.
+   • Call helper functions such as FreeMemAux to update state:
+     – Look up the associated symbolic region (by stripping casts, following base regions).
+     – Check that the deallocation "family" matches the allocation family.
+     – Detect errors like double free (if the region is already released or relinquished) or free on non–heap regions.
+   • Update the region's state (mark it "released" or "relinquished") so that later accesses can be caught as use–after–free.
+
+4. Reporting Bugs and Leaks
+   • When an error condition is detected (memory already freed, pointer used after deallocation, freeing memory allocated on the stack, mismatching allocation/deallocation functions, or leak detection when dead symbols remain allocated), invoke one of the handler functions (e.g. HandleDoubleFree, HandleUseAfterFree, HandleLeak, etc).
+   • Within these handlers, generate a non–fatal error node and create a PathSensitiveBugReport with a concrete diagnostic message.
+   • Optionally, attach hints such as a call–stack or additional details to help guide the user.
+```
+
+### Available Resources
 
 **Utility Functions:**
 
@@ -38,139 +100,59 @@ You have access to the following utility functions that are already implemented:
 
 {{suggestions}}
 
-**Code Template:**
-
-```cpp
-{{checker_template}}
-```
-
 ## Your Task
 
-Create a comprehensive implementation plan that includes:
+Create a comprehensive implementation plan following the Knighter style shown above. Your plan should:
 
-### 1. Program State Design
+1. **Use numbered steps** (1. 2. 3...) with clear descriptions
+2. **Use bullet points (•)** for sub-items within each step
+3. **Include specific API calls** and function names
+4. **Be concrete and actionable** - no vague descriptions
 
-Decide if you need to track program state across analysis. Specify:
-- What state to track (use `REGISTER_TRAIT_WITH_PROGRAMSTATE`, `REGISTER_MAP_WITH_PROGRAMSTATE`, or `REGISTER_SET_WITH_PROGRAMSTATE`)
-- What information to store
+### Your plan should cover:
+
+**If you need program state tracking:**
+- What state to track (REGISTER_MAP_WITH_PROGRAMSTATE, etc.)
 - When to update the state
+- How to query the state
 
-### 2. Callback Selection
-
-Choose the appropriate checker callbacks. Common options:
-- `checkPreStmt<T>` / `checkPostStmt<T>` - For statement-level analysis
-- `checkPreCall` / `checkPostCall` - For function call analysis
-- `checkBranchCondition` - For analyzing branch conditions
-- `checkLocation` - For memory load/store operations
-- `checkBind` - For tracking variable assignments
-- `checkBeginFunction` / `checkEndFunction` - For function lifecycle
-
-### 3. Step-by-Step Implementation
-
-For each callback, provide:
-1. What to check/analyze
-2. What state to read/update
-3. What conditions indicate a bug
-4. How to report the bug
-
-### 4. Edge Cases
-
-Consider and address:
-- NULL pointers
-- Unknown values
-- Symbolic values without constraints
-- Multiple code paths
-- Different variable scopes
+**For each callback:**
+- What the callback checks for
+- What state it reads/updates
+- What API calls it uses
+- When to report a bug
 
 ## Output Format
 
-Provide your plan in the following structure:
+Provide your plan in the following structure (Knighter style):
 
 ```markdown
-## Implementation Plan
+### Implementation Plan
 
-### 1. Program State Design
+1. [Step Name with Clear Purpose]
+   • [First specific action with API call]
+   • [Second specific action with API call]
+   • [Third specific action if applicable]
 
-[Describe what program state to track and why]
+2. [Next Step Name]
+   • [Action description]
+   • [More details]
+   • [Even more details if needed]
 
-**State Definition:**
-```cpp
-REGISTER_MAP_WITH_PROGRAMSTATE(...)
-```
+3. [Continue with steps...]
 
-### 2. Callback Selection
-
-**Primary Callbacks:**
-- [Callback 1]: [Purpose]
-- [Callback 2]: [Purpose]
-
-**Helper Callbacks (if needed):**
-- [Callback 3]: [Purpose]
-
-### 3. Implementation Steps
-
-#### Step 1: [Step Name]
-[Callback to use]
-
-**What to check:**
-- [Check 1]
-- [Check 2]
-
-**What state to use:**
-- Read: [State to read]
-- Write: [State to update]
-
-**Pseudocode:**
-```cpp
-void callback(...) const {
-    // Step 1: ...
-    // Step 2: ...
-    // Step 3: ...
-}
-```
-
-#### Step 2: [Step Name]
-[Continue with detailed steps...]
-
-### 4. Bug Detection Logic
-
-**Conditions for bug report:**
-1. [Condition 1]
-2. [Condition 2]
-3. [Condition 3]
-
-**Bug report message:**
-"[Short, clear description of the bug]"
-
-### 5. Edge Cases and Special Handling
-
-- **Case 1**: [How to handle]
-- **Case 2**: [How to handle]
-- **Case 3**: [How to handle]
-
-### 6. Testing Considerations
-
-**True Positive Cases:**
-- [Example scenario 1]
-- [Example scenario 2]
-
-**True Negative Cases:**
-- [Example scenario 1]
-- [Example scenario 2]
-
-## Implementation Notes
-
-[Additional considerations or warnings]
+Each step should be specific and include actual API calls where relevant.
 ```
 
 ## Important Guidelines
 
-1. **Be Specific**: Each step should be concrete and actionable
-2. **Use Available Utilities**: Leverage the provided utility functions
-3. **Follow Best Practices**: Adhere to the development suggestions
-4. **Consider All Cases**: Think about NULL, unknown, and edge cases
-5. **Keep It Simple**: Use the simplest approach that achieves the goal
-6. **Be Complete**: Don't leave placeholders or TODOs
+1. **Follow Knighter Style**: Numbered steps with bullet points
+2. **Be Specific**: Include actual API names and function calls
+3. **Be Concrete**: Each step should be directly implementable
+4. **Use Available Utilities**: Reference the provided utility functions
+5. **Consider Edge Cases**: NULL pointers, unknown values, multiple paths
+6. **Keep It Focused**: Only include steps relevant to THIS vulnerability
+7. **No Placeholders**: Don't use "TODO" or "implement this"
 
 ## Feedback from Previous Attempts
 
@@ -181,4 +163,4 @@ The following implementation attempts had issues. Learn from them:
 {{/if}}
 
 ---
-*Your plan should be detailed enough that a developer can directly implement a working checker from it.*
+*Your plan should match the Knighter style shown in the examples above - concrete, actionable, and ready to implement.*

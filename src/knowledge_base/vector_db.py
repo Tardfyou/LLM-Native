@@ -440,15 +440,16 @@ class VectorDatabase:
                     })
 
             if ids:
-                # 批量添加到数据库
-                self.collection.add(
+                # 使用 upsert 来添加或更新现有条目
+                # upsert 会更新已存在的条目，添加不存在的条目
+                self.collection.upsert(
                     ids=ids,
                     documents=documents,
                     embeddings=embeddings,
                     metadatas=metadatas
                 )
 
-                logger.info(f"Added {len(ids)} entries to vector database")
+                logger.info(f"Upserted {len(ids)} entries to vector database")
                 return True
             else:
                 logger.warning("No valid entries to add")

@@ -26,7 +26,6 @@ llm:
   # DeepSeek:
   #   - deepseek-chat: 通用对话模型
   #   - deepseek-reasoner: 推理增强模型
-  #   - deepseek-coder: 代码生成模型
   #
   # OpenAI:
   #   - gpt-4, gpt-4-turbo, gpt-4o, gpt-4o-mini
@@ -44,7 +43,7 @@ llm:
   # deepseek-reasoner: DeepSeek 推理模型（推荐用于修复，避免GLM并发限制）
   # glm-4-flash: GLM 快速模型
   # glm-4-air: GLM 中等速度，平衡性能
-  fast_model: "deepseek-reasoner"
+  fast_model: "deepseek-chat"
 
   # 可选: 自定义 API 端点 (如果需要)
   # base_url: "https://your-custom-endpoint.com/v1"
@@ -66,11 +65,20 @@ llm:
 
   # Generation parameters
   generation:
-    temperature: 0.3
-    max_tokens: 9192  # 增加到16000以生成更完整的代码
+    temperature: 0.3  # 默认温度（向后兼容）
+    max_tokens: 8192  # deepseek-chat 上限是 8192
     top_p: 0.95
     frequency_penalty: 0.0
     presence_penalty: 0.0
+
+  # 分阶段温度设置
+  stage_temperature:
+    # 漏洞模式分析阶段 - 高温激发创造力
+    analysis: 1.0
+    # 代码生成阶段 - 低温确保精确性
+    code_generation: 0.0
+    # 代码修复阶段 - 低温确保确定性输出
+    repair: 0.0
 
   # Request parameters
   timeout: 120
@@ -117,7 +125,7 @@ knowledge_base:
     # Embedding model
     embedding_model: "microsoft/unixcoder-base"
     # Retrieval settings
-    top_k: 10
+    top_k: 2
     similarity_threshold: 0.7
     # Hybrid retrieval weights
     dense_weight: 0.7

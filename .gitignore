@@ -92,5 +92,8 @@ htmlcov/
 # Pretrained models (large files)
 pretrained_models/
 
+# Knighter (external reference)
+Knighter/
+
 # Test results and logs
 scripts/test_results/

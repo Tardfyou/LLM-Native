@@ -90,7 +90,7 @@ private:
   // Get the memory region from an expression
   const MemRegion *getRegion(const Expr *E, CheckerContext &C) const {
     SVal Val = C.getSVal(E);
-    if (Optional<loc::MemRegionVal> RegionVal = Val.getAs<loc::MemRegionVal>()) {
+    if (auto RegionVal = Val.getAs<loc::MemRegionVal>()) {
       return RegionVal->getRegion()->getBaseRegion();
     }
     return nullptr;
@@ -98,8 +98,11 @@ private:
 
   // Check if a value is null
   bool isNull(SVal Val) const {
-    if (Optional<loc::ConcreteInt> ConcreteVal = Val.getAs<loc::ConcreteInt>()) {
-      return ConcreteVal->getValue().isZero();
+    if (auto ConcreteVal = Val.getAs<loc::ConcreteInt>()) {
+      // getValue() returns APSIntPtr, need to dereference
+      if (auto IntPtr = ConcreteVal->getValue()) {
+        return *IntPtr == 0;
+      }
     }
     return false;
   }

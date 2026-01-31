@@ -4,8 +4,9 @@
 # 使用方法: ./scripts/dev-manual.sh [选项]
 #
 # 选项:
-#   (无参数)  - 启动开发环境
+#   (无参数)  - 启动开发环境（如容器已存在则直接进入）
 #   build     - 强制重新构建镜像
+#   rebuild   - 强制重新创建容器
 #   clang     - 启动并运行Clang环境测试
 #   test      - 检查Clang环境后运行生成引擎测试
 #   full      - 运行完整测试套件（Clang + 生成引擎）
@@ -68,44 +69,87 @@ fi
 echo -e "\033[94m[INFO]\033[0m Starting development container..."
 DEV_CONTAINER_NAME="llm_native_dev"
 
-# 停止已存在的容器
-docker stop $DEV_CONTAINER_NAME 2>/dev/null || true
-docker rm $DEV_CONTAINER_NAME 2>/dev/null || true
-
 # 获取当前目录的绝对路径
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-docker run -it \
-    --name $DEV_CONTAINER_NAME \
-    --network llm_native_network \
-    -p 8000:8000 \
-    -v "$PROJECT_ROOT:/app:cached" \
-    -v "$PROJECT_ROOT/pretrained_models:/root/.cache/huggingface/hub:cached" \
-    -v llm_native_knowledge:/app/data/knowledge \
-    -v llm_native_benchmarks:/app/data/benchmarks \
-    -v "$PROJECT_ROOT/results:/app/results" \
-    -v "$PROJECT_ROOT/logs:/app/logs" \
-    -e PYTHONPATH=/app/src:/app \
-    -e DEEPSEEK_API_KEY=sk-6b1ae1bdb0e24c0189f0f0e9db43a94a \
-    -e LOG_LEVEL=DEBUG \
-    -e HF_HUB_CACHE=/root/.cache/huggingface/hub \
-    -e TRANSFORMERS_CACHE=/root/.cache/huggingface/hub \
-    --workdir /app \
-    llm-native:dev \
-    bash
+# 检查是否需要重新创建容器
+REBUILD_CONTAINER=false
+if [ "$1" = "rebuild" ] || [ "$2" = "rebuild" ]; then
+    REBUILD_CONTAINER=true
+fi
+
+# 检查容器是否已存在
+CONTAINER_EXISTS=false
+if docker ps -a --format '{{.Names}}' | grep -q "^${DEV_CONTAINER_NAME}$"; then
+    CONTAINER_EXISTS=true
+fi
+
+if [ "$CONTAINER_EXISTS" = true ] && [ "$REBUILD_CONTAINER" = false ]; then
+    echo -e "\033[92m[INFO]\033[0m Container '$DEV_CONTAINER_NAME' already exists, attaching to it..."
+    echo -e "\033[93m[TIP]\033[0m Use './scripts/dev-manual.sh rebuild' to recreate the container"
+    docker start -i $DEV_CONTAINER_NAME
+elif [ "$CONTAINER_EXISTS" = true ] && [ "$REBUILD_CONTAINER" = true ]; then
+    echo -e "\033[93m[INFO]\033[0m Removing existing container '$DEV_CONTAINER_NAME'..."
+    docker rm -f $DEV_CONTAINER_NAME 2>/dev/null || true
+    echo -e "\033[92m[INFO]\033[0m Creating new container '$DEV_CONTAINER_NAME'..."
+    docker run -it \
+        --name $DEV_CONTAINER_NAME \
+        --network llm_native_network \
+        -p 8000:8000 \
+        -v "$PROJECT_ROOT:/app:cached" \
+        -v "$PROJECT_ROOT/pretrained_models:/root/.cache/huggingface/hub:cached" \
+        -v llm_native_knowledge:/app/data/knowledge \
+        -v llm_native_benchmarks:/app/data/benchmarks \
+        -v "$PROJECT_ROOT/results:/app/results" \
+        -v "$PROJECT_ROOT/logs:/app/logs" \
+        -e PYTHONPATH=/app/src:/app \
+        -e DEEPSEEK_API_KEY=sk-6b1ae1bdb0e24c0189f0f0e9db43a94a \
+        -e LOG_LEVEL=DEBUG \
+        -e HF_HUB_CACHE=/root/.cache/huggingface/hub \
+        -e TRANSFORMERS_CACHE=/root/.cache/huggingface/hub \
+        --workdir /app \
+        llm-native:dev \
+        bash
+else
+    echo -e "\033[92m[INFO]\033[0m Creating new container '$DEV_CONTAINER_NAME'..."
+    docker run -it \
+        --name $DEV_CONTAINER_NAME \
+        --network llm_native_network \
+        -p 8000:8000 \
+        -v "$PROJECT_ROOT:/app:cached" \
+        -v "$PROJECT_ROOT/pretrained_models:/root/.cache/huggingface/hub:cached" \
+        -v llm_native_knowledge:/app/data/knowledge \
+        -v llm_native_benchmarks:/app/data/benchmarks \
+        -v "$PROJECT_ROOT/results:/app/results" \
+        -v "$PROJECT_ROOT/logs:/app/logs" \
+        -e PYTHONPATH=/app/src:/app \
+        -e DEEPSEEK_API_KEY=sk-6b1ae1bdb0e24c0189f0f0e9db43a94a \
+        -e LOG_LEVEL=DEBUG \
+        -e HF_HUB_CACHE=/root/.cache/huggingface/hub \
+        -e TRANSFORMERS_CACHE=/root/.cache/huggingface/hub \
+        --workdir /app \
+        llm-native:dev \
+        bash
+fi
 
 echo -e "\033[92m[SUCCESS]\033[0m Development environment has been started!"
 echo ""
 echo -e "\033[96m[HELP]\033[0m Common commands:"
-echo "  # Re-enter container"
+echo "  # Re-enter container (same as running this script again)"
 echo "  docker start -i $DEV_CONTAINER_NAME"
+echo "  ./scripts/dev-manual.sh"
 echo ""
 echo "  # Check container status"
-echo "  docker ps"
+echo "  docker ps -a | grep $DEV_CONTAINER_NAME"
 echo ""
-echo "  # Stop environment"
+echo "  # Recreate container (if needed)"
+echo "  ./scripts/dev-manual.sh rebuild"
+echo ""
+echo "  # Stop environment (keeps container for later use)"
 echo "  docker stop $DEV_CONTAINER_NAME $CONTAINER_NAME"
-echo "  docker rm $DEV_CONTAINER_NAME $CONTAINER_NAME"
+echo ""
+echo "  # Remove containers (clean up - use only if needed)"
+echo "  docker rm -f $DEV_CONTAINER_NAME $CONTAINER_NAME"
 echo ""
 echo -e "\033[96m[HELP]\033[0m Model download instructions:"
 echo "  # Download pretrained models: python3 scripts/download_models.py"
@@ -118,14 +162,24 @@ echo "  # Run Clang environment test: python3 scripts/test_clang_environment.py"
 echo "  # Run generator engine test: python3 scripts/test_generator_engine.py basic"
 
 # 根据参数执行测试
-if [ "$1" = "clang" ]; then
+if [ "$1" = "clang" ] || [ "$2" = "clang" ]; then
     echo ""
     echo -e "\033[94m[INFO]\033[0m Running Clang environment test..."
+    # 确保容器正在运行
+    if ! docker ps --format '{{.Names}}' | grep -q "^${DEV_CONTAINER_NAME}$"; then
+        echo -e "\033[93m[INFO]\033[0m Starting container..."
+        docker start $DEV_CONTAINER_NAME >/dev/null 2>&1
+    fi
     docker exec $DEV_CONTAINER_NAME python3 scripts/test_clang_environment.py
-elif [ "$1" = "test" ]; then
+elif [ "$1" = "test" ] || [ "$2" = "test" ]; then
     echo ""
     echo -e "\033[94m[INFO]\033[0m Checking Clang environment and running generator engine test..."
     echo -e "\033[94m[INFO]\033[0m  1. Checking Clang environment..."
+    # 确保容器正在运行
+    if ! docker ps --format '{{.Names}}' | grep -q "^${DEV_CONTAINER_NAME}$"; then
+        echo -e "\033[93m[INFO]\033[0m Starting container..."
+        docker start $DEV_CONTAINER_NAME >/dev/null 2>&1
+    fi
     if docker exec $DEV_CONTAINER_NAME python3 scripts/test_clang_environment.py >/dev/null 2>&1; then
         echo -e "\033[92m[SUCCESS]\033[0m  Clang environment is normal"
         echo ""
@@ -133,13 +187,19 @@ elif [ "$1" = "test" ]; then
         docker exec $DEV_CONTAINER_NAME python3 scripts/test_generator_engine.py basic
     else
         echo -e "\033[91m[ERROR]\033[0m  Clang environment abnormal, please rebuild image or check environment configuration"
-        echo -e "\033[93m[WARNING]\033[0m  Tip: Use './scripts/dev-manual.sh build' to rebuild"
+        echo -e "\033[93m[WARNING]\033[0m  Tip: Use './scripts/dev-manual.sh build' to rebuild image"
+        echo -e "\033[93m[WARNING]\033[0m  Tip: Use './scripts/dev-manual.sh rebuild' to recreate container"
         exit 1
     fi
-elif [ "$1" = "full" ]; then
+elif [ "$1" = "full" ] || [ "$2" = "full" ]; then
     echo ""
     echo -e "\033[94m[INFO]\033[0m Running full test suite..."
     echo -e "\033[94m[INFO]\033[0m  1. Clang environment test..."
+    # 确保容器正在运行
+    if ! docker ps --format '{{.Names}}' | grep -q "^${DEV_CONTAINER_NAME}$"; then
+        echo -e "\033[93m[INFO]\033[0m Starting container..."
+        docker start $DEV_CONTAINER_NAME >/dev/null 2>&1
+    fi
     if docker exec $DEV_CONTAINER_NAME python3 scripts/test_clang_environment.py; then
         echo -e "\033[92m[SUCCESS]\033[0m  Clang environment test passed"
         echo ""
@@ -147,7 +207,8 @@ elif [ "$1" = "full" ]; then
         docker exec $DEV_CONTAINER_NAME python3 scripts/test_generator_engine.py basic
     else
         echo -e "\033[91m[ERROR]\033[0m  Clang environment test failed, skipping generator engine test"
-        echo -e "\033[93m[WARNING]\033[0m  Tip: Use './scripts/dev-manual.sh build' to rebuild"
+        echo -e "\033[93m[WARNING]\033[0m  Tip: Use './scripts/dev-manual.sh build' to rebuild image"
+        echo -e "\033[93m[WARNING]\033[0m  Tip: Use './scripts/dev-manual.sh rebuild' to recreate container"
         exit 1
     fi
 fi

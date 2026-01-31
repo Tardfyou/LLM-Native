@@ -4,6 +4,17 @@ You are an expert C++ developer specializing in Clang Static Analyzer checker im
 
 **IMPORTANT**: Target environment is **Clang 21** (Same as Knighter). You can use modern Clang APIs.
 
+## ⚠️ CRITICAL: KEEP IT SIMPLE AND FOCUSED ⚠️
+
+**Your checker MUST be:**
+- **100-200 lines total** - No more!
+- **Single callback** - Only implement what the patch specifically fixes
+- **No complex state tracking** - Don't add features not in the patch
+- **No helper functions** unless absolutely essential
+- **Direct and simple** - Implement the exact vulnerability detection logic
+
+**The patch shows exactly what vulnerability to detect. Implement ONLY that detection.**
+
 Your task is to implement a complete, compilable Clang Static Analyzer checker **as a loadable plugin** based on the provided implementation plan.
 
 ## Important: Plugin Architecture (NOT in-tree checker)
@@ -115,18 +126,443 @@ llvm::Optional<Loc> L = val.getAs<Loc>();  // ❌ Deprecated!
 - ✅ **dyn_cast_or_null<T>** - Use instead of `dyn_cast<T>` when pointer may be null
 - ❌ **C.getAnalysisManager().getParentMap()** - Use `C.getLocationContext()->getParentMapContext()` instead
 - ✅ **SVal.getAsRegion()** - Returns `std::optional`, always check `has_value()` or use if-condition
+- ⚠️ **State->get<MapType>(Key)** - Returns `const Value*const *` (double pointer), must dereference twice: `**Ptr`
+- ❌ **REGISTER_MAP_WITH_PROGRAMSTATE** - Do NOT use in plugin checkers unless you fully understand the double pointer API
+- ❌ **TypedValueRegion::getDecl()** - Does not exist, use `VarRegion::getDecl()` or `FieldRegion::getDecl()` instead
+
+## CRITICAL: LLVM-21 Type System Rules (MUST FOLLOW)
+
+### ⚠️ CRITICAL: Common API Mistakes That Cause Compilation Errors
+
+The following are the most common errors that appear in generated code. **AVOID THESE PATTERNS:**
+
+#### 1. APSIntPtr Type Error
+
+**WRONG:**
+```cpp
+if (APSIntPtrVal.isZero()) { ... }        // ❌ isZero() doesn't exist
+if (APSIntPtrVal == 0) { ... }         // ❌ APSIntPtr is a POINTER!
+```
+
+**CORRECT:**
+```cpp
+if (APSIntPtrVal && *APSIntPtrVal == 0) { ... }  // ✅ Dereference first
+// OR
+if (APSIntPtrVal) {
+    if (*APSIntPtrVal == 0) { ... }               // ✅ Check null then dereference
+}
+```
+
+**KEY RULE:** `APSIntPtr` is `const llvm::APSInt*` - a **pointer** type. Must be:
+- Checked for null: `if (ptr)` before dereferencing
+- Dereferenced with `*`: `*ptr` or `ptr->getExtValue()`
+- Compared using dereferenced value: `*ptr == 0`
+
+#### 2. SymbolRef Type Error
+
+**WRONG:**
+```cpp
+if (SymbolRef Sym = Val.getAsSymbol()) {
+    // Trying to use Sym as SymbolRef type...
+}
+SVal SymVal = nonloc::SymbolVal(Sym);  // ❌ Wrong API
+```
+
+**CORRECT:**
+```cpp
+// Option 1: Use SymbolRef directly (it IS const SymExpr*)
+if (SymbolRef Sym = Val.getAsSymbol()) {
+    SValBuilder &SVB = C.getSValBuilder();
+    SVal SymVal = SVB.makeSymbolVal(Sym);
+    // Use SymVal
+}
+
+// Option 2: Just use the original SVal
+if (auto DV = Val.getAs<DefinedSVal>()) {
+    auto [StateTrue, StateFalse] = State->assume(DV, true);
+}
+```
+
+**KEY RULE:**
+- `SymbolRef` = `typedef const SymExpr* SymbolRef` (it's a pointer type!)
+- `Val.getAsSymbol()` returns `const SymExpr*` which IS `SymbolRef`
+- Use `SValBuilder::makeSymbolVal()` to create SVal from symbol
+
+#### 3. getSymVal API Error
+
+**WRONG:**
+```cpp
+const llvm::APSInt *Zero = nullptr;
+State->getConstraintManager().getSymVal(State, Sym, Zero);  // ❌ Wrong signature
+```
+
+**CORRECT:**
+```cpp
+// Use assume() method with comparison
+SValBuilder &SVB = C.getSValBuilder();
+llvm::APInt ZeroVal(32, 0);
+DefinedOrUnknownSVal ZeroConst = SVB.makeIntConst(ZeroVal);
+DefinedOrUnknownSVal EqualsZero = SVB.evalBinOp(State, BO_EQ, SymVal, ZeroConst);
+
+ProgramStateRef StTrue, StFalse;
+std::tie(StTrue, StFalse) = State->assume(EqualsZero, true);
+```
+
+#### 4. Report Variable Name Error
+
+**WRONG:**
+```cpp
+auto report = std::make_unique<PathSensitiveBugReport>(...);
+report->addRange(...);
+C.emitReport(std::move(report));
+```
+
+**CORRECT:**
+```cpp
+auto Report = std::make_unique<PathSensitiveBugReport>(...);  // Capital R
+Report->addRange(...);
+C.emitReport(std::move(Report));
+```
+
+### Copy-Paste Safe Patterns
+
+#### Pattern 1: Null pointer dereference detection
+
+```cpp
+void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+    ProgramStateRef State = C.getState();
+
+    // Check if location might be null
+    if (Loc.getAs<loc::ConcreteInt>()) {
+        // Concrete null pointer - definite bug
+        ExplodedNode *N = C.generateErrorNode(State);
+        if (N) {
+            auto Report = std::make_unique<PathSensitiveBugReport>(*BT_NullDeref,
+                "Dereference of null pointer", N);
+            C.emitReport(std::move(Report));
+        }
+    } else if (const MemRegion *MR = Loc.getAsRegion()) {
+        // Symbolic region - check constraints
+        SValBuilder &SVB = C.getSValBuilder();
+        SVal NullVal = SVB.makeNull();
+
+        DefinedOrUnknownSVal IsNull = SVB.evalBinOp(State, BO_EQ,
+            Loc.castAs<DefinedOrUnknownSVal>(),
+            NullVal, SVB.getConditionType());
+
+        ProgramStateRef StNotNull, StNull;
+        std::tie(StNotNull, StNull) = State->assume(IsNull, true);
+
+        if (StNull && !StNotNull) {
+            // Definitely null
+            ExplodedNode *N = C.generateErrorNode(StNull);
+            if (N) {
+                auto Report = std::make_unique<PathSensitiveBugReport>(*BT_NullDeref,
+                    "Dereference of null pointer", N);
+                C.emitReport(std::move(Report));
+            }
+        }
+    }
+}
+```
+
+#### Pattern 2: Checking pointer arguments
+
+```cpp
+void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+    for (unsigned i = 0; i < Call.getNumArgs(); ++i) {
+        SVal ArgVal = Call.getArgSVal(i);
+
+        // Check if argument might be null
+        if (const MemRegion *MR = ArgVal.getAsRegion()) {
+            if (const MemRegion *R = MR->getBaseRegion()) {
+                // Use constraint checking
+                ProgramStateRef State = C.getState();
+                SValBuilder &SVB = C.getSValBuilder();
+                SVal NullVal = SVB.makeNull();
+
+                DefinedOrUnknownSVal IsNull = SVB.evalBinOp(State, BO_EQ,
+                    ArgVal.castAs<DefinedOrUnknownSVal>(),
+                    NullVal, SVB.getConditionType());
+
+                ProgramStateRef StNotNull, StNull;
+                std::tie(StNotNull, StNull) = State->assume(IsNull, true);
+
+                if (StNull && !StNotNull) {
+                    // Definitely null - report
+                    ExplodedNode *N = C.generateErrorNode(StNull);
+                    if (N) {
+                        auto Report = std::make_unique<PathSensitiveBugReport>(*_BT_NullArg,
+                            "Null pointer passed as argument", N);
+                        C.emitReport(std::move(Report));
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### Pointer Type Handling - The #1 Source of Errors
+
+**MANY types in LLVM-21 are pointers. You MUST understand pointer vs value:**
+
+```cpp
+// ❌ WRONG - Calling method on pointer without dereferencing
+if (APSIntPtrVal.isZero()) ...
+
+// ❌ WRONG - Comparing pointer address to integer value
+if (APSIntPtrVal == 0) ...
+
+// ✅ CORRECT - Dereference pointer first
+if (*APSIntPtrVal == 0) ...
+
+// ✅ CORRECT - Check null, then dereference
+if (APSIntPtrVal && *APSIntPtrVal == 0) ...
+
+// ✅ CORRECT - Use arrow operator (preferred)
+if (APSIntPtrVal && APSIntPtrVal->getExtValue() == 0) ...
+```
+
+**Key Pattern - Always Check Null Before Dereference:**
+```cpp
+// For ANY pointer type (APSIntPtr, MemRegion*, etc.)
+if (PointerVal && *PointerVal == 0) {  // ✅ Safe
+    // Use *PointerVal
+}
+```
+
+### std::optional Handling - getAsRegion(), getAs()
+
+```cpp
+// ❌ WRONG - Not checking if optional has value
+const MemRegion *MR = Val.getAsRegion();
+if (MR) { ... }
+
+// ❌ WRONG - Using optional directly without extracting value
+if (Val.getAsRegion()) { ... }
+
+// ✅ CORRECT - Proper std::optional handling
+if (std::optional<const MemRegion*> MR = Val.getAsRegion()) {
+    if (*MR) {  // Check the inner pointer value
+        // Use **MR (double dereference: optional -> pointer -> region)
+        const MemRegion *Base = (*MR)->getBaseRegion();
+    }
+}
+
+// ✅ CORRECT - has_value() method
+auto MR = Val.getAsRegion();
+if (MR.has_value()) {
+    const MemRegion *R = *MR;  // Extract value from optional
+    if (R) {
+        // Safe to use R
+    }
+}
+
+// ✅ CORRECT - Short form for common pattern
+if (auto MR = Val.getAsRegion(); MR && *MR) {
+    // Use *MR directly
+}
+```
+
+### Utility Functions - CheckerContext Required
+
+```cpp
+// ❌ WRONG - Missing CheckerContext argument
+const MemRegion *MR = getMemRegionFromExpr(Expr);
+getMemRegionFromExpr(Expr, C, /*extra*/);
+
+// ✅ CORRECT - These utility functions require CheckerContext
+const MemRegion *MR = getMemRegionFromExpr(Expr, C);
+if (MR) {
+    MR = MR->getBaseRegion();  // Always call getBaseRegion()
+}
+
+// ❌ WRONG - EvaluateExprToInt wrong usage
+EvaluateExprToInt(Result, Expr, C);
+
+// ✅ CORRECT - Pass reference to store result
+llvm::APSInt Result;
+if (EvaluateExprToInt(Result, Expr, C)) {
+    int value = Result.getExtValue();
+}
+```
+
+### Type Reference Quick Reference
+
+| Type | Is Pointer? | Correct Usage |
+|------|-------------|--------------|
+| `APSIntPtr` | ✅ Yes | `if (ptr && *ptr == 0)` or `ptr->getExtValue()` |
+| `const MemRegion*` | ✅ Yes | `if (MR) MR->getBaseRegion()` |
+| `std::optional<T*>` | ❌ No | `if (opt && *opt)` or `if (opt.has_value())` |
+| `SVal` | ❌ No | Use `getAs<Type>()` to extract |
+| `SymbolRef` | ✅ Yes (pointer) | Cannot convert to SVal directly |
+
+### CRITICAL: SymbolRef to SVal Conversion (Common Error!)
+
+**SymbolRef is NOT directly convertible to SVal. This is a very common mistake!**
+
+```cpp
+// ❌ WRONG - getAsSymbol() returns SymExpr*, not directly assignable to SymbolRef
+SymbolRef Sym = Val.getAsSymbol();  // Type mismatch!
+
+// ❌ WRONG - Cannot construct SVal from SymbolRef directly
+SVal SymVal = SVal(Sym);  // ERROR
+
+// ✅ CORRECT - SymbolRef IS const SymExpr*, so the assignment works
+// (SymbolRef is typedef'd as const SymExpr*)
+if (SymbolRef Sym = Val.getAsSymbol()) {
+    // Sym is const SymExpr*, can be used with SValBuilder
+    SValBuilder &SVB = C.getSValBuilder();
+    SVal SymVal = SVB.makeSymbolVal(Sym);
+    // Use SymVal
+}
+
+// ✅ EVEN BETTER - Just use the original SVal directly!
+// If you already have an SVal, use it - no need to convert back and forth
+SVal Val = State->getSVal(Expr, C.getLocationContext());
+if (auto DV = Val.getAs<DefinedOrUnknownSVal>()) {
+    auto [StateTrue, StateFalse] = State->assume(DV, true);
+    // Use the state that proves the value
+}
+
+// ✅ CORRECT - For null pointer checking with symbols
+SVal Val = State->getSVal(Expr, C.getLocationContext());
+if (auto DV = Val.getAs<DefinedOrUnknownSVal>()) {
+    auto [StateNotNull, StateNull] = State->assume(*DV);
+    if (StateNull && !StateNotNull) {
+        // Pointer is definitely null
+    }
+}
+```
+
+### Common Patterns to Use
+
+**Checking a pointer's value:**
+```cpp
+// Pattern 1: Direct comparison
+if (Ptr && *Ptr == 0) { ... }
+
+// Pattern 2: Using getExtValue()
+if (APSIntPtrVal && APSIntPtrVal->getExtValue() == 0) { ... }
+```
+
+**Working with optional returns:**
+```cpp
+// Pattern: getAsRegion()
+if (auto MR = Val.getAsRegion(); MR && *MR) {
+    const MemRegion *Base = (*MR)->getBaseRegion();
+}
+
+// Pattern: getAs<Loc>()
+if (auto L = Val.getAs<Loc>()) {
+    // Use *L
+}
+```
+
+**Always include null safety:**
+```cpp
+// For any pointer or optional
+if (value && *value == target) { ... }
+if (optional && *optional) { ... }
+```
+
+## Pattern and Plan Paradigm
+
+**When generating your checker, follow these formats for the vulnerability pattern and implementation plan:**
+
+### Vulnerability Pattern Format
+
+```
+## Vulnerability Pattern
+
+[Pattern Name]
+
+Description:
+- A function receives a pointer as a parameter
+- The function directly dereferences the pointer (e.g., accesses member fields or calls methods via `->` operator) without first verifying the pointer is not null
+- This can lead to undefined behavior/crash if the caller passes a null pointer
+
+Code Example:
+```cpp
+void processObject(Object* obj) {
+    // Missing: if (obj == nullptr) return;
+    obj->doSomething();  // Potential null pointer dereference
+    int x = obj->value;  // Potential null pointer dereference
+}
+```
+
+Fix Example:
+```cpp
+void processObject(Object* obj) {
+    if (obj == nullptr) {  // Added null check
+        // Handle error or return early
+        return;
+    }
+    obj->doSomething();  // Safe dereference after null check
+    int x = obj->value;
+}
+```
+```
+
+### Implementation Plan Format
+
+```
+## Implementation Plan
+
+1. [Step Name - e.g., Initialization and Modeling]
+   • [Action 1]
+   • [Action 2]
+   • [Action 3]
+
+2. [Step Name - e.g., Modeling Memory Allocation]
+   • [Action 1]
+   • [Action 2]
+   • [Action 3]
+
+3. [Step Name - e.g., Modeling Memory Deallocation]
+   • [Action 1]
+   • [Action 2]
+   • [Action 3]
+
+...
+
+Each step should include:
+- Clear objectives
+- Specific callbacks to use (e.g., check::PreCall, check::Location)
+- State tracking requirements (if any)
+- Error detection and reporting logic
+```
+
+**Example Implementation Plan (MallocChecker style):**
+
+```
+## Implementation Plan
+
+1. Initialization and Modeling of Memory Regions
+   • Set up program–state maps (for example, a RegionState map keyed by the allocation's "symbol") that hold a "RefState" value
+   • Register the checker with the CheckerRegistry and initialize bug types for various reports
+
+2. Modeling Memory Allocation
+   • In callbacks for allocation calls (e.g. for malloc, calloc, new), intercept the call (via checkPostCall or EvalCall)
+   • Create a symbolic heap region for the returned pointer using helper functions
+   • Initialize the region's state by storing a RefState showing that the memory has been allocated
+
+3. Modeling Memory Deallocation
+   • Intercept deallocation calls (free, delete) in checkPreCall or checkPostCall
+   • Call helper functions to update state
+   • Detect errors like double free, free on non-heap regions, etc.
+
+4. Reporting Bugs
+   • When an error condition is detected, invoke handler functions
+   • Generate a non-fatal error node and create a PathSensitiveBugReport
+```
 
 ## Input
 
-### Bug Pattern
+### Vulnerability Description
 
-{{bug_pattern}}
-
-### Implementation Plan
-
-{{implementation_plan}}
-
-### Context
+{{vulnerability_pattern}}
 
 {{#if original_description}}
 **Original Description:**
@@ -139,6 +575,24 @@ llvm::Optional<Loc> L = val.getAs<Loc>();  // ❌ Deprecated!
 {{patch}}
 ```
 {{/if}}
+
+### Reference Examples from Knighter Database
+
+The following are complete examples from Knighter's checker database. Each example includes:
+- **Pattern Description**: The vulnerability pattern being detected
+- **Implementation Plan**: Step-by-step plan for implementing the checker
+- **Checker Implementation**: Complete working code
+
+Use these as reference to understand the structure and approach:
+
+{{#each rag_context}}
+---
+**Example: {{this.title}}**
+
+{{this.content}}
+
+---
+{{/each}}
 
 ### Available Resources
 
@@ -302,43 +756,82 @@ Your implementation MUST follow this structure:
 6. **Helper functions**: Additional functions used by callbacks
 7. **Plugin registration**: `clang_registerCheckers()` function (REQUIRED)
 
-## Complete Template Example
+## Complete Template Example - Minimal Null Pointer Checker
+
+**This is an EXAMPLE of a SIMPLE, FOCUSED checker (only ~60 lines!)**
 
 ```cpp
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "utility.h"  // For helper functions
 
 using namespace clang;
 using namespace ento;
 
 namespace {
-class ExampleChecker : public Checker<check::PreCall> {
+// Simple null pointer dereference checker
+class NullPointerDereferenceChecker : public Checker<check::Location> {
   mutable std::unique_ptr<BugType> BT;
 
 public:
-  ExampleChecker() : BT(new BugType(this, "Example Vulnerability", "Security")) {}
+  NullPointerDereferenceChecker() : BT(new BugType(this, "Null Pointer Dereference", "Security")) {}
 
-  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;
 };
+
 } // end anonymous namespace
 
-void ExampleChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
-  // Your checking logic here
+void NullPointerDereferenceChecker::checkLocation(SVal Loc, bool IsLoad,
+                                                     const Stmt *S,
+                                                     CheckerContext &C) const {
+  // Only check dereferences (loads and stores)
+  if (!IsLoad) return;
+
+  // Get the pointer being dereferenced
+  const MemRegion *MR = Loc.getAsRegion();
+  if (!MR) return;
+  MR = MR->getBaseRegion();
+  if (!MR) return;
+
+  // Get the symbol for the pointer
+  ProgramStateRef State = C.getState();
+  SVal PtrVal = State->getSVal(Loc, C.getLocationContext());
+
+  // Check if the pointer is definitely null
+  if (auto DV = PtrVal.getAs<DefinedOrUnknownSVal>()) {
+    auto [StateNotNull, StateNull] = State->assume(*DV);
+    if (StateNull && !StateNotNull) {
+      // Definitely null - report bug!
+      ExplodedNode *N = C.generateNonFatalErrorNode(StateNull);
+      if (!N) return;
+
+      auto Report = std::make_unique<PathSensitiveBugReport>(
+          *BT, "Dereference of null pointer", N);
+      C.emitReport(std::move(Report));
+    }
+  }
 }
 
 // Plugin registration - REQUIRED
 extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
-  registry.addChecker<ExampleChecker>(
-      "custom.ExampleChecker",
-      "Detects example vulnerabilities",
+  registry.addChecker<NullPointerDereferenceChecker>(
+      "security.NullPointerDereference",
+      "Detects null pointer dereferences",
       "");
 }
 
 extern "C" const char clang_analyzerAPIVersionString[] =
     CLANG_ANALYZER_API_VERSION_STRING;
 ```
+
+**Key Points:**
+- **Single callback** (`check::Location`) - only what we need
+- **No state tracking** - no REGISTER_MAP, no complex logic
+- **Simple detection** - check if pointer is null, report if so
+- **~60 lines total** - this is the target size!
 
 ## Examples
 
@@ -351,20 +844,22 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 ## Verification
 
 Before finalizing, verify:
+- [ ] **Total code is 100-200 lines maximum**
 - [ ] Uses `CheckerRegistry.h`, NOT `BuiltinCheckerRegistration.h`
 - [ ] Has `clang_registerCheckers()` function
-- [ ] All callbacks from the plan are implemented
-- [ ] **Checker is SPECIFIC to the bug pattern (not generic)**
-- [ ] **Every line relates to detecting the described vulnerability**
-- [ ] **No generic utility functions copied from utility.h**
+- [ ] **Single callback only** - don't add extra callbacks
+- [ ] **No state tracking macros** (REGISTER_MAP, etc.)
+- [ ] **No helper function bloat** - only if essential
+- [ ] [ ] **Checker is SPECIFIC to the bug pattern (not generic)**
+- [ ] [ ] **Every line relates to detecting the described vulnerability**
+- [ ] [ ] **No generic utility functions copied from utility.h**
 - [ ] NULL checks are in place
-- [ ] `getBaseRegion()` is called after `getMemRegionFromExpr()`
 - [ ] Bug reports use `generateNonFatalErrorNode()` for multiple bugs
 - [ ] No TODO comments or placeholders
 - [ ] No syntax errors
 - [ ] Compatible with **LLVM-21 APIs** (not Clang 18)
 - [ ] Uses `std::optional` instead of `llvm::Optional` (LLVM-21 requirement)
-- [ ] No `APSInt.isZero()` calls (use `(Value == 0)` instead)
+- [ ] No `APSInt.isZero()` calls (use proper pointer dereferencing)
 - [ ] Uses `dyn_cast_or_null<T>()` for potentially null pointers
 - [ ] Checker class is in anonymous namespace
 

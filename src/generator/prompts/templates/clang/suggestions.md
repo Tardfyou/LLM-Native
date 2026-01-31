@@ -133,9 +133,113 @@ if (MaxVal) {
 }
 ```
 
+### APSIntPtr Value Comparison
+**When comparing APSIntPtr values, use `getExtValue()` method.**
+
+`APSIntPtr` is `const llvm::APSInt*` - a pointer to an `APSInt` object.
+
+```cpp
+// ❌ WRONG - getValue() returns APInt&, not directly comparable with int
+if (auto ConcreteVal = Val.getAs<loc::ConcreteInt>()) {
+    return ConcreteVal->getValue() == 0;  // ERROR!
+}
+
+// ❌ WRONG - APSIntPtr is a pointer, can't compare directly
+if (auto ConcreteVal = Val.getAs<loc::ConcreteInt>()) {
+    if (ConcreteVal->getValue() == 0) { ... }  // ERROR!
+}
+
+// ✅ CORRECT - Use getExtValue() to get int64_t value
+if (auto ConcreteVal = Val.getAs<loc::ConcreteInt>()) {
+    return ConcreteVal->getExtValue() == 0;  // Correct!
+}
+
+// ✅ CORRECT - With null check
+if (auto ConcreteVal = Val.getAs<loc::ConcreteInt>()) {
+    if (ConcreteVal && ConcreteVal->getExtValue() == 0) { ... }
+}
+
+// ✅ CORRECT - Alternative: dereference APSInt to get APSInt, then compare
+if (auto ConcreteVal = Val.getAs<loc::ConcreteInt>()) {
+    if (*ConcreteVal == 0) { ... }  // APSInt overloads operator== with APInt
+}
+```
+
+**KEY DIFFERENCES:**
+- `getValue()` on `APSInt` returns `const APInt&` - cannot directly compare with `int`
+- `getExtValue()` on `APSInt` returns `int64_t` - can directly compare with `0`
+- `*APSIntPtr` returns `APSInt` object - can compare with `APInt(0)`
+
+## Constraint Checking with State->assume()
+
+**WARNING:** `State->isNull()` and `State->isNonNull()` do NOT exist or have wrong signatures!
+
+```cpp
+// ❌ WRONG - These methods don't exist or have wrong API
+if (State->isNull(*LocVal).isConstrainedTrue()) { ... }
+if (State->isNonNull(*LocVal).isConstrainedTrue()) { ... }
+
+// ✅ CORRECT - Use State->assume() instead
+ProgramStateRef StNotNull, StNull;
+std::tie(StNotNull, StNull) = State->assume(LocVal->castAs<DefinedOrUnknownSVal>());
+
+if (StNull && !StNotNull) {
+    // Definitely null
+    return true;
+} else if (StNotNull && !StNull) {
+    // Definitely non-null
+    return false;
+}
+// Unknown constraint - be conservative
+```
+
+**KEY RULE:** Use `State->assume(DefinedOrUnknownSVal)` which returns a pair:
+- `.first` (or `StNotNull`): state where value is constrained to be non-null
+- `.second` (or `StNull`): state where value is constrained to be null
+
+If only one state is feasible (the other is `nullptr`), you know the constraint for sure.
+
 ## Pointer Aliasing Analysis
 
-### Using Program State for Aliasing
+### WARNING: ProgramStateTrait MAP Return Type Depends on Value Type!
+
+**CRITICAL:** The return type of `State->get<MapType>(Key)` depends on the Value type in `REGISTER_MAP_WITH_PROGRAMSTATE`:
+
+```cpp
+// For POINTER value types (e.g., const MemRegion*, const SVal*)
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+// State->get<PtrAliasMap>(Key) returns: const Value*const * (double pointer)
+
+// For NON-POINTER value types (e.g., bool, int)
+REGISTER_MAP_WITH_PROGRAMSTATE(CheckedMap, const MemRegion*, bool)
+// State->get<CheckedMap>(Key) returns: const bool* (single pointer)
+```
+
+```cpp
+// ❌ WRONG - Treating pointer type as single pointer
+const MemRegion *Alias = State->get<PtrAliasMap>(CheckedMR);
+// Error: cannot initialize 'const MemRegion *' with 'const MemRegion *const *'
+
+// ✅ CORRECT - Handle pointer type with double pointer
+const MemRegion *const *AliasPtr = State->get<PtrAliasMap>(CheckedMR);
+if (AliasPtr && *AliasPtr) {
+    const MemRegion *Alias = *AliasPtr;  // Single dereference
+    // Use Alias
+}
+
+// ✅ CORRECT - Handle non-pointer type with single pointer
+const bool *Checked = State->get<CheckedMap>(MR);
+if (Checked && *Checked) {
+    // Value is true
+}
+```
+
+**RECOMMENDATION:** For simple null pointer checkers, AVOID using `REGISTER_MAP_WITH_PROGRAMSTATE` with `MemRegion*` keys. The double pointer API for pointer value types is error-prone. Instead:
+- Use simple null checking with `checkBranchCondition`
+- Track checked status without complex state maps
+- If you must use MAP, prefer `bool` or `int` value types (simpler single pointer API)
+
+### Using Program State for Aliasing (If You Must Use It)
 **For pointer analysis, use program state maps with `checkBind` callback.**
 
 ```cpp

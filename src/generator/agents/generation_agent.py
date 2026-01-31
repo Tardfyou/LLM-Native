@@ -120,6 +120,10 @@ class GenerationAgent(BaseAgent):
                 result = await self._generate_planned_code(task_data)
             elif task_type == "code_repair":
                 result = await self._repair_code(task_data)
+            elif task_type == "refine_plan_pattern":
+                result = await self._refine_plan_pattern(task_data)
+            elif task_type == "generate_plan_pattern_from_patch":
+                result = await self._generate_plan_pattern_from_patch(task_data)
             else:
                 raise ValueError(f"Unknown task type: {task_type}")
 
@@ -137,24 +141,24 @@ class GenerationAgent(BaseAgent):
     async def _generate_initial_code(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
         """基于分析结果生成初始代码 - 使用LLM"""
         analysis = task_data["analysis"]
-        # 修复：获取检索到的知识
-        retrieved_knowledge = task_data.get("retrieved_knowledge", [])
+        # 支持 rag_context (新) 和 retrieved_knowledge (旧) 两种变量名
+        rag_context = task_data.get("rag_context") or task_data.get("retrieved_knowledge", [])
 
         # 1. 确定漏洞类型和框架
         vuln_type = self._infer_vulnerability_type(analysis)
         framework = "clang"  # 默认使用Clang
 
         logger.info(f"Generating checker for vulnerability type: {vuln_type}")
-        if retrieved_knowledge:
-            logger.info(f"Using {len(retrieved_knowledge)} retrieved knowledge items")
+        if rag_context:
+            logger.info(f"Using {len(rag_context)} RAG context entries")
 
-        # 2. 构建代码生成提示词 - 传递检索到的知识
+        # 2. 构建代码生成提示词 - 传递 RAG 上下文
         if self.prompt_manager:
             generation_prompt = self.prompt_manager.build_code_generation_prompt(
                 vulnerability_type=vuln_type,
                 framework=framework,
                 analysis_context=analysis,
-                retrieved_knowledge=retrieved_knowledge  # 修复：传递检索到的知识
+                rag_context=rag_context  # 传递 RAG 上下文
             )
 
             # 使用LLM生成代码（如果有LLM客户端）
@@ -164,7 +168,8 @@ class GenerationAgent(BaseAgent):
                     # 使用 asyncio.to_thread 调用同步的 generate() 方法，避免阻塞事件循环
                     # 使用配置文件中的 max_tokens 设置
                     max_tokens = getattr(self.llm_client.config, 'max_tokens', 10000)
-                    temperature = getattr(self.llm_client.config, 'temperature', 0.3)
+                    # 代码生成阶段使用低温确保精确性 (temperature=0.0)
+                    temperature = 0.0
 
                     # 使用 asyncio.wait_for 添加超时保护（5分钟超时）
                     llm_response = await asyncio.wait_for(
@@ -814,3 +819,281 @@ void registerGenericChecker(clang::ento::CheckerRegistry &registry) {
         # 最后的回退：返回原响应（已移除think标签）
         logger.warning("Could not extract clean code block, returning filtered response")
         return response.strip()
+
+    async def _refine_plan_pattern(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
+        """精化plan和pattern - 基于RAG检索的Knighter示例"""
+        try:
+            # 提取输入参数
+            initial_pattern = task_data.get("initial_pattern", "")
+            rag_pattern = task_data.get("rag_pattern")
+            rag_plan = task_data.get("rag_plan")
+            rag_checker = task_data.get("rag_checker")
+            patch = task_data.get("patch", "")
+            vulnerability_description = task_data.get("vulnerability_description", "")
+            vulnerability_type = task_data.get("vulnerability_type", "")
+
+            logger.info("Starting plan/pattern refinement with Knighter examples...")
+
+            # 构建精化提示词
+            if self.prompt_manager:
+                refine_prompt = self.prompt_manager.build_refine_plan_pattern_prompt(
+                    initial_pattern=initial_pattern,
+                    rag_pattern=rag_pattern,
+                    rag_plan=rag_plan,
+                    rag_checker=rag_checker,
+                    patch=patch,
+                    vulnerability_description=vulnerability_description,
+                    vulnerability_type=vulnerability_type
+                )
+
+                # 使用LLM进行精化
+                if self.llm_client:
+                    logger.info("Calling LLM for plan/pattern refinement...")
+                    # Plan/Pattern 精炼使用高温度激发创造力 (temperature=1.0)
+                    llm_response = await asyncio.to_thread(
+                        self.llm_client.generate,
+                        refine_prompt,
+                        temperature=1.0,
+                        max_tokens=2000
+                    )
+
+                    if not llm_response:
+                        logger.warning("LLM returned empty response for refinement")
+                        return self._fallback_refinement(initial_pattern, rag_plan)
+                    else:
+                        # 解析LLM响应，提取精化后的pattern和plan
+                        refined_pattern, refined_plan = self._parse_refinement_response(llm_response)
+
+                        logger.success(f"Pattern refined: {len(refined_pattern)} chars")
+                        logger.success(f"Plan refined: {len(refined_plan)} chars")
+
+                        return {
+                            "refined_pattern": refined_pattern,
+                            "refined_plan": refined_plan,
+                            "raw_response": llm_response
+                        }
+                else:
+                    logger.warning("No LLM client available for refinement")
+                    return self._fallback_refinement(initial_pattern, rag_plan)
+            else:
+                logger.warning("No prompt manager available for refinement")
+                return self._fallback_refinement(initial_pattern, rag_plan)
+
+        except Exception as e:
+            logger.error(f"Plan/Pattern refinement failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return self._fallback_refinement(task_data.get("initial_pattern", ""), task_data.get("rag_plan"))
+
+    def _parse_refinement_response(self, response: str) -> tuple[str, str]:
+        """解析LLM精化响应，提取pattern和plan"""
+        import re
+
+        # 移除think标签（如果有）
+        response = self._remove_think_tags(response)
+
+        logger.debug(f"Parsing refinement response ({len(response)} chars)")
+
+        # 尝试提取"Refined Vulnerability Pattern"部分
+        pattern_match = re.search(
+            r'##\s*Refined\s+Vulnerability\s+Pattern\s*\n(.*?)(?=##\s*Refined\s+Implementation\s+Plan|$)',
+            response,
+            re.DOTALL | re.IGNORECASE
+        )
+
+        # 尝试提取"Refined Implementation Plan"部分
+        # 使用 [\s\S]*? 确保匹配所有字符（包括换行符）直到字符串末尾
+        plan_match = re.search(
+            r'##\s*Refined\s+Implementation\s+Plan\s*\n([\s\S]*?)(?=\Z|$)',
+            response,
+            re.IGNORECASE
+        )
+
+        if pattern_match:
+            refined_pattern = pattern_match.group(1).strip()
+            logger.debug(f"Found pattern section: {len(refined_pattern)} chars")
+        else:
+            refined_pattern = response[:1000]
+            logger.debug("Pattern section not found, using first 1000 chars")
+
+        if plan_match:
+            refined_plan = plan_match.group(1).strip()
+            logger.debug(f"Found plan section: {len(refined_plan)} chars")
+        else:
+            refined_plan = ""
+            logger.debug("Plan section not found with regex")
+
+        # 如果没有找到明确的section，尝试分割
+        if not refined_plan and "##" in response:
+            parts = response.split("##")
+            if len(parts) >= 2:
+                refined_pattern = parts[0].strip()
+                refined_plan = parts[1].strip()
+                logger.debug(f"Split by ##: pattern={len(refined_pattern)}, plan={len(refined_plan)}")
+        elif not refined_plan:
+            # 如果仍然没有plan，取后半部分
+            mid_point = len(response) // 2
+            refined_pattern = response[:mid_point].strip()
+            refined_plan = response[mid_point:].strip()
+            logger.debug(f"Split by midpoint: pattern={len(refined_pattern)}, plan={len(refined_plan)}")
+
+        logger.info(f"Final refined_plan length: {len(refined_plan)} chars")
+
+        return refined_pattern, refined_plan
+
+    def _remove_think_tags(self, text: str) -> str:
+        """移除think标签（DeepSeek模型特殊输出）"""
+        import re
+        # 移除 <think>...</think> 标签及其内容
+        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+
+    def _fallback_refinement(self, initial_pattern: str, rag_plan: Optional[str]) -> Dict[str, Any]:
+        """回退策略：如果RAG找到plan，直接使用；否则使用初始pattern"""
+        if rag_plan:
+            logger.info("Using RAG plan as fallback")
+            return {
+                "refined_pattern": initial_pattern,
+                "refined_plan": rag_plan,
+                "raw_response": "(fallback: used RAG plan)"
+            }
+        else:
+            logger.info("Using initial pattern as fallback")
+            return {
+                "refined_pattern": initial_pattern,
+                "refined_plan": "",
+                "raw_response": "(fallback: used initial pattern)"
+            }
+
+    async def _generate_plan_pattern_from_patch(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        基于 patch 生成漏洞模式和实现计划
+        参考 RAG 检索的 Knighter 范式模板
+
+        Args:
+            task_data: 包含 patch, vulnerability_description, vulnerability_type, rag_context
+
+        Returns:
+            包含生成 pattern 和 plan 的字典
+        """
+        try:
+            patch = task_data.get("patch", "")
+            vulnerability_description = task_data.get("vulnerability_description", "")
+            vulnerability_type = task_data.get("vulnerability_type", "")
+            rag_context = task_data.get("rag_context", [])
+
+            logger.info(f"Generating plan/pattern for vulnerability type: {vulnerability_type}")
+
+            # 构建 prompt - 包含范式模板和 RAG 上下文
+            if self.prompt_manager:
+                prompt = self.prompt_manager.build_plan_pattern_generation_prompt(
+                    patch=patch,
+                    vulnerability_description=vulnerability_description,
+                    vulnerability_type=vulnerability_type,
+                    rag_context=rag_context
+                )
+            else:
+                logger.warning("No prompt manager available")
+                return {
+                    "pattern": "",
+                    "plan": ""
+                }
+
+            # 调用 LLM 生成
+            if self.llm_client:
+                logger.info("Calling LLM to generate pattern and plan from patch...")
+
+                # 使用高温度激发创造力 (temperature=1.0)
+                llm_response = await asyncio.to_thread(
+                    self.llm_client.generate,
+                    prompt,
+                    temperature=1.0,
+                    max_tokens=3000  # 需要更长的输出
+                )
+
+                if not llm_response:
+                    logger.warning("LLM returned empty response")
+                    return {"pattern": "", "plan": ""}
+
+                # 解析响应，提取 pattern 和 plan
+                pattern, plan = self._parse_plan_pattern_response(llm_response)
+
+                logger.success(f"Pattern generated: {len(pattern)} chars")
+                logger.success(f"Plan generated: {len(plan)} chars")
+
+                return {
+                    "pattern": pattern,
+                    "plan": plan
+                }
+            else:
+                logger.warning("No LLM client available")
+                return {"pattern": "", "plan": ""}
+
+        except Exception as e:
+            logger.error(f"Error generating plan/pattern from patch: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"pattern": "", "plan": ""}
+
+    def _parse_plan_pattern_response(self, response: str) -> tuple[str, str]:
+        """
+        解析 LLM 响应，提取 pattern 和 plan
+
+        响应格式期望：
+        ## Vulnerability Pattern
+        [pattern content]
+
+        ## Implementation Plan
+        [plan content]
+        """
+        import re
+
+        # 移除 think 标签
+        response = self._remove_think_tags(response)
+
+        # 提取 Vulnerability Pattern 部分
+        pattern_match = re.search(
+            r'##\s*Vulnerability\s+Pattern\s*\n(.*?)(?=##\s*Implementation\s+Plan|\Z)',
+            response,
+            re.DOTALL | re.IGNORECASE
+        )
+
+        if pattern_match:
+            pattern = pattern_match.group(1).strip()
+        else:
+            pattern = ""
+            logger.debug("Pattern section not found in LLM response")
+
+        # 提取 Implementation Plan 部分
+        plan_match = re.search(
+            r'##\s*Implementation\s+Plan\s*\n(.*?)(?=\Z|##\s*[Vv]ulnerability)',
+            response,
+            re.DOTALL | re.IGNORECASE
+        )
+
+        if plan_match:
+            plan = plan_match.group(1).strip()
+        else:
+            plan = ""
+            logger.debug("Plan section not found in LLM response")
+
+        # 如果都找不到，尝试按分隔符分割
+        if not pattern and not plan and "##" in response:
+            parts = response.split("##")
+            if len(parts) >= 2:
+                # 第一个非空部分作为 pattern
+                for part in parts[1:]:
+                    part = part.strip()
+                    if part:
+                        pattern = part
+                        break
+                # 第二个非空部分作为 plan
+                found_first = False
+                for part in parts[1:]:
+                    part = part.strip()
+                    if part and found_first:
+                        plan = part
+                        break
+                    elif part:
+                        found_first = True
+
+        return pattern, plan

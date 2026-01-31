@@ -94,6 +94,282 @@ Before fixing APIs, **verify the basic code structure is complete**:
    #include "utility.h"
    ```
 
+## LLVM-21 Type System Critical Fixes (HIGH PRIORITY)
+
+### Problem 1: Pointer Types - APSIntPtr, MemRegion*, etc.
+
+**CRITICAL:** Many types in LLVM-21 are **pointers** (`*`). You must **dereference** them before using.
+
+#### APSIntPtr (const llvm::APSInt*)
+
+```cpp
+// ❌ WRONG - Trying to call method on pointer type
+if (APSIntPtrVal.isZero()) ...
+
+// ❌ WRONG - Comparing pointer directly to int (pointer vs int comparison)
+if (APSIntPtrVal == 0) ...
+
+// ✅ CORRECT - Dereference pointer first, then compare
+if (*APSIntPtrVal == 0) ...
+
+// ✅ CORRECT - Check null pointer first, then dereference
+if (APSIntPtrVal && *APSIntPtrVal == 0) ...
+
+// ✅ CORRECT - Use arrow operator (preferred)
+if (APSIntPtrVal && APSIntPtrVal->isZero()) ...
+
+// ✅ CORRECT - Get integer value
+if (APSIntPtrVal && APSIntPtrVal->getExtValue() == 0) ...
+```
+
+#### Key Understanding:
+```cpp
+APSIntPtr    = const llvm::APSInt*    // This is a POINTER!
+APSInt       = llvm::APSInt         // This is a VALUE
+
+// To get value from pointer:
+*APSIntPtrVal                      // Dereference
+APSIntPtrVal->getExtValue()        // Call method on pointer
+```
+
+### Problem 2: std::optional Handling - getAsRegion(), getAs()
+
+```cpp
+// ❌ WRONG - Not checking if optional has value
+const MemRegion *MR = Val.getAsRegion();
+if (MR) { ... }  // This might compile but is not the correct way
+
+// ❌ WRONG - Trying to use optional directly
+if (Val.getAsRegion()) { ... }
+
+// ✅ CORRECT - Proper std::optional handling
+if (std::optional<const MemRegion*> MR = Val.getAsRegion()) {
+    if (*MR) {
+        // Use **MR (double dereference: optional -> pointer -> value)
+        const MemRegion *Base = (*MR)->getBaseRegion();
+    }
+}
+
+// ✅ CORRECT - Alternative: has_value() method
+auto MR = Val.getAsRegion();
+if (MR.has_value()) {
+    const MemRegion *R = *MR;
+    if (R) {
+        // Use R
+    }
+}
+
+// ✅ CORRECT - Short form with structured binding
+if (auto MR = Val.getAsRegion(); MR && *MR) {
+    // Use *MR
+}
+```
+
+### Problem 3: Function Signature - getMemRegionFromExpr, EvaluateExprToInt
+
+```cpp
+// ❌ WRONG - Wrong number of arguments
+const MemRegion *MR = getMemRegionFromExpr(Expr);
+const MemRegion *MR = getMemRegionFromExpr(Expr, C, /*extra_arg*/);
+
+// ✅ CORRECT - These utility functions require CheckerContext
+const MemRegion *MR = getMemRegionFromExpr(Expr, C);
+if (MR) MR = MR->getBaseRegion();
+
+// ❌ WRONG - EvaluateExprToInt returns bool, void result
+EvaluateExprToInt(Result, Expr, C);
+
+// ✅ CORRECT - Pass reference to store result
+llvm::APSInt Result;
+if (EvaluateExprToInt(Result, Expr, C)) {
+    int value = Result.getExtValue();
+}
+```
+
+### Problem 4: Null Safety Pattern (Always use!)
+
+```cpp
+// ❌ WRONG - No null check before dereference
+const MemRegion *MR = getMemRegionFromExpr(E, C);
+const MemRegion *Base = MR->getBaseRegion();  // CRASH if MR is null!
+
+// ✅ CORRECT - Always check null pointers first
+const MemRegion *MR = getMemRegionFromExpr(E, C);
+if (MR) {
+    const MemRegion *Base = MR->getBaseRegion();
+    // Use Base
+}
+
+// ✅ CORRECT - For pointer chains
+if (auto MR = Val.getAsRegion(); MR && *MR) {
+    const MemRegion *Base = (*MR)->getBaseRegion();
+    // Safe to use Base
+}
+```
+
+### Type Reference Quick Guide
+
+| Type | Is Pointer? | How to Get Value | How to Check |
+|------|-------------|-----------------|--------------|
+| `APSIntPtr` | ✅ Yes | `*ptr` or `ptr->getExtValue()` | `if (ptr)` |
+| `const MemRegion*` | ✅ Yes | `ptr->getBaseRegion()` | `if (ptr)` |
+| `std::optional<T*>` | ❌ No | `*opt` (gives `T*`) | `if (opt)` or `opt.has_value()` |
+| `SVal` | ❌ No | Use `getAs<Type>()` | N/A |
+
+### Common Error Patterns and Fixes
+
+#### Error: "invalid operands to binary expression ('APSIntPtr' and 'int')"
+
+```cpp
+// Cause: Comparing pointer to int directly
+if (APSIntPtrVal == 0) { ... }
+
+// Fix: Dereference pointer first
+if (*APSIntPtrVal == 0) { ... }
+```
+
+#### Error: "no member named 'isZero' in 'clang::ento::APSIntPtr'"
+
+```cpp
+// Cause: Calling method on pointer without dereferencing
+if (APSIntPtrVal.isZero()) { ... }
+
+// Fix: Use arrow operator or dereference
+if (APSIntPtrVal->isZero()) { ... }
+// OR
+if (*APSIntPtrVal == 0) { ... }
+```
+
+#### Error: "no viable conversion from 'const llvm::APSInt*' to 'std::optional<llvm::APSInt>'"
+
+```cpp
+// Cause: Trying to assign pointer to std::optional value
+std::optional<llvm::APSInt> Opt = APSIntPtrVal;
+
+// Fix: Dereference pointer to get value, then wrap in optional
+if (APSIntPtrVal) {
+    std::optional<llvm::APSInt> Opt = *APSIntPtrVal;
+}
+```
+
+## Copy-Paste Safe Patterns
+
+When in doubt, use these proven patterns from Knighter checkers:
+
+### Pattern 1: Null pointer dereference detection
+
+```cpp
+void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+    ProgramStateRef State = C.getState();
+
+    // Check if location might be null
+    if (Loc.getAs<loc::ConcreteInt>()) {
+        // Concrete null pointer - definite bug
+        ExplodedNode *N = C.generateErrorNode(State);
+        if (N) {
+            auto Report = std::make_unique<PathSensitiveBugReport>(*BT_NullDeref,
+                "Dereference of null pointer", N);
+            C.emitReport(std::move(Report));
+        }
+    } else if (const MemRegion *MR = Loc.getAsRegion()) {
+        // Symbolic region - check constraints
+        SValBuilder &SVB = C.getSValBuilder();
+        SVal NullVal = SVB.makeNull();
+
+        DefinedOrUnknownSVal IsNull = SVB.evalBinOp(State, BO_EQ,
+            Loc.castAs<DefinedOrUnknownSVal>(),
+            NullVal, SVB.getConditionType());
+
+        ProgramStateRef StNotNull, StNull;
+        std::tie(StNotNull, StNull) = State->assume(IsNull, true);
+
+        if (StNull && !StNotNull) {
+            // Definitely null
+            ExplodedNode *N = C.generateErrorNode(StNull);
+            if (N) {
+                auto Report = std::make_unique<PathSensitiveBugReport>(*BT_NullDeref,
+                    "Dereference of null pointer", N);
+                C.emitReport(std::move(Report));
+            }
+        }
+    }
+}
+```
+
+### Pattern 2: Checking pointer arguments
+
+```cpp
+void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+    for (unsigned i = 0; i < Call.getNumArgs(); ++i) {
+        SVal ArgVal = Call.getArgSVal(i);
+
+        // Check if argument might be null
+        if (const MemRegion *MR = ArgVal.getAsRegion()) {
+            if (const MemRegion *R = MR->getBaseRegion()) {
+                // Use constraint checking
+                ProgramStateRef State = C.getState();
+                SValBuilder &SVB = C.getSValBuilder();
+                SVal NullVal = SVB.makeNull();
+
+                DefinedOrUnknownSVal IsNull = SVB.evalBinOp(State, BO_EQ,
+                    ArgVal.castAs<DefinedOrUnknownSVal>(),
+                    NullVal, SVB.getConditionType());
+
+                ProgramStateRef StNotNull, StNull;
+                std::tie(StNotNull, StNull) = State->assume(IsNull, true);
+
+                if (StNull && !StNotNull) {
+                    // Definitely null - report
+                    ExplodedNode *N = C.generateErrorNode(StNull);
+                    if (N) {
+                        auto Report = std::make_unique<PathSensitiveBugReport>(*_BT_NullArg,
+                            "Null pointer passed as argument", N);
+                        C.emitReport(std::move(Report));
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### Pattern 3: Creating SVal from Symbol
+
+```cpp
+// ✅ CORRECT
+if (SymbolRef Sym = Val.getAsSymbol()) {  // SymbolRef IS const SymExpr*
+    SValBuilder &SVB = C.getSValBuilder();
+    SVal SymVal = SVB.makeSymbolVal(Sym);
+    // Now SymVal can be used in assume(), etc.
+}
+```
+
+### Pattern 4: Comparing APSIntPtr values
+
+```cpp
+// ✅ CORRECT
+if (APSIntPtrVal1 && APSIntPtrVal2) {
+    if (*APSIntPtrVal1 == *APSIntPtrVal2) {
+        // Values are equal
+    }
+}
+
+// ✅ CORRECT (with null check)
+if (APSIntPtrVal) {
+    if (*APSIntPtrVal == 0) {
+        // Pointer is null
+    }
+}
+```
+
+## Remember: When in Doubt
+
+1. **Check types**: Is it a pointer? If yes, dereference with `*` or `->`
+2. **Use SValBuilder**: For creating SVal from symbols/regions
+3. **Use assume()**: For constraint checking (returns pair of states)
+4. **Check for null**: Always check pointer validity before dereferencing
+5. **Follow Knighter examples**: Knighter checkers are compiled and verified
+
 ## Common Hallucinated APIs (DO NOT USE)
 
 The following APIs **DO NOT EXIST** - LLM may hallucinate them. Use the correct alternatives:
@@ -143,6 +419,42 @@ const llvm::APSInt *Max = inferSymbolMaxVal(Sym);
 
 // CORRECT - Must pass CheckerContext
 const llvm::APSInt *Max = inferSymbolMaxVal(Sym, C);
+```
+
+### ❌ `nonloc::SymbolVal(Sym)` - SymbolRef to SVal conversion
+**CRITICAL: This is a very common error!**
+
+```cpp
+// ❌ WRONG - nonloc::SymbolVal does NOT accept SymbolRef directly
+SymbolRef Sym = Val.getAsSymbol();
+SVal SymVal = nonloc::SymbolVal(Sym);  // ERROR: no viable conversion
+
+// ❌ WRONG - Cannot construct SVal from SymbolRef
+SVal SymVal = SVal(Sym);  // ERROR
+
+// ✅ CORRECT - Use SValBuilder to create SVal from SymbolRef
+SymbolRef Sym = Val.getAsSymbol();
+if (Sym) {
+    SValBuilder &SVB = C.getSValBuilder();
+    SVal SymVal = SVB.makeSymbolVal(Sym);
+    // Use SymVal
+}
+
+// ✅ CORRECT - Alternative: Use the original SVal directly
+// If you already have an SVal, just use it - no need to convert
+SVal Val = State->getSVal(Expr, C.getLocationContext());
+if (SymbolRef Sym = Val.getAsSymbol()) {
+    // Use Val directly instead of trying to create new SVal from Sym
+    State = State->assume(Val.castAs<DefinedSVal>(), true);
+}
+
+// ✅ CORRECT - For constraint operations, use the original SVal
+ProgramStateRef State = C.getState();
+SVal Val = State->getSVal(Expr, C.getLocationContext());
+if (auto DV = Val.getAs<DefinedSVal>()) {
+    // Use *DV for assume() operations
+    auto [StateTrue, StateFalse] = State->assume(*DV);
+}
 ```
 
 ### ❌ Other common hallucinations
@@ -244,6 +556,10 @@ SVal Val = C.getSVal(Expr);
 ProgramStateRef State = C.getState();
 SVal Val = State->getSVal(Expr, C.getLocationContext());
 ```
+
+## Original Vulnerability Context
+
+{context_section}
 
 ## Checker Code to Fix
 
