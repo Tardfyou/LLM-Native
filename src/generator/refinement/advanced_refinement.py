@@ -12,15 +12,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Set, Dict, Any
 
-# 使用绝对导入以支持从容器运行
-from src.generator.refinement.report_triage import ReportTriage, ReportData
-from src.generator.models.refinement_models import (
+# 使用绝对导入（PYTHONPATH 包含 src/）
+from generator.refinement.report_triage import ReportTriage, ReportData
+from generator.models.refinement_models import (
     RefinementResult,
     RefineAttempt,
     GenerationProgress
 )
-from src.model.llm_client import LLMClient
-from src.generator.utils.code_utils import (
+from model.llm_client import LLMClient
+from generator.utils.code_utils import (
     extract_checker_code,
     error_formatting,
     grab_error_message

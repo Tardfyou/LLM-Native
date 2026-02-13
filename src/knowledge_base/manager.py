@@ -2,8 +2,13 @@
 Knowledge Base Manager
 知识库管理器 - 负责知识库的构建、搜索和管理
 支持多种数据源和混合检索
+
+支持环境感知：
+- 容器内运行：使用 /app 路径前缀
+- 宿主机运行：自动检测项目根目录
 """
 
+import os
 from typing import Dict, Any, List, Optional, Union, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +28,34 @@ from .models import KnowledgeEntry, SearchResult, KnowledgeStats
 # from .data_sources import DataSourceProcessor
 
 
+def _get_project_root() -> Path:
+    """
+    获取项目根目录（支持容器和宿主机环境）
+
+    Returns:
+        Path: 项目根目录
+    """
+    # 检查环境变量
+    env_root = os.environ.get("LLM_NATIVE_ROOT")
+    if env_root:
+        return Path(env_root)
+
+    # 检查是否在容器内
+    if Path("/app/config/config.yaml").exists():
+        return Path("/app")
+
+    # 从当前文件位置向上查找项目根
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "config" / "config.yaml").exists():
+            return parent
+        if (parent / "LLM-Native" / "config" / "config.yaml").exists():
+            return parent / "LLM-Native"
+
+    # 回退到默认位置
+    return current.parent.parent.parent
+
+
 class KnowledgeBaseManager:
     """
     知识库管理器
@@ -32,6 +65,10 @@ class KnowledgeBaseManager:
     2. 代码示例和查询模板
     3. CWE漏洞模式描述
     4. 专家知识和最佳实践
+
+    环境感知：
+    - 自动检测运行环境（容器/宿主机）
+    - 自动适配路径配置
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -42,7 +79,26 @@ class KnowledgeBaseManager:
             config: 配置字典
         """
         self.config = config or {}
-        self.knowledge_dir = Path(self.config.get('paths', {}).get('knowledge_dir', 'data/knowledge'))
+
+        # 环境感知的路径配置
+        project_root = _get_project_root()
+
+        # 优先使用配置中的路径，否则使用环境感知的默认路径
+        config_paths = self.config.get('paths', {})
+
+        # 处理配置中的路径（替换环境变量）
+        def resolve_path(config_path: str, default: str) -> Path:
+            if config_path:
+                # 替换环境变量占位符
+                path = config_path.replace('${LLM_NATIVE_ROOT:-/app}', str(project_root))
+                path = path.replace('${LLM_NATIVE_ROOT}', str(project_root))
+                return Path(path)
+            return project_root / default
+
+        self.knowledge_dir = resolve_path(
+            config_paths.get('knowledge_dir'),
+            'data/knowledge'
+        )
         self.knowledge_dir.mkdir(parents=True, exist_ok=True)
 
         # 初始化向量数据库
@@ -66,7 +122,7 @@ class KnowledgeBaseManager:
         else:
             logger.info("Vector database ready for hybrid search")
 
-        logger.info(f"KnowledgeBaseManager initialized with {len(self.entries)} entries")
+        logger.info(f"KnowledgeBaseManager initialized with {len(self.entries)} entries (root={project_root})")
 
     def _init_vector_db(self):
         """初始化向量数据库"""
@@ -579,6 +635,10 @@ class KnowledgeBaseManager:
                 logger.info("No entries to embed")
                 return True
 
+            # 获取项目根目录（环境感知）
+            project_root = _get_project_root()
+            pretrained_dir = project_root / 'pretrained_models'
+
             # 加载嵌入模型
             from sentence_transformers import SentenceTransformer
             from transformers import AutoTokenizer, AutoModel
@@ -590,16 +650,16 @@ class KnowledgeBaseManager:
             unixcoder_tokenizer = None
 
             # 加载BGE-M3
-            bge_path = "./pretrained_models/BAI/bge-m3"
-            if Path(bge_path).exists():
-                bge_model = SentenceTransformer(bge_path)
+            bge_path = pretrained_dir / "BAI" / "bge-m3"
+            if bge_path.exists():
+                bge_model = SentenceTransformer(str(bge_path))
                 logger.info("Loaded BGE-M3 model")
 
             # 加载UniXcoder
-            unixcoder_path = "./pretrained_models/microsoft/unixcoder-base"
-            if Path(unixcoder_path).exists():
-                unixcoder_tokenizer = AutoTokenizer.from_pretrained(unixcoder_path)
-                unixcoder_model = AutoModel.from_pretrained(unixcoder_path)
+            unixcoder_path = pretrained_dir / "microsoft" / "unixcoder-base"
+            if unixcoder_path.exists():
+                unixcoder_tokenizer = AutoTokenizer.from_pretrained(str(unixcoder_path))
+                unixcoder_model = AutoModel.from_pretrained(str(unixcoder_path))
                 logger.info("Loaded UniXcoder model")
 
             if not bge_model and not unixcoder_model:

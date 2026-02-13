@@ -79,6 +79,52 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 - ❌ `SymbolReaper::getDeadSymbols()` - This method does not exist in Clang 21
 - ❌ `llvm::Optional` - Deprecated in LLVM-21, use `std::optional` instead
 
+### ⚠️ CRITICAL: Hallucinated APIs That DO NOT EXIST
+
+**The following APIs are NOT part of Clang - NEVER use them:**
+
+| ❌ Hallucinated API | ✅ Correct Alternative |
+|-------------------|----------------------|
+| `isCallToFunction(Call, "name")` | `Call.getCalleeIdentifier()->getName() == "name"` |
+| `Call.isCalled(CFunction())` | `Call.getCalleeIdentifier()->getName() == "func"` |
+| `getElementSize(type)` | `C.getASTContext().getTypeSize(type)` |
+| `getBufferSize(expr)` | `C.getASTContext().getTypeSize(expr->getType())` |
+| `getArraySize(array)` | `C.getASTContext().getTypeSize(array->getType())` |
+| `evaluateToInt(expr, C)` | `EvaluateExprToInt(result, expr, C)` from utility.h |
+| `getMaxSignedBits()` | `getBitWidth()` |
+| `APSInt.isZero()` | `*APSInt == 0` or `APSInt->getExtValue() == 0` |
+| `State->isNull(SVal)` | `State->assume(SVal.castAs<DefinedOrUnknownSVal>()).first` |
+| `PathDiagnosticLocation::createBegin(S, SM, LC)` | `PathDiagnosticLocation(S, SM)` |
+
+**Examples:**
+
+```cpp
+// ❌ WRONG - isCallToFunction does NOT exist
+if (isCallToFunction(Call, "strcpy")) { }
+
+// ✅ CORRECT - use getCalleeIdentifier()
+const IdentifierInfo *II = Call.getCalleeIdentifier();
+if (II && II->getName() == "strcpy") { }
+
+// ❌ WRONG - getElementSize does NOT exist
+size_t size = getElementSize(type);
+
+// ✅ CORRECT - use ASTContext
+uint64_t size = C.getASTContext().getTypeSize(type);
+
+// ❌ WRONG - APInt cannot be directly assigned to APSInt
+llvm::APSInt sizeValue = sizeAPInt;
+
+// ✅ CORRECT - use APSInt constructor
+llvm::APSInt sizeValue(sizeAPInt, true);
+
+// ❌ WRONG - createBegin takes different parameters in LLVM-21
+Report->addNote(Msg, PathDiagnosticLocation::createBegin(S, C.getSourceManager(), C.getLocationContext()));
+
+// ✅ CORRECT - use PathDiagnosticLocation constructor
+Report->addNote(Msg, PathDiagnosticLocation(S, C.getSourceManager()));
+```
+
 ### CRITICAL: Always use `std::optional` NOT `Optional` or `llvm::Optional` for LLVM-21
 
 **WRONG:**

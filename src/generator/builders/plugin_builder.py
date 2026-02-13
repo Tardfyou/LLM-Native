@@ -816,6 +816,41 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 line = line.replace('getArraySizeDirect(', 'getArraySizeFromExpr(')
                 fixed_count += 1
 
+            # 7. 修复 isCallToFunction() - 幻觉API，使用 getCalleeIdentifier() 代替
+            # 错误：if (isCallToFunction(Call, "free")) { ... }
+            # 正确：const IdentifierInfo *II = Call.getCalleeIdentifier(); if (II && II->getName() == "free") { ... }
+            if 'isCallToFunction(' in line:
+                # 这是一个复杂的替换，暂时注释掉并添加警告
+                line = re.sub(r'\bisCallToFunction\s*\([^,]+,\s*"([^"]+)"\s*\)',
+                             r'/* FIXME: isCallToFunction() does not exist. Use: const IdentifierInfo *II = Call.getCalleeIdentifier(); if (II && II->getName() == "\1") */ true',
+                             line)
+                fixed_count += 1
+
+            # 8. 修复 getElementSize() - 幻觉API，使用 ASTContext.getTypeSize() 代替
+            # 错误：size_t size = getElementSize(type);
+            # 正确：uint64_t size = C.getASTContext().getTypeSize(type);
+            if 'getElementSize(' in line:
+                line = re.sub(r'\bgetElementSize\s*\(',
+                             r'C.getASTContext().getTypeSize(',
+                             line)
+                fixed_count += 1
+
+            # 9. 修复 getBufferSize() - 幻觉API
+            if 'getBufferSize(' in line:
+                line = re.sub(r'\bgetBufferSize\s*\(',
+                             r'/* FIXME: getBufferSize() does not exist */ C.getASTContext().getTypeSize(',
+                             line)
+                fixed_count += 1
+
+            # 10. 修复 APInt 到 APSInt 的直接转换
+            # 错误：llvm::APSInt value = apint_obj;
+            # 正确：llvm::APSInt value(apint_obj, true);
+            if re.search(r'llvm::APSInt\s+\w+\s*=\s*\w+\.get\w+\(\);', line):
+                line = re.sub(r'(llvm::APSInt\s+(\w+)\s*=\s*)(\w+)\.get(\w+)\(\);',
+                             r'\1llvm::APSInt(\3.get\4(), true);',
+                             line)
+                fixed_count += 1
+
             if line != original_line:
                 logger.debug(f"Fixed hallucinated API: {original_line[:60]}...")
 

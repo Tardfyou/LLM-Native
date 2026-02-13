@@ -7,16 +7,24 @@ project:
   description: "面向缺陷检测的大预言模型原生静态分析框架"
 
 # Directory Paths
+# 这些路径会被 environment.py 自动检测和覆盖
+# 在容器内: 使用 /app 前缀
+# 在宿主机: 自动检测项目根目录
+# 也可以通过环境变量覆盖:
+#   - LLM_NATIVE_ROOT: 项目根目录
+#   - LLM_NATIVE_DATA: 数据目录
+#   - LLM_NATIVE_RESULTS: 结果目录
+#   - LLM_NATIVE_LOGS: 日志目录
 paths:
-  root_dir: "/app"
-  src_dir: "/app/src"
-  data_dir: "/app/data"
-  results_dir: "/app/results"
-  logs_dir: "/app/logs"
-  knowledge_dir: "/app/data/knowledge"
-  benchmarks_dir: "/app/data/benchmarks"
-  config_dir: "/app/config"
-  prompt_templates_dir: "/app/prompt_templates"
+  root_dir: "${LLM_NATIVE_ROOT:-/app}"
+  src_dir: "${LLM_NATIVE_ROOT:-/app}/src"
+  data_dir: "${LLM_NATIVE_DATA:-${LLM_NATIVE_ROOT:-/app}/data}"
+  results_dir: "${LLM_NATIVE_RESULTS:-${LLM_NATIVE_ROOT:-/app}/results}"
+  logs_dir: "${LLM_NATIVE_LOGS:-${LLM_NATIVE_ROOT:-/app}/logs}"
+  knowledge_dir: "${LLM_NATIVE_ROOT:-/app}/data/knowledge"
+  benchmarks_dir: "${LLM_NATIVE_ROOT:-/app}/data/benchmarks"
+  config_dir: "${LLM_NATIVE_ROOT:-/app}/config"
+  prompt_templates_dir: "${LLM_NATIVE_ROOT:-/app}/prompt_templates"
 
 # LLM Configuration
 llm:
@@ -118,10 +126,25 @@ knowledge_base:
   # Vector database settings
   vector_db:
     type: "chromadb"  # Options: chromadb, milvus, qdrant
-    host: "localhost"
-    port: 8001
-    collection: "llm_native_knowledge"  # 修复：与import_knowledge.py保持一致
-    persist_directory: "/app/data/knowledge/vector_cache"  # 修复：使用实际的ChromaDB数据目录
+
+    # ChromaDB 连接模式:
+    # - "auto": 自动检测（推荐）- 优先尝试连接远程服务器，失败则使用本地持久化
+    # - "remote": 强制使用远程 ChromaDB 服务器
+    # - "local": 强制使用本地持久化存储
+    mode: "auto"
+
+    # 远程连接设置（当 mode 为 remote 或 auto 时使用）
+    # 可通过环境变量 CHROMA_HOST 和 CHROMA_PORT 覆盖
+    host: "${CHROMA_HOST:-localhost}"
+    port: ${CHROMA_PORT:-8001}
+
+    collection: "llm_native_knowledge"  # 与import_knowledge.py保持一致
+
+    # 本地持久化目录（当 mode 为 local 或 auto 时使用）
+    # 在容器内: /app/data/knowledge/vector_cache
+    # 在宿主机: 自动检测项目目录下的 data/knowledge/vector_cache
+    persist_directory: "${LLM_NATIVE_ROOT:-/app}/data/knowledge/vector_cache"
+
     # Embedding model
     embedding_model: "microsoft/unixcoder-base"
     # Retrieval settings

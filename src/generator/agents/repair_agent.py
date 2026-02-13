@@ -729,6 +729,59 @@ class RepairAgent(BaseAgent):
         # 但通常只需要1个参数，这个错误可能是其他原因导致的
         # 暂时不处理，等待确认 API 签名
 
+        # 21. 修复 isCallToFunction() - 幻觉API
+        # 错误：if (isCallToFunction(Call, "free")) { ... }
+        # 正确：const IdentifierInfo *II = Call.getCalleeIdentifier(); if (II && II->getName() == "free") { ... }
+        pattern_isCallToFunction = r'isCallToFunction\s*\(\s*(\w+)\s*,\s*"([^"]+)"\s*\)'
+        def replace_isCallToFunction(match):
+            call_var = match.group(1)  # Call
+            func_name = match.group(2)  # free
+            return f'({call_var}.getCalleeIdentifier() && ({call_var}.getCalleeIdentifier()->getName() == "{func_name}"))'
+
+        new_code = re.sub(pattern_isCallToFunction, replace_isCallToFunction, fixed_code)
+        if new_code != fixed_code:
+            fixes_applied.append("Fixed isCallToFunction() - replaced with getCalleeIdentifier()->getName() pattern")
+            fixed_code = new_code
+
+        # 22. 修复 getElementSize() - 幻觉API
+        # 错误：size_t size = getElementSize(type);
+        # 正确：uint64_t size = C.getASTContext().getTypeSize(type);
+        pattern_getElementSize = r'\bgetElementSize\s*\('
+        if re.search(pattern_getElementSize, fixed_code):
+            fixed_code = re.sub(pattern_getElementSize, 'C.getASTContext().getTypeSize(', fixed_code)
+            fixes_applied.append("Fixed getElementSize() - replaced with C.getASTContext().getTypeSize()")
+
+        # 23. 修复 APInt 到 APSInt 转换
+        # 错误：llvm::APSInt Value = SomeAPInt;
+        # 正确：llvm::APSInt Value(SomeAPInt, true);
+        pattern_apint_to_apsint = r'llvm::APSInt\s+(\w+)\s*=\s*(\w+\.get\w+\(\)|\w+\.(?:getValue|getExtValue)\(\));'
+        def replace_apint_to_apsint(match):
+            var_name = match.group(1)
+            source_expr = match.group(2)
+            # 判断源表达式是否已经是 APSInt
+            if 'APSInt' in source_expr or '->' in source_expr:
+                return f'llvm::APSInt {var_name}({source_expr}, true);'
+            else:
+                return f'llvm::APSInt {var_name}({source_expr});'
+
+        new_code = re.sub(pattern_apint_to_apsint, replace_apint_to_apsint, fixed_code)
+        if new_code != fixed_code:
+            fixes_applied.append("Fixed APInt to APSInt conversion - added constructor call")
+            fixed_code = new_code
+
+        # 24. 修复 getSVal() 调用缺少 LocationContext 参数
+        # 错误：SVal Val = State->getSVal(Expr);
+        # 正确：SVal Val = State->getSVal(Expr, C.getLocationContext());
+        pattern_getSval_missing_lc = r'State\s*->\s*getSVal\s*\(\s*(\w+)\s*\)(?!\s*,\s*C\.getLocationContext\(\))'
+        def replace_getSval_missing_lc(match):
+            expr_var = match.group(1)
+            return f'State->getSVal({expr_var}, C.getLocationContext())'
+
+        new_code = re.sub(pattern_getSval_missing_lc, replace_getSval_missing_lc, fixed_code)
+        if new_code != fixed_code:
+            fixes_applied.append("Fixed State->getSVal() - added LocationContext parameter")
+            fixed_code = new_code
+
         return fixed_code, fixes_applied
 
     def _fix_missing_includes(self, code: str, issues: List[str]) -> tuple[str, List[str]]:

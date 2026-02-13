@@ -684,7 +684,7 @@ void registerGenericChecker(clang::ento::CheckerRegistry &registry) {
 
         # 首先移除think标签（推理模型特殊输出）
         try:
-            from src.generator.utils.code_utils import remove_think_tags
+            from ..utils.code_utils import remove_think_tags
             response = remove_think_tags(response)
         except:
             pass

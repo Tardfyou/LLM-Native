@@ -9,10 +9,12 @@ LLM-Native Static Analysis Framework - Main Entry Point
 - 报告Triage系统
 - 简化版知识库
 - 改进的Prompt模板管理器
+- 环境感知：支持容器和宿主机运行
 """
 
 import asyncio
 import sys
+import os
 import yaml
 from pathlib import Path
 from typing import Optional
@@ -37,15 +39,119 @@ from validator.validator import Validator
 from generator.utils.code_utils import extract_checker_code
 
 
-def load_config(config_file: str = "config/config.yaml") -> dict:
-    """加载配置文件"""
-    config_path = Path(config_file)
-    if not config_path.exists():
-        logger.warning(f"Config file not found: {config_file}, using defaults")
-        return {}
+def _get_project_root() -> Path:
+    """
+    获取项目根目录（支持容器和宿主机环境）
 
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+    Returns:
+        Path: 项目根目录
+    """
+    # 检查环境变量
+    env_root = os.environ.get("LLM_NATIVE_ROOT")
+    if env_root:
+        return Path(env_root)
+
+    # 检查是否在容器内
+    if Path("/app/config/config.yaml").exists():
+        return Path("/app")
+
+    # 从当前文件位置向上查找项目根
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "config" / "config.yaml").exists():
+            return parent
+        if (parent / "LLM-Native" / "config" / "config.yaml").exists():
+            return parent / "LLM-Native"
+
+    # 回退到默认位置
+    return current.parent.parent
+
+
+def _expand_config_paths(config: dict, project_root: Path) -> dict:
+    """
+    展开配置中的路径变量
+
+    Args:
+        config: 配置字典
+        project_root: 项目根目录
+
+    Returns:
+        更新后的配置字典
+    """
+    def expand_value(value):
+        if isinstance(value, str):
+            # 替换环境变量占位符
+            value = value.replace('${LLM_NATIVE_ROOT:-/app}', str(project_root))
+            value = value.replace('${LLM_NATIVE_ROOT}', str(project_root))
+            # 替换其他环境变量
+            for env_key in ['LLM_NATIVE_DATA', 'LLM_NATIVE_RESULTS', 'LLM_NATIVE_LOGS', 'CHROMA_HOST', 'CHROMA_PORT']:
+                placeholder = f'${{{env_key}:-'
+                if placeholder in value:
+                    # 简单处理：提取默认值
+                    import re
+                    pattern = r'\$\{' + env_key + r':-([^}]*)\}'
+                    match = re.search(pattern, value)
+                    if match:
+                        env_value = os.environ.get(env_key, match.group(1))
+                        value = re.sub(pattern, env_value, value)
+        elif isinstance(value, dict):
+            return {k: expand_value(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [expand_value(v) for v in value]
+        return value
+
+    return expand_value(config)
+
+
+def load_config(config_file: str = "config/config.yaml") -> dict:
+    """
+    加载配置文件（支持环境感知）
+
+    Args:
+        config_file: 配置文件路径（相对于项目根目录或绝对路径）
+
+    Returns:
+        配置字典
+    """
+    # 获取项目根目录
+    project_root = _get_project_root()
+
+    # 解析配置文件路径
+    config_path = Path(config_file)
+    if not config_path.is_absolute():
+        config_path = project_root / config_file
+
+    if not config_path.exists():
+        logger.warning(f"Config file not found: {config_path}, using defaults")
+        config = {}
+    else:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f) or {}
+
+    # 展开配置中的路径变量
+    config = _expand_config_paths(config, project_root)
+
+    # 更新路径配置
+    if 'paths' not in config:
+        config['paths'] = {}
+
+    config['paths']['root_dir'] = str(project_root)
+    config['paths']['src_dir'] = str(project_root / 'src')
+    config['paths']['data_dir'] = str(project_root / 'data')
+    config['paths']['results_dir'] = str(project_root / 'results')
+    config['paths']['logs_dir'] = str(project_root / 'logs')
+    config['paths']['knowledge_dir'] = str(project_root / 'data' / 'knowledge')
+    config['paths']['config_dir'] = str(project_root / 'config')
+
+    # 添加环境信息
+    config['_environment'] = {
+        'project_root': str(project_root),
+        'in_container': Path("/.dockerenv").exists() or Path("/app/config/config.yaml").exists(),
+    }
+
+    logger.info(f"Config loaded from {config_path} (root={project_root})")
+
+    return config
 
 
 class LLMAnalysisFramework:
@@ -153,9 +259,8 @@ class LLMAnalysisFramework:
             # 异步运行生成
             result = asyncio.run(self.orchestrator.generate_checker(input_data))
 
-            # 确定输出目录
-            # 使用脚本所在目录的绝对路径作为基准，确保在容器中也能正确映射到宿主机
-            project_root = Path(__file__).parent.parent  # LLM-Native目录
+            # 确定输出目录（环境感知）
+            project_root = _get_project_root()
 
             # 生成时间戳，用于创建唯一目录
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')

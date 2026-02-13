@@ -268,7 +268,7 @@ class GeneratorOrchestrator:
                 "language": self.current_state.input_data.language
             },
             "task_type": "knowledge_retrieval",
-            "top_k": 3  # 增加到3以获取更多Knighter示例（pattern, plan, checker）
+            "top_k": 1  # 仅考虑最优解
         })
 
         # 存储检索结果用于后续使用

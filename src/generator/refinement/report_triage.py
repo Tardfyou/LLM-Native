@@ -9,9 +9,9 @@ import logging
 from typing import Dict, Any, Optional
 from pathlib import Path
 
-# 使用绝对导入
-from src.generator.models.refinement_models import TriageResult, ReportData
-from src.model.llm_client import LLMClient
+# 使用绝对导入（PYTHONPATH 包含 src/）
+from generator.models.refinement_models import TriageResult, ReportData
+from model.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 

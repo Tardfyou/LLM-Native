@@ -671,6 +671,45 @@ llvm::Optional<SVal> opt;
 if (*APSIntVal == 0) ...
 std::optional<SVal> opt = Val.getAs<SVal>();
 ```
+
+## ⚠️ APIs THAT DO NOT EXIST (NEVER USE THESE!)
+
+**The following APIs are HALLUCINATIONS - they DO NOT exist in Clang API:**
+
+| ❌ Hallucinated API | ✅ Correct Alternative |
+|-------------------|----------------------|
+| `isCallToFunction(Call, "name")` | `Call.getCalleeIdentifier()->getName() == "name"` |
+| `Call.isCalled(CFunction())` | `Call.getCalleeIdentifier()->getName() == "func"` |
+| `getElementSize(type)` | `C.getASTContext().getTypeSize(type)` |
+| `getBufferSize(expr)` | `C.getASTContext().getTypeSize(expr->getType())` |
+| `getArraySize(array)` | `C.getASTContext().getTypeSize(array->getType())` |
+| `evaluateToInt(expr, C)` | `EvaluateExprToInt(result, expr, C)` from utility.h |
+| `getMaxSignedBits()` | `getBitWidth()` |
+| `APSInt.isZero()` | `*APSInt == 0` or `APSInt->getExtValue() == 0` |
+| `State->isNull(SVal)` | `State->assume(SVal.castAs<DefinedOrUnknownSVal>()).first` |
+
+**Buffer Overflow Detection Specific APIs:**
+
+```cpp
+// ❌ WRONG - hallucinated API
+if (isCallToFunction(Call, "strcpy")) { }
+
+// ✅ CORRECT - use getCalleeIdentifier()
+const IdentifierInfo *II = Call.getCalleeIdentifier();
+if (II && II->getName() == "strcpy") { }
+
+// ❌ WRONG - hallucinated API
+size_t size = getElementSize(elementType);
+
+// ✅ CORRECT - use ASTContext
+uint64_t size = C.getASTContext().getTypeSize(elementType);
+
+// ❌ WRONG - APInt cannot be directly assigned to APSInt
+llvm::APSInt sizeValue = sizeAPInt;
+
+// ✅ CORRECT - use APSInt constructor
+llvm::APSInt sizeValue(sizeAPInt, true);
+```
 """
 
     def _select_examples_for_code_generation(self, vulnerability_type: str) -> str:

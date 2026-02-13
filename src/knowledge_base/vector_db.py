@@ -6,12 +6,18 @@ Vector Database Integration
 - 稠密检索（Dense）：基于语义嵌入的相似度搜索
 - 稀疏检索（Sparse）：基于关键词的精确匹配
 - 混合检索（Hybrid）：结合两种方法的加权结果
+
+支持两种运行模式：
+- 本地模式（local）：使用本地持久化存储
+- 远程模式（remote）：连接到 ChromaDB 服务器
 """
 
 from typing import Dict, Any, List, Optional, Tuple, Union
 import json
+import os
 from pathlib import Path
 import logging
+import socket
 
 # 延迟导入numpy，避免在不支持的环境中出错
 try:
@@ -42,6 +48,56 @@ except ImportError:
 from .models import KnowledgeEntry, SearchResult
 
 
+def _get_project_root() -> Path:
+    """
+    获取项目根目录（支持容器和宿主机环境）
+
+    Returns:
+        Path: 项目根目录
+    """
+    # 检查环境变量
+    env_root = os.environ.get("LLM_NATIVE_ROOT")
+    if env_root:
+        return Path(env_root)
+
+    # 检查是否在容器内
+    if Path("/app/config/config.yaml").exists():
+        return Path("/app")
+
+    # 从当前文件位置向上查找项目根
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "config" / "config.yaml").exists():
+            return parent
+        if (parent / "LLM-Native" / "config" / "config.yaml").exists():
+            return parent / "LLM-Native"
+
+    # 回退到默认位置
+    return current.parent.parent.parent
+
+
+def _check_chroma_server(host: str, port: int, timeout: float = 2.0) -> bool:
+    """
+    检查 ChromaDB 服务器是否可访问
+
+    Args:
+        host: 主机名
+        port: 端口号
+        timeout: 超时时间（秒）
+
+    Returns:
+        bool: True 如果可以连接
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
 class VectorDatabase:
     """
     向量数据库管理器 - 基于ChromaDB的混合检索系统
@@ -52,6 +108,7 @@ class VectorDatabase:
     3. 元数据过滤：基于语言、框架、模块的多级过滤
     4. 多路召回：先召回更多候选，再用交叉编码器重排序
     5. 增量更新：支持动态添加和更新条目
+    6. 环境感知：自动检测运行环境，支持本地/远程 ChromaDB
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -86,15 +143,38 @@ class VectorDatabase:
         self.client = None
         self.collection = None
 
-        # 本地缓存
-        # 修复：优先使用 knowledge_base.vector_db.persist_directory 配置
-        # 如果没有配置，则使用默认的 knowledge_dir / 'vector_cache'
+        # === 环境感知的路径配置 ===
+        project_root = _get_project_root()
+
+        # ChromaDB 模式配置
+        self.chroma_mode = config.get('knowledge_base', {}).get('vector_db', {}).get('mode', 'auto')
+
+        # 远程连接配置
+        self.chroma_host = os.environ.get('CHROMA_HOST') or config.get('knowledge_base', {}).get('vector_db', {}).get('host', 'localhost')
+        self.chroma_port = int(os.environ.get('CHROMA_PORT') or config.get('knowledge_base', {}).get('vector_db', {}).get('port', 8001))
+
+        # 本地缓存目录
         configured_persist_dir = config.get('knowledge_base', {}).get('vector_db', {}).get('persist_directory')
         if configured_persist_dir:
+            # 替换环境变量
+            configured_persist_dir = configured_persist_dir.replace('${LLM_NATIVE_ROOT:-/app}', str(project_root))
+            configured_persist_dir = configured_persist_dir.replace('${LLM_NATIVE_ROOT}', str(project_root))
             self.cache_dir = Path(configured_persist_dir)
         else:
-            self.cache_dir = Path(config.get('paths', {}).get('knowledge_dir', 'data/knowledge')) / 'vector_cache'
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.cache_dir = project_root / 'data' / 'knowledge' / 'vector_cache'
+
+        # 确定实际的连接模式
+        self._determine_connection_mode()
+
+        # 创建本地缓存目录（如果使用本地模式）
+        if self.actual_mode == 'local':
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"VectorDatabase: mode={self.actual_mode}, collection={self.collection_name}")
+        if self.actual_mode == 'remote':
+            logger.info(f"  Remote: {self.chroma_host}:{self.chroma_port}")
+        else:
+            logger.info(f"  Local: {self.cache_dir}")
 
     def initialize(self) -> bool:
         """
@@ -116,102 +196,160 @@ class VectorDatabase:
             logger.error(f"Failed to initialize vector database: {e}")
             return False
 
+    def _determine_connection_mode(self):
+        """
+        确定实际的连接模式
+
+        根据 mode 配置和环境检测结果决定使用本地还是远程模式
+        """
+        if self.chroma_mode == 'local':
+            self.actual_mode = 'local'
+        elif self.chroma_mode == 'remote':
+            # 强制远程模式，检查服务器是否可用
+            if _check_chroma_server(self.chroma_host, self.chroma_port):
+                self.actual_mode = 'remote'
+            else:
+                logger.warning(f"ChromaDB server not available at {self.chroma_host}:{self.chroma_port}")
+                logger.warning("Falling back to local mode")
+                self.actual_mode = 'local'
+        else:  # auto
+            # 自动检测：优先尝试远程，失败则使用本地
+            if _check_chroma_server(self.chroma_host, self.chroma_port):
+                self.actual_mode = 'remote'
+                logger.info(f"Auto-detected ChromaDB server at {self.chroma_host}:{self.chroma_port}")
+            else:
+                self.actual_mode = 'local'
+                logger.info("ChromaDB server not available, using local persistence")
+
     def _init_chromadb(self) -> bool:
-        """初始化ChromaDB"""
+        """初始化ChromaDB（支持本地和远程模式）"""
         if not CHROMADB_AVAILABLE:
             logger.error("ChromaDB not installed")
             return False
 
         try:
             # 设置环境变量以使用本地模型（在初始化前设置）
-            import os
             os.environ['HF_HUB_OFFLINE'] = '1'
             os.environ['TRANSFORMERS_OFFLINE'] = '1'
             # 指向本地模型缓存目录
-            pretrained_path = Path('./pretrained_models').absolute()
+            pretrained_path = _get_project_root() / 'pretrained_models'
             if pretrained_path.exists():
                 os.environ['HF_HOME'] = str(pretrained_path)
                 os.environ['HUGGINGFACE_HUB_CACHE'] = str(pretrained_path)
                 logger.info(f"Set HF_HOME to local cache: {pretrained_path}")
+
             # 首先初始化本地嵌入模型（用于ChromaDB的embedding function）
             if not self.embedding_models:
                 if not self.initialize_embedding_model():
                     logger.warning("Failed to initialize local embedding models, ChromaDB will use default embedding")
 
-            # 配置ChromaDB
-            settings = Settings(
-                persist_directory=str(self.cache_dir),
-                is_persistent=True
-                # 注意: 新版ChromaDB不再支持 anonymously_telemetry 参数
-            )
-
-            self.client = chromadb.PersistentClient(path=str(self.cache_dir), settings=settings)
-
             # 创建自定义 embedding function（使用本地模型）
-            embedding_function = None
-            if self.embedding_models and 'sentence_transformer' in self.embedding_models:
-                # 使用本地的 sentence-transformer 模型
-                from chromadb.utils import embedding_functions
+            embedding_function = self._create_embedding_function()
 
-                # 构建本地模型路径
-                local_model_name = "all-MiniLM-L6-v2"
-                local_model_path = Path('./pretrained_models') / f"models--sentence-transformers--{local_model_name}"
+            # 根据模式初始化客户端
+            if self.actual_mode == 'remote':
+                success = self._init_remote_chromadb(embedding_function)
+            else:
+                success = self._init_local_chromadb(embedding_function)
 
-                # 查找实际的模型目录（在snapshots子目录中）
-                if local_model_path.exists():
-                    snapshot_dirs = list(local_model_path.glob("snapshots/*"))
-                    if snapshot_dirs:
-                        actual_model_path = str(snapshot_dirs[0])
-                    else:
-                        actual_model_path = str(local_model_path)
+            return success
+
+        except Exception as e:
+            logger.error(f"Failed to initialize ChromaDB: {e}")
+            return False
+
+    def _create_embedding_function(self):
+        """创建嵌入函数"""
+        try:
+            from chromadb.utils import embedding_functions
+
+            # 使用本地的 sentence-transformer 模型
+            local_model_name = "all-MiniLM-L6-v2"
+            local_model_path = _get_project_root() / 'pretrained_models' / f"models--sentence-transformers--{local_model_name}"
+
+            # 查找实际的模型目录（在snapshots子目录中）
+            if local_model_path.exists():
+                snapshot_dirs = list(local_model_path.glob("snapshots/*"))
+                if snapshot_dirs:
+                    actual_model_path = str(snapshot_dirs[0])
                 else:
-                    # 如果本地路径不存在，回退到HuggingFace标识符
-                    actual_model_path = "sentence-transformers/all-MiniLM-L6-v2"
+                    actual_model_path = str(local_model_path)
+            else:
+                # 如果本地路径不存在，回退到HuggingFace标识符
+                actual_model_path = "sentence-transformers/all-MiniLM-L6-v2"
 
-                embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-                    model_name=actual_model_path,  # 使用本地路径
-                    device="cpu"
-                )
-                logger.info(f"Using local sentence-transformers model for ChromaDB: {actual_model_path}")
+            embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=actual_model_path,
+                device="cpu"
+            )
+            logger.info(f"Using embedding function: {actual_model_path}")
+            return embedding_function
 
-            elif self.embedding_models and 'unixcoder' in self.embedding_models:
-                # 回退到使用本地 unixcoder 模型
-                from chromadb.utils import embedding_functions
+        except Exception as e:
+            logger.warning(f"Failed to create embedding function: {e}")
+            return None
 
-                # 构建本地模型路径
-                local_model_path = Path('./pretrained_models') / f"models--microsoft--unixcoder-base"
-
-                if local_model_path.exists():
-                    snapshot_dirs = list(local_model_path.glob("snapshots/*"))
-                    actual_model_path = str(snapshot_dirs[0]) if snapshot_dirs else str(local_model_path)
-                else:
-                    actual_model_path = "microsoft/unixcoder-base"
-
-                embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-                    model_name=actual_model_path,
-                    device="cpu"
-                )
-                logger.info(f"Using local unixcoder model for ChromaDB: {actual_model_path}")
+    def _init_remote_chromadb(self, embedding_function) -> bool:
+        """初始化远程 ChromaDB 连接"""
+        try:
+            self.client = chromadb.HttpClient(
+                host=self.chroma_host,
+                port=self.chroma_port
+            )
 
             # 获取或创建集合
             try:
                 self.collection = self.client.get_collection(
                     name=self.collection_name,
-                    embedding_function=embedding_function  # 使用本地模型
+                    embedding_function=embedding_function
                 )
-                logger.info(f"Loaded existing ChromaDB collection: {self.collection_name}")
+                logger.info(f"Connected to remote ChromaDB collection: {self.collection_name}")
+            except Exception as e:
+                if "does not exist" in str(e) or "not found" in str(e).lower():
+                    self.collection = self.client.create_collection(
+                        name=self.collection_name,
+                        embedding_function=embedding_function
+                    )
+                    logger.info(f"Created remote ChromaDB collection: {self.collection_name}")
+                else:
+                    raise
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to connect to remote ChromaDB: {e}")
+            logger.info("Falling back to local mode")
+            self.actual_mode = 'local'
+            return self._init_local_chromadb(embedding_function)
+
+    def _init_local_chromadb(self, embedding_function) -> bool:
+        """初始化本地持久化 ChromaDB"""
+        try:
+            # 确保目录存在
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # 配置ChromaDB
+            settings = Settings(
+                persist_directory=str(self.cache_dir),
+                is_persistent=True
+            )
+
+            self.client = chromadb.PersistentClient(path=str(self.cache_dir), settings=settings)
+
+            # 获取或创建集合
+            try:
+                self.collection = self.client.get_collection(
+                    name=self.collection_name,
+                    embedding_function=embedding_function
+                )
+                logger.info(f"Loaded local ChromaDB collection: {self.collection_name}")
             except (ValueError, Exception) as e:
-                # 集合不存在或其他错误，创建新的
                 if "does not exist" in str(e) or "not found" in str(e).lower() or isinstance(e, ValueError):
-                    try:
-                        self.collection = self.client.create_collection(
-                            name=self.collection_name,
-                            embedding_function=embedding_function  # 使用本地模型
-                        )
-                        logger.info(f"Created new ChromaDB collection: {self.collection_name} (with local embedding)")
-                    except Exception as create_e:
-                        logger.error(f"Failed to create ChromaDB collection: {create_e}")
-                        return False
+                    self.collection = self.client.create_collection(
+                        name=self.collection_name,
+                        embedding_function=embedding_function
+                    )
+                    logger.info(f"Created local ChromaDB collection: {self.collection_name}")
                 else:
                     logger.error(f"Failed to get ChromaDB collection: {e}")
                     return False
@@ -219,7 +357,7 @@ class VectorDatabase:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB: {e}")
+            logger.error(f"Failed to initialize local ChromaDB: {e}")
             return False
 
     def _init_milvus(self) -> bool:
@@ -245,13 +383,16 @@ class VectorDatabase:
             return False
 
         try:
+            # 获取项目根目录（环境感知）
+            project_root = _get_project_root()
+            pretrained_dir = project_root / 'pretrained_models'
+
             # 优先加载兼容sentence-transformers的通用嵌入模型
             primary_models = [
                 ('sentence-transformers/all-MiniLM-L6-v2', 'sentence_transformer'),  # ⭐ 主要的句子嵌入模型
             ]
 
             # 代码专用模型暂时只使用通用sentence-transformers模型
-            # BAAI/bge-m3虽然下载了但与sentence-transformers不兼容
             code_models = [
                 # ('BAAI/bge-m3', 'bge'),  # 暂时禁用，等待兼容性修复
                 # ('BAAI/bge-large-zh-v1.5', 'bge_zh')  # 中文增强版本（如果下载了）
@@ -268,13 +409,12 @@ class VectorDatabase:
                     if model_name.startswith('sentence-transformers/'):
                         try:
                             # 设置离线模式环境变量
-                            import os
                             os.environ['HF_HUB_OFFLINE'] = '1'
                             os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
-                            # 构建本地模型路径
+                            # 构建本地模型路径（使用环境感知的路径）
                             local_model_name = model_name.replace('sentence-transformers/', '')
-                            local_model_path = Path('./pretrained_models') / f"models--sentence-transformers--{local_model_name.replace('/', '--')}"
+                            local_model_path = pretrained_dir / f"models--sentence-transformers--{local_model_name.replace('/', '--')}"
 
                             if local_model_path.exists():
                                 # 查找实际的模型目录（可能在snapshots子目录中）
@@ -287,8 +427,8 @@ class VectorDatabase:
                                 # 使用本地路径加载
                                 self.embedding_models[model_key] = SentenceTransformer(
                                     str(actual_model_path),
-                    device='cpu'  # 可以配置为GPU
-                )
+                                    device='cpu'  # 可以配置为GPU
+                                )
                                 logger.info(f"✅ Loaded {model_key}: {model_name} (local sentence-transformers)")
                                 continue
                             else:
@@ -299,7 +439,7 @@ class VectorDatabase:
                             continue
 
                     # 对于其他模型，检查本地文件是否存在
-                    model_path = Path('./pretrained_models') / f"models--{model_name.replace('/', '--')}"
+                    model_path = pretrained_dir / f"models--{model_name.replace('/', '--')}"
                     if not model_path.exists():
                         logger.warning(f"❌ {model_name} 模型路径未找到")
                         continue
@@ -307,7 +447,6 @@ class VectorDatabase:
                     # 检查模型类型是否被sentence-transformers支持
                     config_path = model_path / "config.json"
                     if config_path.exists():
-                        import json
                         with open(config_path, 'r') as f:
                             config = json.load(f)
                         model_type = config.get('model_type', '')
@@ -355,12 +494,11 @@ class VectorDatabase:
                 if self.cross_encoder_name:
                     from sentence_transformers import CrossEncoder
                     # 设置离线模式
-                    import os
                     os.environ['HF_HUB_OFFLINE'] = '1'
                     os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
-                    # 构建本地模型路径
-                    local_model_path = Path('./pretrained_models') / f"models--{self.cross_encoder_name.replace('/', '--')}"
+                    # 构建本地模型路径（使用环境感知的路径）
+                    local_model_path = pretrained_dir / f"models--{self.cross_encoder_name.replace('/', '--')}"
 
                     if local_model_path.exists():
                         # 查找实际的模型目录（可能在snapshots子目录中）
@@ -1033,33 +1171,15 @@ class VectorDatabase:
             return False
 
         try:
-            # 删除并重新创建集合（使用本地embedding function）
             # 获取当前使用的embedding function
-            from chromadb.utils import embedding_functions
-
-            embedding_function = None
-            if self.embedding_models and 'sentence_transformer' in self.embedding_models:
-                # 构建本地模型路径
-                local_model_name = "all-MiniLM-L6-v2"
-                local_model_path = Path('./pretrained_models') / f"models--sentence-transformers--{local_model_name}"
-
-                if local_model_path.exists():
-                    snapshot_dirs = list(local_model_path.glob("snapshots/*"))
-                    actual_model_path = str(snapshot_dirs[0]) if snapshot_dirs else str(local_model_path)
-                else:
-                    actual_model_path = "sentence-transformers/all-MiniLM-L6-v2"
-
-                embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-                    model_name=actual_model_path,
-                    device="cpu"
-                )
+            embedding_function = self._create_embedding_function()
 
             self.client.delete_collection(self.collection_name)
             self.collection = self.client.create_collection(
                 name=self.collection_name,
-                embedding_function=embedding_function  # 使用本地embedding function
+                embedding_function=embedding_function
             )
-            logger.info(f"Cleared collection: {self.collection_name} (with local embedding)")
+            logger.info(f"Cleared collection: {self.collection_name}")
             return True
         except Exception as e:
             logger.error(f"Failed to clear collection: {e}")

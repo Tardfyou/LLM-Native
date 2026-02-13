@@ -56,10 +56,10 @@ streamlit>=1.28.0
 gradio>=4.8.0
 
 # Utilities
-loguru>=0.7.0
+loguru
 tqdm>=4.66.0
 rich>=13.7.0
-pyyaml>=6.0
+pyyaml
 python-dotenv>=1.0.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
@@ -92,4 +92,4 @@ pylint>=3.0.0
 bandit>=1.7.0
 
 # CLI Tools
-fire>=0.7.0
+fire
