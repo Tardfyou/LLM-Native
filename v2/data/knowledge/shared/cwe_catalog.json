@@ -1,0 +1,582 @@
+[
+  {
+    "id": "cwe-120",
+    "category": "buffer_overflow",
+    "title": "CWE-120: Buffer Copy without Checking Size of Input ('Classic Buffer Overflow')",
+    "description": "The product copies an input buffer to an output buffer without verifying that the size of the input buffer is less than the size of the output buffer.",
+    "internal_family": "buffer_overflow",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch replaces strcpy/strcat/sprintf/gets style sinks or wraps memcpy-like sinks with explicit length checks.",
+      "A length variable, destination capacity, and the write sink are bound together in the same control-flow region.",
+      "The fix introduces checked snprintf return values, sizeof guards, or early-return barriers before the copy."
+    ],
+    "fix_signals": [
+      "Guard the copy with a destination-capacity check that dominates the sink.",
+      "Prefer bounded APIs only when the returned length or size argument is also validated.",
+      "Keep source length, destination extent, and the sink in the same proof obligation."
+    ],
+    "csa_guidance": [
+      "Model destination regions, copied byte count, and dominating guards together.",
+      "Do not suppress unbounded sinks just because the source length is symbolic.",
+      "Null checks are not bounds proofs."
+    ],
+    "codeql_guidance": [
+      "Require a structured relation between fixed-size destinations, tracked size expressions, and missing barriers.",
+      "Avoid callee-only matching on risky copy APIs.",
+      "Treat checked snprintf return values and explicit size guards as silence conditions."
+    ],
+    "tags": ["cwe-120", "memory", "buffer", "copy", "bounds", "write"]
+  },
+  {
+    "id": "cwe-121",
+    "category": "stack_overflow",
+    "title": "CWE-121: Stack-based Buffer Overflow",
+    "description": "A stack-based buffer overflow condition is a condition where the buffer being overwritten is allocated on the stack (i.e., is a local variable or, rarely, a parameter to a function).",
+    "internal_family": "buffer_overflow",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The vulnerable destination is a local array, small stack buffer, or function parameter buffer.",
+      "The patch adds local-capacity checks or rewrites unsafe formatting/copy logic around a local object.",
+      "The fix keeps stack object identity tied to the size proof."
+    ],
+    "fix_signals": [
+      "Use the true local-buffer extent rather than a guessed constant.",
+      "Bind the guard to the same local array or stack field that is written.",
+      "Preserve early-return behavior once the local bound is violated."
+    ],
+    "csa_guidance": [
+      "Recover stack object extents from local variable or field regions.",
+      "Treat local arrays as first-class destination identities for path-sensitive reasoning.",
+      "Prefer sink-plus-bound proofs over generic dangerous-function alarms."
+    ],
+    "codeql_guidance": [
+      "Prefer ArrayType-backed local destinations and explicit size variables.",
+      "Model snprintf/strncpy-style barriers only when they dominate the local write.",
+      "Do not generalize from local stack writes into unrelated heap cases unless the patch evidence supports it."
+    ],
+    "tags": ["cwe-121", "memory", "stack", "buffer", "overflow"]
+  },
+  {
+    "id": "cwe-122",
+    "category": "heap_overflow",
+    "title": "CWE-122: Heap-based Buffer Overflow",
+    "description": "A heap overflow condition is a buffer overflow, where the buffer that can be overwritten is allocated in the heap portion of memory, generally meaning that the buffer was allocated using a routine such as malloc().",
+    "internal_family": "buffer_overflow",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The overwritten object is heap allocated through malloc/calloc/realloc/new style APIs.",
+      "The patch adds allocation-size validation, tracked length checks, or safer write contracts around the heap object.",
+      "The fix ties the allocation size to later copy or index operations."
+    ],
+    "fix_signals": [
+      "Preserve the relation between allocation extent and downstream writes.",
+      "Treat realloc and derived-length arithmetic as part of the same safety contract.",
+      "Keep allocator return values and destination aliases aligned."
+    ],
+    "csa_guidance": [
+      "Track allocator results, aliases, and destination-region size through the path state.",
+      "Do not separate allocation arithmetic from the later write sink.",
+      "Preserve ownership and alias continuity when modeling heap regions."
+    ],
+    "codeql_guidance": [
+      "Connect allocation size, destination identity, and write length in the same query.",
+      "Treat heap extents as semantic evidence, not just API names.",
+      "Avoid broad matches on malloc plus memcpy without a missing-bound relation."
+    ],
+    "tags": ["cwe-122", "memory", "heap", "buffer", "overflow"]
+  },
+  {
+    "id": "cwe-125",
+    "category": "out_of_bounds_read",
+    "title": "CWE-125: Out-of-bounds Read",
+    "description": "The product reads data past the end, or before the beginning, of the intended buffer.",
+    "internal_family": "out_of_bounds_read",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch adds index bounds, end-pointer checks, or explicit length gating before a read.",
+      "The vulnerable logic reads through array indexing, pointer arithmetic, or size-derived offset expressions.",
+      "The fix constrains the same offset or cursor variable that drives the read."
+    ],
+    "fix_signals": [
+      "Require a dominating proof that the read stays inside the intended region.",
+      "Treat end-pointer comparisons and validated cursor arithmetic as silence conditions.",
+      "Keep region identity and read offset in the same reasoning unit."
+    ],
+    "csa_guidance": [
+      "Model pointer arithmetic, symbolic offsets, and region extents together.",
+      "Do not reduce bounds-read detection to generic dereference checks.",
+      "Prefer read-sink plus missing-bound proof over arbitrary array-access alarms."
+    ],
+    "codeql_guidance": [
+      "Focus on read-like sinks plus index or pointer expressions that lack a barrier.",
+      "Preserve end-pointer and length-variable relations from the patch.",
+      "Avoid broad matches on all array expressions without region context."
+    ],
+    "tags": ["cwe-125", "memory", "read", "bounds", "pointer", "index"]
+  },
+  {
+    "id": "cwe-126",
+    "category": "buffer_overread",
+    "title": "CWE-126: Buffer Over-read",
+    "description": "The product reads from a buffer using buffer access mechanisms such as indexes or pointers that reference memory locations after the targeted buffer.",
+    "internal_family": "out_of_bounds_read",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The vulnerable read advances an index, pointer, or cursor beyond the valid buffer end.",
+      "The patch introduces truncation, sentinel validation, or explicit end checks before read logic.",
+      "The fix binds the same cursor or offset variable to the boundary proof."
+    ],
+    "fix_signals": [
+      "Keep cursor advancement and region-end validation in one contract.",
+      "Sentinel checks only count when they dominate the read.",
+      "Preserve length-derived guards when generalizing to sibling reads."
+    ],
+    "csa_guidance": [
+      "Track the same symbolic cursor across increments and later reads.",
+      "Model post-increment and derived-pointer patterns explicitly.",
+      "Do not replace region reasoning with raw memcmp/strlen call-name checks."
+    ],
+    "codeql_guidance": [
+      "Prefer cursor and offset relations over sink-only matching.",
+      "Model reads that are driven by symbolic indices or pointer movement.",
+      "Treat validated end checks as silence barriers."
+    ],
+    "tags": ["cwe-126", "memory", "buffer", "over-read", "cursor", "pointer"]
+  },
+  {
+    "id": "cwe-134",
+    "category": "format_string",
+    "title": "CWE-134: Use of Externally-Controlled Format String",
+    "description": "The product uses a function that accepts a format string as an argument, but the format string originates from an external source.",
+    "internal_family": "format_string",
+    "preferred_analyzers": ["codeql", "csa"],
+    "patch_signals": [
+      "The patch replaces printf(user) style calls with literal formats plus explicit arguments.",
+      "The fix moves untrusted data out of the format slot and into data arguments.",
+      "The same format position is validated or constrained before the sink."
+    ],
+    "fix_signals": [
+      "Require the format argument to be a literal or a trusted constant abstraction.",
+      "Keep API-specific format-argument positions correct.",
+      "Treat wrapper APIs and fprintf/syslog variants as separate sink signatures."
+    ],
+    "csa_guidance": [
+      "Detect the actual format parameter position for each sink API.",
+      "Differentiate literal formats from externally influenced expressions.",
+      "Do not conflate data arguments with format arguments."
+    ],
+    "codeql_guidance": [
+      "Model sink-specific format positions precisely.",
+      "A strong baseline is non-literal format arguments into printf-like APIs.",
+      "Do not overgeneralize to every string argument of formatting functions."
+    ],
+    "tags": ["cwe-134", "security", "format-string", "printf"]
+  },
+  {
+    "id": "cwe-190",
+    "category": "integer_overflow",
+    "title": "CWE-190: Integer Overflow or Wraparound",
+    "description": "The product performs a calculation that can produce an integer overflow or wraparound when the logic assumes that the resulting value will always be larger than the original value. This occurs when an integer value is incremented to a value that is too large to store in the associated representation. When this occurs, the value may become a very small or negative number.",
+    "internal_family": "integer_overflow",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch adds arithmetic guards, widened types, overflow checks, or caps before allocation/index/copy sinks.",
+      "The vulnerable arithmetic feeds a sensitive sink such as allocation size, index, loop bound, or byte count.",
+      "The fix constrains the same count or size variable that later drives the sink."
+    ],
+    "fix_signals": [
+      "Keep arithmetic result and downstream sink in the same proof obligation.",
+      "Do not treat standalone large constants as enough evidence.",
+      "Honor patch-added clamp, checked multiplication, or early-return logic."
+    ],
+    "csa_guidance": [
+      "Prefer range reasoning on symbolic integers that feed memory or indexing operations.",
+      "Model arithmetic guards before allocator or copy calls.",
+      "Do not report isolated arithmetic if no sensitive sink depends on it."
+    ],
+    "codeql_guidance": [
+      "Query arithmetic expressions that reach allocation, indexing, or copy-length sinks.",
+      "Preserve the relation between the guarded variable and the sink use.",
+      "Avoid generic large-expression pattern matching."
+    ],
+    "tags": ["cwe-190", "integer", "overflow", "arithmetic", "allocation"]
+  },
+  {
+    "id": "cwe-191",
+    "category": "integer_underflow",
+    "title": "CWE-191: Integer Underflow (Wrap or Wraparound)",
+    "description": "The product subtracts one value from another, such that the result is less than the minimum allowable integer value, which produces a value that is not equal to the correct result.",
+    "internal_family": "integer_overflow",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The vulnerable logic subtracts sizes, offsets, counts, or cursor values before a sensitive use.",
+      "The patch adds lower-bound checks, non-negative guards, or saturating arithmetic.",
+      "The fix constrains the same subtraction result that later feeds length or index operations."
+    ],
+    "fix_signals": [
+      "Keep lower-bound proof tied to the downstream sink.",
+      "Honor non-negative and monotonicity guards that dominate the subtraction result.",
+      "Do not collapse underflow into generic integer alarms without sink relevance."
+    ],
+    "csa_guidance": [
+      "Track subtraction results and signedness conversions through the active path.",
+      "Model lower-bound guards before length, allocation, and index sinks.",
+      "Be careful with size_t/ssize_t transitions."
+    ],
+    "codeql_guidance": [
+      "Prefer subtraction or offset expressions that later feed indexing or length logic.",
+      "Preserve signedness-sensitive variables from the patch context.",
+      "Do not treat all negative checks as equivalent to underflow guards."
+    ],
+    "tags": ["cwe-191", "integer", "underflow", "offset", "length"]
+  },
+  {
+    "id": "cwe-369",
+    "category": "divide_by_zero",
+    "title": "CWE-369: Divide By Zero",
+    "description": "The product divides a value by zero.",
+    "internal_family": "divide_by_zero",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch adds divisor non-zero checks, early returns, fallback values, or validated denominators.",
+      "The vulnerable sink is a division or modulo operation whose divisor is external, derived, or insufficiently constrained.",
+      "The fix constrains the same divisor expression used at the sink."
+    ],
+    "fix_signals": [
+      "Require a dominating non-zero proof for the divisor.",
+      "Treat fallback branches and early returns as silence barriers only when they cover the same divisor.",
+      "Keep division and modulo sinks separate when modeling operators."
+    ],
+    "csa_guidance": [
+      "Use path constraints on the divisor at division or modulo sinks.",
+      "Preserve the exact operand that becomes the denominator.",
+      "Do not conflate unrelated range checks with non-zero proofs."
+    ],
+    "codeql_guidance": [
+      "Model division/modulo operators and the divisor expression directly.",
+      "Prefer barriers that dominate the same arithmetic sink.",
+      "Use conservative sink-focused baselines instead of generic arithmetic matching."
+    ],
+    "tags": ["cwe-369", "arithmetic", "divide-by-zero", "modulo"]
+  },
+  {
+    "id": "cwe-401",
+    "category": "memory_leak",
+    "title": "CWE-401: Missing Release of Memory after Effective Lifetime",
+    "description": "The product does not sufficiently track and release allocated memory after it has been used, making the memory unavailable for reallocation and reuse.",
+    "internal_family": "memory_leak",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch adds cleanup on early returns, error paths, or ownership-transfer boundaries.",
+      "The vulnerable logic allocates memory and then exits without a matching release or transfer.",
+      "The fix covers the same allocation source across all relevant exits."
+    ],
+    "fix_signals": [
+      "Track ownership transfer separately from local cleanup.",
+      "Honor cleanup labels, defer-style patterns, and patch-added release calls.",
+      "Require an escaping unreleased path rather than flagging every allocator."
+    ],
+    "csa_guidance": [
+      "Model allocation sources, ownership handoff, and exit-path cleanup obligations.",
+      "Early-return paths are often the deciding evidence.",
+      "Do not treat one free in the function as proof that all paths are safe."
+    ],
+    "codeql_guidance": [
+      "Good retrieval cues are allocation sites plus path-sensitive or role-specific cleanup notes from the patch.",
+      "Prefer ownership and cleanup contracts over allocator-name matching alone.",
+      "Use leak rules as path obligations, not as pure sink rules."
+    ],
+    "tags": ["cwe-401", "memory", "leak", "ownership", "cleanup"]
+  },
+  {
+    "id": "cwe-415",
+    "category": "double_free",
+    "title": "CWE-415: Double Free",
+    "description": "The product calls free() twice on the same memory address.",
+    "internal_family": "double_free",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch clears aliases after release, inserts release guards, or removes repeated destroy/free paths.",
+      "The vulnerable logic frees the same resource twice along one feasible path or across aliases.",
+      "The fix changes release ordering, ownership, or nulling on the same resource."
+    ],
+    "fix_signals": [
+      "Require identity continuity for the same resource across both releases.",
+      "Treat nulling, rebinding, and ownership transfer as silence conditions.",
+      "Do not count unrelated frees as the same defect."
+    ],
+    "csa_guidance": [
+      "Track symbolic resource identity and alias continuity across release calls.",
+      "Model guards that block the second release on the active path.",
+      "Preserve the distinction between repeated destroy wrappers and repeated direct frees."
+    ],
+    "codeql_guidance": [
+      "A stable baseline is two free-like calls on the same variable in the same function with textual order.",
+      "Tighten precision with alias and branch filters instead of deleting the repeated-release skeleton.",
+      "Do not reduce the detector to counting free calls."
+    ],
+    "tags": ["cwe-415", "memory", "double-free", "lifecycle", "alias"]
+  },
+  {
+    "id": "cwe-416",
+    "category": "use_after_free",
+    "title": "CWE-416: Use After Free",
+    "description": "The product reuses or references memory after it has been freed. At some point afterward, the memory may be allocated again and saved in another pointer, while the original pointer references a location somewhere within the new allocation. Any operations using the original pointer are no longer valid because the memory \"belongs\" to the code that operates on the new pointer.",
+    "internal_family": "use_after_free",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch nulls or rebinds stale pointers after release or replaces stale-pointer use with a fresh lookup.",
+      "The vulnerable logic releases a resource and later dereferences, frees, or reads through the same alias.",
+      "The fix changes lifetime ordering, alias reset, or reacquisition logic around the same resource role."
+    ],
+    "fix_signals": [
+      "Require release and later use on the same symbolic resource or alias family.",
+      "Treat explicit nulling, reinitialization, or authoritative relookup as silence barriers.",
+      "Keep cross-function lifetime transitions intact when generalizing."
+    ],
+    "csa_guidance": [
+      "Model release, nulling/rebind, and later use on the same path-sensitive resource identity.",
+      "Preserve helper-function and wrapper transitions if the patch uses them.",
+      "Do not treat every free as a finding."
+    ],
+    "codeql_guidance": [
+      "A strong baseline is release-then-use ordering on the same variable inside one function.",
+      "Extend precision with alias and helper-role reasoning rather than by broad name matching.",
+      "Cross-file variants often depend on reacquisition versus stale-pointer use."
+    ],
+    "tags": ["cwe-416", "memory", "use-after-free", "lifecycle", "alias"]
+  },
+  {
+    "id": "cwe-457",
+    "category": "uninitialized_variable",
+    "title": "CWE-457: Use of Uninitialized Variable",
+    "description": "The code uses a variable that has not been initialized, leading to unpredictable or unintended results.",
+    "internal_family": "uninitialized_variable",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch adds default initialization, memset/zero-init, constructor setup, or branch coverage before a read.",
+      "The vulnerable logic reads a local variable, field, or struct slot before a dominating initializer exists on all paths.",
+      "The fix initializes the same storage location that later drives control flow or output."
+    ],
+    "fix_signals": [
+      "Require missing dominating initialization on the active path.",
+      "Treat explicit zero-init and constructor-style setup as silence barriers when they cover the same storage.",
+      "Keep field-level initialization separate from whole-object assumptions."
+    ],
+    "csa_guidance": [
+      "Track dominating writes and zero-inits before read-like sinks.",
+      "Path-sensitive branch coverage matters more than declaration form alone.",
+      "Do not report every declaration without an inline initializer."
+    ],
+    "codeql_guidance": [
+      "Use retrieval to focus on later reads or branch conditions whose variable lacks a patch-backed initializer.",
+      "Keep variable identity and dominance conditions visible in the query plan.",
+      "Prefer minimal, conservative baselines if precise path proof is unavailable."
+    ],
+    "tags": ["cwe-457", "memory", "uninitialized", "state", "control-flow"]
+  },
+  {
+    "id": "cwe-476",
+    "category": "null_dereference",
+    "title": "CWE-476: NULL Pointer Dereference",
+    "description": "The product dereferences a pointer that it expects to be valid but is NULL.",
+    "internal_family": "null_dereference",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The patch adds early-return null guards, successful initializer checks, or fallback object paths before dereference.",
+      "The vulnerable logic dereferences a pointer, accesses a field, or performs an indirect call without a non-null proof.",
+      "The fix constrains the same pointer value that reaches the sink."
+    ],
+    "fix_signals": [
+      "Require missing non-null proof on the active path.",
+      "Treat dominating pointer validation on the same value as a silence barrier.",
+      "Do not conflate unrelated branches with null safety."
+    ],
+    "csa_guidance": [
+      "Use path constraints and dominating guards on the actual pointer reaching the sink.",
+      "Model field access, dereference, and indirect-call sinks separately when useful.",
+      "Preserve initializer success/failure contracts from the patch."
+    ],
+    "codeql_guidance": [
+      "A conservative baseline is pointer dereference expressions that later need patch-backed guard refinement.",
+      "Use dominance and same-value reasoning when tightening the query.",
+      "Avoid confusing null checks on other variables with safety for the sink pointer."
+    ],
+    "tags": ["cwe-476", "memory", "null", "dereference", "guard"]
+  },
+  {
+    "id": "cwe-362",
+    "category": "race_condition",
+    "title": "CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization ('Race Condition')",
+    "description": "The product contains a concurrent code sequence that requires temporary, exclusive access to a shared resource, but a timing window exists in which the shared resource can be modified by another code sequence operating concurrently.",
+    "internal_family": "race_condition",
+    "preferred_analyzers": ["codeql", "csa"],
+    "patch_signals": [
+      "The patch adds mutexes, atomics, serialized access, or closes a shared-state check/use/update window.",
+      "The vulnerable logic reads and updates shared state without a synchronization barrier.",
+      "The fix protects the same shared resource or critical sequence."
+    ],
+    "fix_signals": [
+      "Model the shared resource, critical window, and barrier together.",
+      "A lone lock call is not enough; its scope must cover the risky compound action.",
+      "Preserve patch evidence about state roles and synchronization APIs."
+    ],
+    "csa_guidance": [
+      "Use path and state reasoning when a local lifecycle transition creates the race-sensitive window.",
+      "Keep shared-resource identity tied to the critical sequence.",
+      "Do not treat all thread-aware code as a race."
+    ],
+    "codeql_guidance": [
+      "Good baselines are shared writes without locking or explicit check-then-act skeletons.",
+      "Prefer structured synchronization and shared-state predicates over keyword scans.",
+      "Use patch-added mutex/atomic barriers as silence conditions only when they cover the same state role."
+    ],
+    "tags": ["cwe-362", "concurrency", "race", "shared-state", "synchronization"]
+  },
+  {
+    "id": "cwe-367",
+    "category": "toctou",
+    "title": "CWE-367: Time-of-check Time-of-use (TOCTOU) Race Condition",
+    "description": "The product checks the state of a resource before using that resource, but the resource's state can change between the check and the use in a way that invalidates the results of the check.",
+    "internal_family": "race_condition",
+    "preferred_analyzers": ["codeql", "csa"],
+    "patch_signals": [
+      "The patch removes check-then-use sequences or adds atomic open/create/rename logic.",
+      "The vulnerable logic checks filesystem or object state and later uses the same resource through a stale assumption.",
+      "The fix binds the check and use to an atomic or serialized contract."
+    ],
+    "fix_signals": [
+      "Require the same resource identity for both the check and the later use.",
+      "Treat atomic APIs or lock-guarded sequences as silence conditions.",
+      "Do not reduce TOCTOU to generic mutex matching."
+    ],
+    "csa_guidance": [
+      "Model the stale-assumption window as a state transition between check and use.",
+      "Preserve the resource identifier that flows through both operations.",
+      "Prefer patch-backed ordering evidence over broad concurrency heuristics."
+    ],
+    "codeql_guidance": [
+      "A strong baseline is same-path check and use calls in the same function with textual order.",
+      "Tie the same path/resource expression to both operations.",
+      "Use atomic replacements and serialized regions as silence barriers."
+    ],
+    "tags": ["cwe-367", "concurrency", "toctou", "filesystem", "check-use"]
+  },
+  {
+    "id": "cwe-78",
+    "category": "command_injection",
+    "title": "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+    "description": "The product constructs all or part of an OS command using externally-influenced input from an upstream component, but it does not neutralize or incorrectly neutralizes special elements that could modify the intended OS command when it is sent to a downstream component.",
+    "internal_family": "command_injection",
+    "preferred_analyzers": ["codeql", "csa"],
+    "patch_signals": [
+      "The patch replaces shell command construction with allowlisted exec-style arguments or validated command fragments.",
+      "The vulnerable flow moves external input into system/popen/exec-style sinks without strong normalization.",
+      "The fix constrains the same command string or argument vector that reaches the sink."
+    ],
+    "fix_signals": [
+      "Model untrusted source, command-construction step, sensitive sink, and sanitizer or allowlist barrier together.",
+      "Treat wrapper functions and helper builders as part of the same trust boundary.",
+      "Do not reduce command injection to sink-name matching."
+    ],
+    "csa_guidance": [
+      "Use local string-building and validation evidence when the patch is intraprocedural.",
+      "Keep command fragments and sink parameters aligned.",
+      "Honor allowlist and argument-vector barriers."
+    ],
+    "codeql_guidance": [
+      "Prefer source-to-sink or builder-to-sink modeling over shell-API name matching alone.",
+      "Parameter-vector exec patterns are often silence signals compared with shell-string construction.",
+      "Preserve patch-backed sanitization or allowlist semantics."
+    ],
+    "tags": ["cwe-78", "security", "command-injection", "exec", "shell", "taint"]
+  },
+  {
+    "id": "cwe-89",
+    "category": "sql_injection",
+    "title": "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')",
+    "description": "The product constructs all or part of an SQL command using externally-influenced input from an upstream component, but it does not neutralize or incorrectly neutralizes special elements that could modify the intended SQL command when it is sent to a downstream component. Without sufficient removal or quoting of SQL syntax in user-controllable inputs, the generated SQL query can cause those inputs to be interpreted as SQL instead of ordinary user data.",
+    "internal_family": "sql_injection",
+    "preferred_analyzers": ["codeql", "csa"],
+    "patch_signals": [
+      "The patch replaces string-built queries with prepared statements, parameter binding, or allowlisted fragments.",
+      "The vulnerable flow concatenates or interpolates external input into SQL execution APIs.",
+      "The fix constrains the same query fragment or parameter position that reaches the sink."
+    ],
+    "fix_signals": [
+      "Model query source, construction step, SQL sink, and parameterization barrier together.",
+      "Prepared statements and bound parameters are stronger silence signals than generic escaping comments.",
+      "Do not reduce SQL injection to the presence of SQL keywords in strings."
+    ],
+    "csa_guidance": [
+      "Use local query-building context when the patch clearly changes construction logic before the sink.",
+      "Keep query fragments and execution calls aligned.",
+      "Honor patch-added allowlists and parameterization wrappers."
+    ],
+    "codeql_guidance": [
+      "Prepared statements and parameter binding should dominate the sink to silence the finding.",
+      "Prefer source-to-query-sink modeling over sink-only or concatenation-only heuristics.",
+      "Treat query builder wrappers as part of the same trust boundary."
+    ],
+    "tags": ["cwe-89", "security", "sql-injection", "database", "taint"]
+  },
+  {
+    "id": "cwe-22",
+    "category": "path_traversal",
+    "title": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+    "description": "The product uses external input to construct a pathname that is intended to identify a file or directory that is located underneath a restricted parent directory, but the product does not properly neutralize special elements within the pathname that can cause the pathname to resolve to a location that is outside of the restricted directory.",
+    "internal_family": "path_traversal",
+    "preferred_analyzers": ["codeql", "csa"],
+    "patch_signals": [
+      "The patch adds canonicalization, base-directory validation, traversal-token rejection, or path allowlists.",
+      "The vulnerable flow moves external path input into file open/create/remove APIs without root-boundary proof.",
+      "The fix constrains the same path value that reaches the filesystem sink."
+    ],
+    "fix_signals": [
+      "Canonicalization only counts when the resolved path is checked against an allowed root.",
+      "Treat '../' filtering as insufficient unless normalization and boundary proof are also preserved.",
+      "Keep source path, normalization, and filesystem sink in the same reasoning unit."
+    ],
+    "csa_guidance": [
+      "Use local path-building and validation evidence when the patch is intraprocedural.",
+      "Model rejection branches and canonicalization checks before sink calls.",
+      "Do not treat every open/fopen as a traversal bug."
+    ],
+    "codeql_guidance": [
+      "Prefer path-source to filesystem-sink flows plus missing canonicalization or root-boundary barriers.",
+      "Use patch-backed base-directory checks as silence conditions.",
+      "Avoid simple '../' string matching without normalization semantics."
+    ],
+    "tags": ["cwe-22", "security", "path-traversal", "filesystem", "taint"]
+  },
+  {
+    "id": "cwe-787",
+    "category": "out_of_bounds_write",
+    "title": "CWE-787: Out-of-bounds Write",
+    "description": "The product writes data past the end, or before the beginning, of the intended buffer.",
+    "internal_family": "buffer_overflow",
+    "preferred_analyzers": ["csa", "codeql"],
+    "patch_signals": [
+      "The vulnerable sink is a write, index store, or copy whose target extent is not proven safe.",
+      "The patch adds index/capacity validation or rewrites the sink to a bounded form.",
+      "The fix constrains the same offset or byte count that drives the write."
+    ],
+    "fix_signals": [
+      "Require a write sink plus missing proof that the target region contains the write.",
+      "Treat index guards, capacity checks, and validated sink sizes as silence barriers.",
+      "Do not collapse write-bounds bugs into generic dangerous-API matching."
+    ],
+    "csa_guidance": [
+      "Track target region identity and the write offset or byte count through the active path.",
+      "Preserve index-store and pointer-write patterns, not just library copies.",
+      "Honor dominating bounds checks on the same target and offset."
+    ],
+    "codeql_guidance": [
+      "Use write sinks plus tracked indices, offsets, or size expressions.",
+      "Prefer structural write-without-bound patterns over API names alone.",
+      "Keep the barrier tied to the same target and write driver."
+    ],
+    "tags": ["cwe-787", "memory", "write", "bounds", "index", "copy"]
+  }
+]

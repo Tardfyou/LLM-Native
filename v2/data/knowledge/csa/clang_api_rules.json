@@ -1,0 +1,31 @@
+[
+  {
+    "id": "plugin-structure-required",
+    "category": "critical",
+    "title": "CSA检测器必须是插件式",
+    "description": "所有CSA检测器必须包含插件入口点：clang_registerCheckers 和 clang_analyzerAPIVersionString",
+    "required_pattern": "// 插件版本字符串 - 必须在命名空间外\nextern \"C\"\nconst char clang_analyzerAPIVersionString[] = CLANG_VERSION_STRING;\n\n// 插件注册函数 - 必须导出\nextern \"C\"\nvoid clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<YourChecker>(\"custom.YourChecker\", \"Description\", \"\");\n}",
+    "notes": [
+      "缺少 clang_registerCheckers 会导致 .so 无法被加载",
+      "缺少 clang_analyzerAPIVersionString 会导致版本不匹配错误",
+      "使用 CLANG_VERSION_STRING（注意：Clang 16+ 后此宏定义在 clang/Basic/Version.h）"
+    ],
+    "tags": [
+      "critical",
+      "plugin",
+      "entry"
+    ]
+  },
+  {
+    "id": "header-paths",
+    "category": "structure",
+    "title": "正确的头文件路径",
+    "description": "CheckerRegistry 在 Frontend 目录",
+    "correct_pattern": "#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/CheckerManager.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceLocation.h\"\n#include \"clang/Basic/Version.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include <memory>\n#include <optional>\n#include <string>",
+    "wrong_pattern": "#include \"clang/StaticAnalyzer/Core/CheckerRegistry.h\"",
+    "tags": [
+      "include",
+      "header"
+    ]
+  }
+]

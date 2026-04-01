@@ -1,0 +1,120 @@
+[
+  {
+    "id": "buffer-overflow-plugin",
+    "category": "buffer_overflow",
+    "title": "插件式固定大小缓冲区越界写入检测器基础骨架",
+    "description": "可编译的插件式 CSA 基础骨架，展示 plugin 入口、基础 sink 分发和最小容量读取；它不是最终的 family-semantic seed。",
+    "retrieval_priority": "low",
+    "quality_tier": "baseline_compile_skeleton",
+    "code": "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/CheckerManager.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/SVals.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Type.h\"\n#include \"clang/Basic/Version.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include <memory>\n#include <optional>\n\nusing namespace clang;\nusing namespace ento;\n\nextern \"C\" const char clang_analyzerAPIVersionString[] = CLANG_VERSION_STRING;\n\nnamespace {\nclass BufferOverflowChecker : public Checker<check::PreCall> {\n  mutable std::unique_ptr<BugType> BT;\n\n  static bool isUnboundedWrite(StringRef FuncName) {\n    return FuncName == \"strcpy\" || FuncName == \"strcat\" || FuncName == \"gets\";\n  }\n\n  static std::optional<unsigned> getSizeArgIndex(StringRef FuncName) {\n    if (FuncName == \"memcpy\" || FuncName == \"memmove\" || FuncName == \"strncpy\")\n      return 2;\n    if (FuncName == \"snprintf\")\n      return 1;\n    return std::nullopt;\n  }\n\n  std::optional<uint64_t> getStaticRegionSize(const MemRegion *Region,\n                                              CheckerContext &C) const {\n    const auto *TypedRegion = dyn_cast<TypedValueRegion>(Region->StripCasts());\n    if (!TypedRegion)\n      return std::nullopt;\n\n    QualType QT = TypedRegion->getValueType();\n    if (QT.isNull() || QT->isIncompleteType())\n      return std::nullopt;\n\n    return C.getASTContext().getTypeSizeInChars(QT).getQuantity();\n  }\n\n  std::optional<uint64_t> getConcreteUnsigned(SVal Value) const {\n    if (auto CI = Value.getAs<nonloc::ConcreteInt>())\n      return CI->getValue().getLimitedValue();\n    return std::nullopt;\n  }\n\n  void report(const Stmt *S, CheckerContext &C, StringRef Message) const {\n    if (ExplodedNode *N = C.generateNonFatalErrorNode()) {\n      auto R = std::make_unique<PathSensitiveBugReport>(*BT, Message, N);\n      if (S)\n        R->addRange(S->getSourceRange());\n      C.emitReport(std::move(R));\n    }\n  }\n\npublic:\n  BufferOverflowChecker()\n      : BT(std::make_unique<BugType>(this, \"Buffer overflow\", \"Memory Error\")) {}\n\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const {\n    const IdentifierInfo *II = Call.getCalleeIdentifier();\n    if (!II)\n      return;\n\n    StringRef FuncName = II->getName();\n    std::optional<unsigned> SizeIndex = getSizeArgIndex(FuncName);\n    if (!isUnboundedWrite(FuncName) && !SizeIndex)\n      return;\n\n    if (Call.getNumArgs() == 0)\n      return;\n\n    const MemRegion *DestRegion = Call.getArgSVal(0).getAsRegion();\n    if (!DestRegion)\n      return;\n\n    std::optional<uint64_t> DestBytes = getStaticRegionSize(DestRegion, C);\n    if (!DestBytes)\n      return;\n\n    if (isUnboundedWrite(FuncName)) {\n      report(Call.getOriginExpr(), C,\n             \"Unbounded write into fixed-size destination buffer\");\n      return;\n    }\n\n    if (Call.getNumArgs() <= *SizeIndex)\n      return;\n\n    std::optional<uint64_t> RequestedBytes =\n        getConcreteUnsigned(Call.getArgSVal(*SizeIndex));\n    if (!RequestedBytes)\n      return;\n\n    if (*RequestedBytes > *DestBytes) {\n      report(Call.getOriginExpr(), C,\n             \"Copy length exceeds destination buffer size\");\n    }\n  }\n};\n} // namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<BufferOverflowChecker>(\"custom.BufferOverflowChecker\",\n                                             \"Check fixed-size buffers against write length\",\n                                             \"\");\n}\n",
+    "tags": [
+      "buffer",
+      "overflow",
+      "plugin",
+      "size-check",
+      "guard"
+    ],
+    "notes": [
+      "这是编译安全的基础骨架：同时包含 clang_analyzerAPIVersionString 与 clang_registerCheckers，可直接编译为 .so。",
+      "它故意只展示最小 sink 分发和基础容量读取，不应直接当作最终 buffer-overflow 语义种子。",
+      "遇到结构体字段或数组元素目的地时，应沿 FieldRegion / ElementRegion / super-region 恢复固定容量，而不是只依赖 decayed argument type。",
+      "遇到 strlen(x)+1、len+1、bytes 变量等符号长度 carrier 时，不能直接 return no-report；应继续绑定 same-sink barrier 或约束。",
+      "真正的 family-level 检测器应优先参考高优先级的 CWE/API 规则，而不是照抄这份 baseline skeleton。"
+    ]
+  },
+  {
+    "id": "buffer-overflow-semantic-seed",
+    "category": "buffer_overflow",
+    "title": "固定大小目标缓冲区写入缺少长度 guard 的语义化插件 seed",
+    "description": "面向整个 buffer-overflow / bounds-write 家族的高优先级 CSA seed：围绕 fixed destination、symbolic size carrier 和 same-sink barrier 建模，而不是停留在 callee-only 或 concrete-size-only。对 `check::PreCall`、`strlen`、`memcpy`、buffer size validation 这类 broad query，也应优先命中这里而不是 generic CWE 或 ProgramState 模板。",
+    "retrieval_priority": "high",
+    "quality_tier": "family_semantic_seed",
+    "semantic_depth": "observed_bounds_contract",
+    "patterns": [
+      "Recover destination capacity from FieldRegion / ElementRegion / TypedValueRegion instead of the decayed call argument type.",
+      "Keep symbolic size carriers like strlen(x)+1, len+1, size/bytes locals, and snprintf status checks in scope.",
+      "Only honor guards when the compared size carrier and destination capacity belong to the same sink."
+    ],
+    "checker_hints": [
+      "For strcpy/strcat/sprintf-style sinks, a fixed-size destination plus missing same-sink barrier is already enough to stay suspicious even when source length is symbolic.",
+      "For memcpy/memmove/strncpy/snprintf-style sinks, do not require the size argument to become a concrete integer before reasoning about risk.",
+      "Use AST sibling/parent traversal to bind the active call to an earlier terminating guard or a later checked status branch.",
+      "Capacity/barrier helpers that return constant `false` or `std::nullopt` are invalid placeholders, not semantic modeling."
+    ],
+    "code": "class BufferOverflowChecker : public Checker<check::PreCall> {\n  std::optional<uint64_t> getStaticDestinationBytes(const MemRegion *Region,\n                                                    ASTContext &Ctx) const {\n    if (!Region)\n      return std::nullopt;\n    const MemRegion *Base = Region->StripCasts();\n    while (const auto *Element = dyn_cast<ElementRegion>(Base))\n      Base = Element->getSuperRegion();\n    if (const auto *Field = dyn_cast<FieldRegion>(Base)) {\n      QualType QT = Field->getDecl()->getType();\n      if (!QT.isNull() && !QT->isIncompleteType() &&\n          (QT->isArrayType() || Ctx.getAsConstantArrayType(QT)))\n        return Ctx.getTypeSizeInChars(QT).getQuantity();\n    }\n    if (const auto *Typed = dyn_cast<TypedValueRegion>(Base)) {\n      QualType QT = Typed->getValueType();\n      if (!QT.isNull() && !QT->isIncompleteType() &&\n          (QT->isArrayType() || Ctx.getAsConstantArrayType(QT)))\n        return Ctx.getTypeSizeInChars(QT).getQuantity();\n    }\n    return std::nullopt;\n  }\n\n  bool looksLikeLengthCarrier(const Expr *E) const {\n    const Expr *Core = E ? E->IgnoreParenImpCasts() : nullptr;\n    if (!Core)\n      return false;\n    if (const auto *CallExpr = dyn_cast<clang::CallExpr>(Core)) {\n      if (const FunctionDecl *FD = CallExpr->getDirectCallee()) {\n        StringRef Name = FD->getName();\n        if (Name == \"strlen\" || Name == \"strnlen\")\n          return true;\n      }\n    }\n    if (const auto *Ref = dyn_cast<DeclRefExpr>(Core)) {\n      StringRef Lowered = Ref->getDecl()->getName();\n      return Lowered.contains_insensitive(\"len\") ||\n             Lowered.contains_insensitive(\"size\") ||\n             Lowered.contains_insensitive(\"bytes\");\n    }\n    if (const auto *Member = dyn_cast<MemberExpr>(Core)) {\n      StringRef Lowered = Member->getMemberDecl()->getName();\n      return Lowered.contains_insensitive(\"len\") ||\n             Lowered.contains_insensitive(\"size\") ||\n             Lowered.contains_insensitive(\"bytes\");\n    }\n    if (const auto *BinOp = dyn_cast<BinaryOperator>(Core))\n      return BinOp->getOpcode() == BO_Add || BinOp->getOpcode() == BO_Sub;\n    return false;\n  }\n\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const {\n    const IdentifierInfo *II = Call.getCalleeIdentifier();\n    if (!II)\n      return;\n    StringRef FuncName = II->getName();\n    if (FuncName == \"strcpy\" || FuncName == \"strcat\") {\n      const MemRegion *Dest = Call.getArgSVal(0).getAsRegion();\n      if (!getStaticDestinationBytes(Dest, C.getASTContext()))\n        return;\n      if (hasSameBlockStringBarrier(Call, C, Call.getArgExpr(0), Call.getArgExpr(1)))\n        return;\n      reportBug(Call.getOriginExpr(), C,\n                \"Unsafe string write: missing destination capacity validation\");\n      return;\n    }\n    if ((FuncName == \"memcpy\" || FuncName == \"memmove\" || FuncName == \"strncpy\") &&\n        Call.getNumArgs() > 2) {\n      const MemRegion *Dest = Call.getArgSVal(0).getAsRegion();\n      std::optional<uint64_t> DestBytes =\n          getStaticDestinationBytes(Dest, C.getASTContext());\n      const Expr *SizeArg = Call.getArgExpr(2);\n      if (!DestBytes)\n        return;\n      if (hasSameBlockMemcpyBarrier(Call, C, Call.getArgExpr(0), SizeArg))\n        return;\n      if (auto Concrete = Call.getArgSVal(2).getAs<nonloc::ConcreteInt>()) {\n        if (Concrete->getValue().getLimitedValue() <= *DestBytes)\n          return;\n      } else if (!looksLikeLengthCarrier(SizeArg)) {\n        return;\n      }\n      reportBug(Call.getOriginExpr(), C,\n                \"Copy operation: missing destination capacity validation\");\n    }\n  }\n};",
+    "notes": [
+      "这是 family 级语义 seed，不绑定任何 patch 字符串、变量名、文件路径或行号。",
+      "关键迁移轴是 fixed destination capacity、symbolic size carrier、same-sink barrier，不是某一个危险 API 名称。",
+      "如果 broad query 同时带上 `ProgramState`，但 patch 根因仍是 fixed destination 上缺少 same-sink bounds barrier，应把 `ProgramState` 视为 rejected alternative mode，而不是默认脚手架。",
+      "如果 patch 通过 checked snprintf return value、sizeof guard、size variable comparison 静默当前 sink，就应复用同一套观察面去建模 patched silence。",
+      "不要把 `getStaticDestinationBytes(...) { return std::nullopt; }`、`hasSameBlock...(...) { return false; }` 之类占位 helper 带进最终 detector。"
+    ],
+    "tags": [
+      "buffer",
+      "overflow",
+      "fieldregion",
+      "elementregion",
+      "strlen",
+      "guard",
+      "semantic-seed"
+    ]
+  },
+  {
+    "id": "use-after-free-plugin",
+    "category": "use_after_free",
+    "title": "释放后再次解引用/读写检测插件",
+    "description": "标准插件式 CSA 示例：先在 free/release/destroy 后把符号写入 ProgramState，再在 checkLocation/checkBind 中识别 dangling pointer 的再次解引用、读写或传递。它是泛化的 freed-symbol family seed，不绑定 patch 路径或具体函数名。",
+    "retrieval_priority": "medium",
+    "quality_tier": "generic_stateful_seed",
+    "code": "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/CheckerManager.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/SVals.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Basic/Version.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include <memory>\n\nusing namespace clang;\nusing namespace ento;\n\nextern \"C\" const char clang_analyzerAPIVersionString[] = CLANG_VERSION_STRING;\n\nREGISTER_SET_WITH_PROGRAMSTATE(FreedSymbols, SymbolRef)\n\nnamespace {\nclass UseAfterFreeChecker : public Checker<check::PostCall, check::Location, check::Bind> {\n  mutable std::unique_ptr<BugType> BT;\n\n  static bool isReleaseLike(StringRef FuncName) {\n    return FuncName == \"free\" ||\n           FuncName == \"kfree\" ||\n           FuncName == \"delete\" ||\n           FuncName == \"release\" ||\n           FuncName.ends_with(\"_free\") ||\n           FuncName.ends_with(\"_release\") ||\n           FuncName.contains(\"destroy\");\n  }\n\n  static SymbolRef tracked(SVal Value) {\n    if (SymbolRef Sym = Value.getAsLocSymbol(true))\n      return Sym;\n    return Value.getAsSymbol(true);\n  }\n\n  void reportBug(const Stmt *S, StringRef Message, CheckerContext &C) const {\n    if (!S)\n      return;\n    if (ExplodedNode *N = C.generateErrorNode()) {\n      auto R = std::make_unique<PathSensitiveBugReport>(*BT, Message, N);\n      R->addRange(S->getSourceRange());\n      C.emitReport(std::move(R));\n    }\n  }\n\npublic:\n  UseAfterFreeChecker()\n      : BT(std::make_unique<BugType>(this, \"Use after free\", \"Memory Error\")) {}\n\n  void checkPostCall(const CallEvent &Call, CheckerContext &C) const {\n    const IdentifierInfo *II = Call.getCalleeIdentifier();\n    if (!II || Call.getNumArgs() == 0 || !isReleaseLike(II->getName()))\n      return;\n    if (SymbolRef Released = tracked(Call.getArgSVal(0)))\n      C.addTransition(C.getState()->add<FreedSymbols>(Released));\n  }\n\n  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S,\n                     CheckerContext &C) const {\n    if (SymbolRef Accessed = tracked(Loc)) {\n      if (C.getState()->contains<FreedSymbols>(Accessed)) {\n        reportBug(S, IsLoad ? \"Dereference of a previously released symbol\"\n                            : \"Write through a previously released symbol\",\n                  C);\n      }\n    }\n  }\n\n  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE,\n                 CheckerContext &C) const {\n    (void)Loc;\n    if (SymbolRef Bound = tracked(Val)) {\n      if (C.getState()->contains<FreedSymbols>(Bound)) {\n        reportBug(StoreE,\n                  \"Previously released symbol is propagated through a new binding\",\n                  C);\n      }\n    }\n  }\n};\n} // namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<UseAfterFreeChecker>(\"custom.UseAfterFreeChecker\",\n                                           \"Detect dereference or propagation of released symbols\",\n                                           \"\");\n}\n",
+    "tags": [
+      "use-after-free",
+      "uaf",
+      "programstate",
+      "freedsymbols",
+      "checklocation",
+      "checkbind"
+    ],
+    "notes": [
+      "这是标准插件式 ProgramState UAF 骨架，重点是 `REGISTER_SET_WITH_PROGRAMSTATE(FreedSymbols, SymbolRef)`、`checkPostCall`、`checkLocation`、`checkBind` 的协同。",
+      "它适合 generic freed-symbol family；如果补丁更像 consumer-side stale cache / authoritative relookup，应优先命中更具体的 relookup seed。",
+      "不要把“显式置 NULL”简化成 generic no-op；真实修复里它通常是 patched silence 的一部分。",
+      "Clang 18 插件必须保留 `clang_analyzerAPIVersionString`、`clang_registerCheckers` 与 `CheckerRegistry.h`。"
+    ]
+  },
+  {
+    "id": "use-after-free-cached-pointer-relookup",
+    "category": "use_after_free",
+    "title": "稳定句柄存在时直接使用缓存指针的 consumer-side UAF seed",
+    "description": "面向 stale-cache / authoritative-relookup 这一类 use-after-free：对象拥有者同时保存缓存指针字段与稳定句柄字段时，直接通过缓存指针字段做成员访问，意味着 consumer-side 代码绕过权威重查找，容易形成 stale/dangling alias。该 seed 泛化到一类 managed-resource 缓存失效漏洞，不绑定补丁字符串。",
+    "retrieval_priority": "high",
+    "quality_tier": "family_semantic_seed",
+    "semantic_depth": "consumer_side_relookup_contract",
+    "patterns": [
+      "Record owns both a cached pointer field and a stable handle sibling field.",
+      "Consumer-side code directly dereferences the cached pointer field instead of relooking up by handle.",
+      "Patched silence usually comes from authoritative relookup, explicit pointer invalidation, or handle invalidation."
+    ],
+    "checker_hints": [
+      "For this family, prefer a local AST/contract trigger over forcing ProgramState freed-symbol tracking across functions.",
+      "Nested MemberExpr on a cached managed field is often enough to stay suspicious when a stable handle peer exists.",
+      "Prefer stable-handle peers whose field names align with the cached pointer stem, such as session -> session_id or cache -> cacheHandle."
+    ],
+    "code": "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/CheckerManager.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Expr.h\"\n#include \"clang/Basic/Version.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include <memory>\n#include <string>\n\nusing namespace clang;\nusing namespace ento;\n\nextern \"C\" const char clang_analyzerAPIVersionString[] = CLANG_VERSION_STRING;\n\nnamespace {\nclass CachedPointerRelookupChecker : public Checker<check::PreStmt<MemberExpr>> {\n  mutable std::unique_ptr<BugType> BT;\n\n  static bool looksLikeStableHandleField(const FieldDecl *PointerField,\n                                         const FieldDecl *Candidate) {\n    if (!PointerField || !Candidate)\n      return false;\n    std::string PointerName = PointerField->getName().str();\n    StringRef HandleName = Candidate->getName();\n    return HandleName == (PointerName + \"_id\") ||\n           HandleName == (PointerName + \"Id\") ||\n           HandleName == (PointerName + \"_handle\") ||\n           HandleName == (PointerName + \"Handle\") ||\n           HandleName == (PointerName + \"_key\") ||\n           HandleName == (PointerName + \"Key\");\n  }\n\n  static bool hasStableHandlePeer(const FieldDecl *PointerField) {\n    const auto *Owner = PointerField ? dyn_cast<RecordDecl>(PointerField->getDeclContext()) : nullptr;\n    if (!Owner)\n      return false;\n    for (const FieldDecl *FD : Owner->fields()) {\n      if (FD != PointerField && looksLikeStableHandleField(PointerField, FD))\n        return true;\n    }\n    return false;\n  }\n\npublic:\n  CachedPointerRelookupChecker()\n      : BT(std::make_unique<BugType>(this, \"Stale cached pointer use\", \"Memory Error\")) {}\n\n  void checkPreStmt(const MemberExpr *ME, CheckerContext &C) const {\n    const auto *Inner = ME ? dyn_cast<MemberExpr>(ME->getBase()->IgnoreParenImpCasts()) : nullptr;\n    const auto *PointerField = Inner ? dyn_cast<FieldDecl>(Inner->getMemberDecl()) : nullptr;\n    if (!PointerField || !PointerField->getType()->isPointerType() || !hasStableHandlePeer(PointerField))\n      return;\n    if (ExplodedNode *N = C.generateNonFatalErrorNode()) {\n      auto R = std::make_unique<PathSensitiveBugReport>(\n          *BT,\n          \"Direct use of a cached pointer field bypasses authoritative relookup from a stable handle\",\n          N);\n      R->addRange(ME->getSourceRange());\n      C.emitReport(std::move(R));\n    }\n  }\n};\n} // namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<CachedPointerRelookupChecker>(\n      \"custom.CachedPointerRelookupChecker\",\n      \"Detect direct dereference of cached managed pointers that bypass authoritative relookup\",\n      \"\");\n}\n",
+    "notes": [
+      "这是 consumer-side stale-cache / missing-relookup 语义 seed，不绑定 `find_session`、`destroy_session` 或具体字段名。",
+      "关键迁移轴是 cached pointer、stable handle、authoritative relookup、stale/dangling alias；稳定句柄字段名应尽量与缓存指针字段名同 stem 对齐。",
+      "如果补丁把 `ctx->resource->field` 改成“先用句柄重查找，再使用局部 fresh 指针”，优先复用这套 seed。",
+      "如果 broad query 同时提到 ProgramStateTrait，但补丁主机制是 direct cached pointer dereference，应把 ProgramState 视为备选模式，不要默认套入。"
+    ],
+    "tags": [
+      "use-after-free",
+      "uaf",
+      "stale-cache",
+      "cached pointer",
+      "stable handle",
+      "authoritative relookup",
+      "missing-relookup"
+    ]
+  }
+]

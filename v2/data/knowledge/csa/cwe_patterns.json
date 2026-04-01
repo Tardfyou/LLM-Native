@@ -1,0 +1,72 @@
+[
+  {
+    "id": "cwe-120",
+    "category": "buffer_overflow",
+    "title": "CWE-120: Buffer Copy without Checking Size of Input ('Classic Buffer Overflow')",
+    "description": "The product copies an input buffer to an output buffer without verifying that the size of the input buffer is less than the size of the output buffer.",
+    "retrieval_priority": "high",
+    "quality_tier": "family_semantic_guide",
+    "patterns": [
+      "Unbounded string or memory-copy sinks write into fixed-size destinations.",
+      "The patch introduces explicit size variables, sizeof guards, or checked return values.",
+      "Safety depends on proving the same copied byte count fits the same destination region.",
+      "The destination may appear as a FieldRegion or ElementRegion whose fixed extent must be recovered from super-regions instead of the decayed argument type.",
+      "The copied byte count may stay symbolic as strlen(x)+1, len+1, size_t bytes, or a derived local variable; symbolic does not imply safe."
+    ],
+    "checker_hints": [
+      "Model destination region identity, copied byte count, and dominating guard together.",
+      "Do not suppress strcpy/strcat/sprintf-style sinks just because source length is symbolic.",
+      "Treat null checks as unrelated to bounds safety.",
+      "Recover destination capacity through FieldRegion / ElementRegion / TypedValueRegion super-region walks.",
+      "For bounded sinks, keep symbolic size carriers in scope and bind patch guards to the same destination and size pair."
+    ],
+    "notes": [
+      "Prefer a write-without-proven-bound mechanism over dangerous-API name matching.",
+      "Honor checked snprintf or memcpy size guards only when they cover the same sink.",
+      "A same-function arbitrary if-statement is not enough; the barrier must mention the same size carrier, sizeof operand, or destination capacity.",
+      "Compile-safe skeletons that return when size stays symbolic are only baseline references, not final family seeds."
+    ],
+    "tags": [
+      "cwe-120",
+      "buffer",
+      "overflow",
+      "bounds",
+      "write"
+    ]
+  },
+  {
+    "id": "cwe-416",
+    "category": "use_after_free",
+    "title": "CWE-416: Use After Free",
+    "description": "The product reuses or references memory after it has been freed. In managed-resource code, the same family often appears as stale cached pointer use after release, expiry, or ownership transfer, especially when consumer-side code bypasses authoritative relookup.",
+    "retrieval_priority": "high",
+    "quality_tier": "family_semantic_guide",
+    "patterns": [
+      "A release/expire/destroy step happens, but a cached pointer alias is still read, written, or propagated later.",
+      "The owning record keeps both a cached pointer field and a stable handle field, and the consumer dereferences the cached pointer directly.",
+      "The patch adds explicit pointer invalidation, handle invalidation, or authoritative relookup before later use.",
+      "The bug can be consumer-side stale cache even when the release itself occurs in a different helper function."
+    ],
+    "checker_hints": [
+      "Model stale cached pointer use, authoritative relookup, and explicit invalidation as first-class mechanisms, not just generic free/use pairing.",
+      "For CSA, choose between ProgramState freed-symbol tracking and local cached-pointer AST triggers based on the patch mechanism.",
+      "For CodeQL, do not force interprocedural same-symbol release matching when the patch clearly replaces direct cached-pointer dereference with relookup-by-handle.",
+      "Null checks alone are not freshness barriers; prefer handle validation, relookup, or invalidation tied to the same managed resource."
+    ],
+    "notes": [
+      "This family is broader than raw malloc/free pairs and includes stale, dangling, released cached object handles.",
+      "Authoritative relookup and explicit invalidation are reusable silence mechanisms across session/cache/resource lifetime fixes.",
+      "Do not hard-code project-specific API names into the core family model; generalize via stable-handle / cached-pointer structure first."
+    ],
+    "tags": [
+      "cwe-416",
+      "use-after-free",
+      "uaf",
+      "stale",
+      "dangling",
+      "cached pointer",
+      "stable handle",
+      "relookup"
+    ]
+  }
+]

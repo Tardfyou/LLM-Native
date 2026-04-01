@@ -1,0 +1,25 @@
+# Docker Compose for LLVM Checker Generator v2
+# 仅启动ChromaDB向量数据库
+
+services:
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: checker-chromadb
+    ports:
+      - "8001:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_PORT=8000
+      - ANONYMIZED_TELEMETRY=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  chromadb_data:
+    driver: local

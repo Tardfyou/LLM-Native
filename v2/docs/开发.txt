@@ -1,0 +1,134 @@
+后续任务：精炼系统完成，证据系统完成，实验
+
+==================================================
+# 编译插件式 Checker (使用 LLVM-18)
+==================================================
+/usr/lib/llvm-18/bin/clang++ -shared -fPIC -std=c++20 -O2 \
+    -I/usr/lib/llvm-18/include \
+    -I/usr/lib/llvm-18/include/clang \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer/Core \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer/Frontend \
+    -I/usr/lib/llvm-18/include/llvm \
+    checker.cpp \
+    -L/usr/lib/llvm-18/lib \
+    -lclang-cpp \
+    -Wl,-rpath,/usr/lib/llvm-18/lib \
+    -o Checker.so
+
+==================================================
+# 使用 clang++ --analyze 运行分析 (必须使用 LLVM-18)
+==================================================
+# 单文件验证
+/usr/lib/llvm-18/bin/clang++ --analyze \
+    -Xclang -load -Xclang ./Checker.so \
+    -Xclang -analyzer-checker -Xclang custom.CheckerName \
+    target.c
+
+# 目录验证 (遍历目录下所有.c文件)
+for f in ./tests/*.c; do
+    /usr/lib/llvm-18/bin/clang++ --analyze \
+        -Xclang -load -Xclang ./Checker.so \
+        -Xclang -analyzer-checker -Xclang custom.CheckerName \
+        "$f"
+done
+
+==================================================
+# 项目运行命令
+==================================================
+
+python3 -m src.main generate \
+    --patch ./tests/patchweaver_buffer_lab/buffer_guard.patch \
+    --output ./tests/test_project \
+    --validate-path ./tests/patchweaver_buffer_lab \
+    --analyzer both
+
+python3 -m src.main generate \
+    --patch ./tests/patchweaver_uaf_lab/session_lifetime.patch \
+    --output ./tests/test_project_uaf \
+    --validate-path ./tests/patchweaver_uaf_lab \
+    --analyzer both
+
+python3 -m src.main refine \
+    --input ./tests/test_project \
+    --validate-path ./tests/patchweaver_buffer_lab \
+    --analyzer csa \
+    --no-live
+
+python3 -m src.main refine \
+    --input ./tests/test_project_uaf \
+    --validate-path ./tests/patchweaver_uaf_lab \
+    --analyzer csa \
+    --no-live
+
+python3 -m src.main refine \
+    --input ./tests/test_project_uaf \
+    --validate-path ./tests/patchweaver_uaf_lab \
+    --analyzer codeql \
+    --no-live
+
+==================================================
+# 完整编译和验证命令 (三个 Checker)
+==================================================
+
+# ----- 1. NullDereferenceChecker -----
+# 编译
+/usr/lib/llvm-18/bin/clang++ -shared -fPIC -std=c++20 -O2 \
+    -I/usr/lib/llvm-18/include \
+    -I/usr/lib/llvm-18/include/clang \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer/Core \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer/Frontend \
+    -I/usr/lib/llvm-18/include/llvm \
+    ./tests/results/run_20260223/NullDereferenceChecker.cpp \
+    -L/usr/lib/llvm-18/lib \
+    -lclang-cpp \
+    -Wl,-rpath,/usr/lib/llvm-18/lib \
+    -o ./tests/results/run_20260223/NullDereferenceChecker.so
+
+# 验证
+/usr/lib/llvm-18/bin/clang++ --analyze \
+    -Xclang -load -Xclang ./tests/test_project_uaf/csa/UseAfterFreeChecker.so \
+    -Xclang -analyzer-checker -Xclang custom.UseAfterFreeChecker \
+    ./tests/patchweaver_buffer_lab/src/cache_serializer.c
+
+==================================================
+# 6. CrossFileUAFChecker - 跨文件 Use-After-Free 检测
+==================================================
+# 编译
+/usr/lib/llvm-18/bin/clang++ -shared -fPIC -std=c++20 -O2 \
+    -I/usr/lib/llvm-18/include \
+    -I/usr/lib/llvm-18/include/clang \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer/Core \
+    -I/usr/lib/llvm-18/include/clang/StaticAnalyzer/Frontend \
+    -I/usr/lib/llvm-18/include/llvm \
+    ./tests/results/run_20260227/CrossFileUAFChecker.cpp \
+    -L/usr/lib/llvm-18/lib \
+    -lclang-cpp \
+    -Wl,-rpath,/usr/lib/llvm-18/lib \
+    -o ./tests/results/run_20260227/CrossFileUAFChecker.so
+
+# 跨文件分析 - 使用 compile_commands.json
+./tests/results/run_20260227/analyze_project.sh ./tests/network_server
+
+# 手动跨文件分析 - 每个文件单独分析但共享状态
+for file in ./tests/network_server/src/**/*.c; do
+    /usr/lib/llvm-18/bin/clang --analyze \
+        -Xclang -load -Xclang ./tests/results/run_20260227/CrossFileUAFChecker.so \
+        -Xclang -analyzer-checker -Xclang custom.CrossFileUAFChecker \
+        -Xclang -analyzer-config -Xclang crosscheck-with-z3=true \
+        -I./tests/network_server/include \
+        -I./tests/network_server/src/handlers \
+        "$file"
+done
+
+==================================================
+# 重要说明
+==================================================
+# 1. 编译和运行必须使用相同版本的 LLVM (本项目使用 LLVM-18)
+# 2. 插件必须导出以下符号:
+#    - clang_registerCheckers
+#    - clang_analyzerAPIVersionString
+# 3. 使用 `#include "clang/Basic/Version.h"` 后的 `CLANG_VERSION_STRING` 导出版本字符串
+# 4. 如果使用系统的 clang++ (可能是其他版本)，会导致插件加载失败或崩溃

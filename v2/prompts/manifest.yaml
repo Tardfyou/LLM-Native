@@ -1,0 +1,61 @@
+prompts:
+  generate.agent.system:
+    path: generate/system.md
+    kind: text
+    description: System prompt for the generate agent.
+  generate.agent.task:
+    path: generate/task.md
+    kind: text
+    description: Task prompt for generate runs.
+  generate.agent.plan:
+    path: generate/plan.md
+    kind: text
+    description: Planning prompt for the generate workflow.
+  generate.agent.rag_check:
+    path: generate/rag_check.md
+    kind: text
+    description: RAG conformance check prompt.
+  generate.agent.draft:
+    path: generate/draft.md
+    kind: text
+    description: First-draft prompt for the generate workflow.
+  generate.agent.repair:
+    path: generate/repair.md
+    kind: text
+    description: Repair prompt for the generate workflow.
+  generate.agent.analyzer.csa:
+    path: generate/analyzer/csa.md
+    kind: text
+    description: CSA-specific constraints for generate.
+  generate.agent.analyzer.codeql:
+    path: generate/analyzer/codeql.md
+    kind: text
+    description: CodeQL-specific constraints for generate.
+  generate.agent.reference.csa:
+    path: generate/reference/csa.md
+    kind: text
+    description: CSA skeleton reference.
+  generate.agent.reference.codeql:
+    path: generate/reference/codeql.md
+    kind: text
+    description: CodeQL skeleton reference.
+  orchestrator.analyzer_selection:
+    path: orchestrator/analyzer_selection.md
+    kind: text
+    description: Model prompt for selecting analyzers.
+  analysis.patch:
+    path: analysis/patch_analysis.md
+    kind: text
+    description: LLM prompt for structured patch analysis.
+  refine.agent.system:
+    path: refine/system.md
+    kind: text
+    description: System prompt for the refinement agent.
+  refine.agent.task:
+    path: refine/task.md
+    kind: text
+    description: Task prompt for a refinement run.
+  refine.agent.decide:
+    path: refine/decide.md
+    kind: text
+    description: Decision prompt for each refinement step.

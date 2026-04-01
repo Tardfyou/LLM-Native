@@ -1,0 +1,156 @@
+# LLVM Checker Generator v2 - Configuration
+# 基于补丁文件自动生成Clang-18静态分析检测器
+
+# 版本
+version: "2.2.0"
+description: "基于补丁文件的Clang-18检测器自动生成框架 (智能体模式 + CodeQL 支持)"
+
+project:
+  name: "LLVM Checker Generator"
+  version: "2.2.0"
+  description: "基于补丁文件的Clang-18检测器自动生成框架 (智能体模式 + CodeQL支持)"
+
+# MCP工具标准化配置（新增）
+mcp:
+  enabled: false                    # 默认关闭，不影响当前主流程
+  export_manifest_on_start: false   # 启动时是否导出工具清单
+  manifest_path: "${PROJECT_ROOT:-.}/output/mcp_tools_manifest.json"
+
+# 路径配置
+paths:
+  root_dir: "${PROJECT_ROOT:-.}"
+  prompts_dir: "${PROJECT_ROOT:-.}/prompts"
+  output_dir: "${PROJECT_ROOT:-.}/output"
+  logs_dir: "${PROJECT_ROOT:-.}/logs"
+  tests_dir: "${PROJECT_ROOT:-.}/tests"
+
+# LLM配置 - 支持DeepSeek
+llm:
+  # 主模型
+  primary_model: "deepseek-chat"
+
+  # API密钥
+  api_keys:
+    deepseek: "${DEEPSEEK_API_KEY:-}"
+
+  # 生成参数
+  generation:
+    temperature: 0.7
+    max_tokens: 8192
+    timeout: 120
+    max_retries: 3
+
+# 智能体配置 (新架构)
+agent:
+  max_iterations: 30           # 最大迭代次数
+  verbose: true                # 打印详细过程
+  stream_output: true          # 流式输出 LLM 响应
+  temperature: 0.3             # 智能体默认温度
+  refine_temperature: 0.1      # refine 智能体温度，仅作用于精炼
+  require_relevant_knowledge_before_generation: true
+  required_knowledge_min_similarity: 0.35
+  required_knowledge_min_results: 1
+  required_knowledge_top_k: 3
+
+  # 是否向 agent 注册 select_analyzer 工具
+  enable_analyzer_selection: true  # 启用智能工具选择
+
+# PATCHWEAVER 预规划配置
+patchweaver:
+  enabled: true
+  preflight_analysis: true
+  max_planned_requirements: 8
+
+quality_gates:
+  artifact_review:
+    enabled: true
+
+refine:
+  structural_candidate:
+    enabled: true
+    allowed_families:
+      csa: []
+      codeql: []
+
+validation:
+  semantic:
+    timeout: 120
+    codeql_auto_create_db: true
+
+# CodeQL配置 (新增)
+codeql:
+  enabled: true                   # 是否启用CodeQL (需安装 CodeQL CLI)
+  codeql_path: "/usr/local/bin/codeql"   # CodeQL CLI路径 (如果已安装)
+  database_path: "${PROJECT_ROOT:-.}/codeql_dbs"  # 数据库存储路径
+  validation_retries: 2           # 语法/语义验证失败后的自动修复重试次数
+  search_path: "${PROJECT_ROOT:-.}/codeql_packs"  # QL包搜索路径
+  timeout: 120                   # 执行超时(秒)
+  max_memory_mb: 1024           # 最大内存(MB)
+  cache_enabled: true              # 启用缓存
+
+  cache_dir: "${PROJECT_ROOT:-.}/codeql_cache"  # 缓存目录
+
+  # 数据库配置
+  database:
+    create_if_missing: true      # 数据库不存在时自动创建
+    overwrite: false              # 不覆盖已有数据库
+    parallel_workers: 2           # 并行构建数据库的工作线程数
+
+# 発能工具选择策略 (新增)
+analyzer_selection:
+  # 默认策略
+  default_strategy: "smart"           # smart/adaptive/intelligent
+  # 决策阈值
+  confidence_threshold: 0.7   # 选择置信度阈值(0-1)
+  # 漏洞类型权重
+  vulnerability_weights:
+    memory_leak: 0.2
+    buffer_overflow: 0.3
+    use_after_free: 0.3
+    integer_overflow: 0.2
+    sql_injection: 0.4
+    xss: 0.4
+    command_injection: 0.4
+    format_string: 0.2
+    path_traversal: 0.2
+    taint_tracking: 0.3
+
+  # CSA 特殊配置
+  csa:
+    preferred_for_memory: true      # 内存漏洞优先使用CSA
+    preferred_for_taint: false      # 污点追踪优先使用CodeQL
+    precision_weight: 0.7            # 精确度权重(0-1)
+    cross_file_weight: 0.3            # 跨文件分析权重(0-1)
+
+  # CodeQL 特殊配置
+  codeql_config:
+    preferred_for_memory: false     # 内存漏洞优先使用CodeQL
+    preferred_for_taint: true       # 污点追踪优先使用CodeQL
+    global_analysis_weight: 0.7      # 全局分析权重(0-1)
+    cross_file_weight: 0.8            # 跨文件分析权重(0-1)
+
+# 知识库配置 (RAG)
+knowledge_base:
+  # ChromaDB配置
+  chromadb:
+    host: "${CHROMA_HOST:-localhost}"
+    port: 8001
+    collection: "checker_knowledge"
+
+  # 嵌入模型 - 使用本地预训练模型
+  embedding:
+    model: "sentence-transformers--all-MiniLM-L6-v2"
+    cache_dir: "${PROJECT_ROOT:-.}/pretrained_models"
+
+  # 检索配置
+  retrieval:
+    top_k: 3
+    similarity_threshold: 0.2
+
+  # CodeQL 知识库
+  codeql_knowledge:
+    enabled: true
+    collection: "codeql_knowledge"
+    examples_file: "${PROJECT_ROOT:-.}/data/knowledge/codeql_examples.json"
+
+    templates_file: "${PROJECT_ROOT:-.}/data/knowledge/codeql_templates.json"

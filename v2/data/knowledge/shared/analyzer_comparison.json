@@ -1,0 +1,207 @@
+{
+  "comparison_summary": {
+    "id": "comparison_summary",
+    "title": "CSA vs CodeQL 核心对比",
+    "description": "Clang Static Analyzer 和 CodeQL 的核心差异对比，用于智能选择分析工具",
+    "dimensions": [
+      {
+        "dimension": "分析方式",
+        "csa": "路径敏感的符号执行",
+        "codeql": "基于图数据库的查询"
+      },
+      {
+        "dimension": "扩展语言",
+        "csa": "C++ (编写 Checker)",
+        "codeql": "QL 语言 (声明式查询)"
+      },
+      {
+        "dimension": "数据模型",
+        "csa": "Exploded Graph",
+        "codeql": "代码数据库"
+      },
+      {
+        "dimension": "数据流",
+        "csa": "路径敏感分析",
+        "codeql": "污点分析"
+      },
+      {
+        "dimension": "学习曲线",
+        "csa": "陡峭 (需懂 Clang 内部)",
+        "codeql": "中等 (QL 语言)"
+      },
+      {
+        "dimension": "开源程度",
+        "csa": "完全开源",
+        "codeql": "部分 (CLI 开源，规则库闭源)"
+      }
+    ]
+  },
+  "csa": {
+    "id": "csa",
+    "name": "Clang Static Analyzer",
+    "language": "C++",
+    "analysis_pipeline": "源代码 → Clang AST → CFG → Exploded Graph → 符号执行 → Bug报告",
+    "key_features": [
+      "路径敏感分析 - 模拟程序执行路径",
+      "符号执行 - 使用符号值代替具体值",
+      "状态爆炸 - 需要限制分析深度 (max_loop)",
+      "增量分析 - 单文件分析，跨文件支持有限"
+    ],
+    "strengths": [
+      "路径敏感，分析精确",
+      "完全开源，可控性强",
+      "可深度定制分析逻辑",
+      "与编译器紧密集成",
+      "适合内存相关漏洞检测"
+    ],
+    "weaknesses": [
+      "扩展门槛高 (C++ + Clang 内部)",
+      "跨文件分析困难",
+      "状态爆炸问题",
+      "版本兼容性问题 (LLVM-18 vs LLVM-21)",
+      "工具链复杂"
+    ],
+    "best_for": [
+      "内存漏洞 (buffer overflow, use-after-free, null dereference)",
+      "复杂控制流分析",
+      "需要精确路径分析的场景",
+      "单文件深度分析"
+    ],
+    "example_checker": "class NullDerefChecker : public Checker<check::PreCall> {\n    void checkPreCall(const CallEvent &Call, CheckerContext &C) const {\n        SVal Arg = Call.getArgSVal(0);\n        if (State->isNull(Arg).isConstrainedTrue()) {\n            // 报告bug\n        }\n    }\n};",
+    "build_command": "clang++ -shared -fPIC checker.cpp -o Checker.so"
+  },
+  "codeql": {
+    "id": "codeql",
+    "name": "CodeQL",
+    "language": "QL",
+    "analysis_pipeline": "源代码 → 提取器 → 代码数据库 → QL查询 → 结果",
+    "key_features": [
+      "图数据库 - 将代码建模为关系图 (AST, CFG, DFG)",
+      "声明式查询 - 用 QL 语言描述漏洞模式",
+      "全局分析 - 天然支持跨文件、跨模块",
+      "预计算 - 数据库构建后可多次查询"
+    ],
+    "strengths": [
+      "声明式查询，学习曲线平缓",
+      "天然支持全局/跨文件分析",
+      "GitHub 生态集成好",
+      "规则库丰富",
+      "IDE 支持完善"
+    ],
+    "weaknesses": [
+      "非路径敏感，误报可能多",
+      "CLI 开源，但规则库闭源",
+      "受限于 QL 表达能力",
+      "数据库构建耗时",
+      "内存消耗大"
+    ],
+    "best_for": [
+      "跨文件污点分析 (SQL注入, XSS)",
+      "API 误用检测 (危险函数调用)",
+      "大规模代码扫描 (企业级)",
+      "CI/CD 集成",
+      "安全审计"
+    ],
+    "example_query": "from FunctionCall call, Expr arg\nwhere\n    call.getTarget().getName() = \"strcpy\" and\n    arg = call.getArgument(0)\nselect call, \"Potential buffer overflow: unsafe use of strcpy\"",
+    "build_command": "codeql database create --language=cpp --source-root=./src ./codeql_db"
+  },
+  "scenario_recommendations": [
+    {
+      "scenario": "内存漏洞检测 (buffer overflow, use-after-free)",
+      "recommended": "csa",
+      "reason": "路径敏感，分析精确"
+    },
+    {
+      "scenario": "API 误用 (危险函数调用)",
+      "recommended": "codeql",
+      "reason": "简单模式匹配即可"
+    },
+    {
+      "scenario": "跨文件污点分析 (SQL注入, XSS)",
+      "recommended": "codeql",
+      "reason": "全局分析优势"
+    },
+    {
+      "scenario": "复杂控制流 (状态机验证)",
+      "recommended": "csa",
+      "reason": "路径敏感"
+    },
+    {
+      "scenario": "大规模代码扫描 (企业级)",
+      "recommended": "codeql",
+      "reason": "可扩展性好"
+    },
+    {
+      "scenario": "自定义深度分析",
+      "recommended": "csa",
+      "reason": "完全控制分析逻辑"
+    },
+    {
+      "scenario": "CI/CD 集成",
+      "recommended": "codeql",
+      "reason": "GitHub 原生支持"
+    },
+    {
+      "scenario": "安全审计",
+      "recommended": "codeql",
+      "reason": "规则库丰富"
+    },
+    {
+      "scenario": "不确定漏洞类型",
+      "recommended": "both",
+      "reason": "使用两种工具交叉验证"
+    }
+  ],
+  "vulnerability_type_mapping": {
+    "buffer_overflow": {
+      "primary": "csa",
+      "secondary": "codeql",
+      "reason": "CSA路径敏感分析更精确"
+    },
+    "null_dereference": {
+      "primary": "csa",
+      "secondary": "codeql",
+      "reason": "CSA可精确追踪指针状态"
+    },
+    "use_after_free": {
+      "primary": "csa",
+      "secondary": "codeql",
+      "reason": "CSA可追踪内存生命周期"
+    },
+    "memory_leak": {
+      "primary": "csa",
+      "secondary": "codeql",
+      "reason": "CSA可追踪分配释放配对"
+    },
+    "sql_injection": {
+      "primary": "codeql",
+      "secondary": "csa",
+      "reason": "CodeQL污点追踪能力强"
+    },
+    "xss": {
+      "primary": "codeql",
+      "secondary": null,
+      "reason": "CodeQL全局污点分析"
+    },
+    "command_injection": {
+      "primary": "codeql",
+      "secondary": "csa",
+      "reason": "CodeQL污点追踪更全面"
+    },
+    "path_traversal": {
+      "primary": "codeql",
+      "secondary": null,
+      "reason": "需要跨文件分析"
+    },
+    "integer_overflow": {
+      "primary": "csa",
+      "secondary": "codeql",
+      "reason": "CSA符号执行可检测算术溢出"
+    },
+    "format_string": {
+      "primary": "codeql",
+      "secondary": "csa",
+      "reason": "模式匹配即可"
+    }
+  }
+}

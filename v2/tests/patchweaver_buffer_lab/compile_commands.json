@@ -1,0 +1,17 @@
+[
+  {
+    "directory": "/home/spa/LLM-Native/v2/tests/patchweaver_buffer_lab",
+    "command": "gcc -Wall -Wextra -std=c11 -g -I./include -c src/main.c -o build/main.o",
+    "file": "src/main.c"
+  },
+  {
+    "directory": "/home/spa/LLM-Native/v2/tests/patchweaver_buffer_lab",
+    "command": "gcc -Wall -Wextra -std=c11 -g -I./include -c src/request_parser.c -o build/request_parser.o",
+    "file": "src/request_parser.c"
+  },
+  {
+    "directory": "/home/spa/LLM-Native/v2/tests/patchweaver_buffer_lab",
+    "command": "gcc -Wall -Wextra -std=c11 -g -I./include -c src/cache_serializer.c -o build/cache_serializer.o",
+    "file": "src/cache_serializer.c"
+  }
+]

@@ -1,0 +1,27 @@
+[
+  {
+    "directory": "/home/spa/LLM-Native/v2/tests/patchweaver_uaf_lab",
+    "command": "gcc -Wall -Wextra -std=c11 -g -I./include -c src/main.c -o build/main.o",
+    "file": "src/main.c"
+  },
+  {
+    "directory": "/home/spa/LLM-Native/v2/tests/patchweaver_uaf_lab",
+    "command": "gcc -Wall -Wextra -std=c11 -g -I./include -c src/session_store.c -o build/session_store.o",
+    "file": "src/session_store.c"
+  },
+  {
+    "directory": "/home/spa/LLM-Native/v2/tests/patchweaver_uaf_lab",
+    "command": "gcc -Wall -Wextra -std=c11 -g -I./include -c src/request_router.c -o build/request_router.o",
+    "file": "src/request_router.c"
+  },
+  {
+    "directory": "/home/spa/LLM-Native/v2/tests/patchweaver_uaf_lab",
+    "command": "gcc -Wall -Wextra -std=c11 -g -I./include -c src/audit_log.c -o build/audit_log.o",
+    "file": "src/audit_log.c"
+  },
+  {
+    "directory": "/home/spa/LLM-Native/v2/tests/patchweaver_uaf_lab",
+    "command": "gcc -Wall -Wextra -std=c11 -g -I./include -c src/report_cache.c -o build/report_cache.o",
+    "file": "src/report_cache.c"
+  }
+]

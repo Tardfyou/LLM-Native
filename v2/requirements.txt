@@ -1,0 +1,40 @@
+# LLVM Checker Generator v2 - Dependencies
+
+# LLM
+openai>=1.0.0
+langchain>=1.0.0
+langchain-openai>=1.0.0
+
+# Vector Database & RAG
+chromadb>=0.4.0
+llama-index-core>=0.10.0
+llama-index-vector-stores-chroma>=0.1.0
+llama-index-embeddings-huggingface>=0.1.0
+sentence-transformers>=2.2.0
+transformers>=4.30.0
+torch>=2.0.0
+
+# Code Analysis
+tree-sitter>=0.21.0
+
+# Configuration
+pyyaml>=6.0
+pydantic>=2.0.0
+
+# Logging
+loguru>=0.7.0
+
+# CLI
+rich>=13.0.0
+click>=8.0.0
+
+# Utilities
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+unidiff>=0.7.5
+patch-ng>=1.19.0
+diff-match-patch>=20241021
+
+# network
+socksio
+codechecker

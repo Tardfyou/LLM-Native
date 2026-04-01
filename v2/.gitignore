@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.o
+*.a
+*.out
+
+config/__tmp_*.yaml
+experiments/results/
+
+# CodeQL 数据库
+codeql_dbs/
+*.qll
+codeql_cache/
+
+# 预训练模型
+pretrained_models/
+
+# 测试输出
+tests/test_project*/
+tests/*/refinements/
+tests/*/csa/versions/
+tests/*/codeql/versions/
+scan_results/
+
+# 日志
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
+*.plist
+.lsp_tmp/
