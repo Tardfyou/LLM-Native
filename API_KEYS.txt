@@ -1,0 +1,24 @@
+# API Keys 备录
+
+## DeepSeek (有效)
+- Key: sk-f1ed234b6c2240e1bed912e09e601c75 ✓
+- Key: sk-61de429c43324f1e90a41e8610637a5e (无效)
+- Base URL: https://api.deepseek.com (注意: 不带 /v1，SDK 自动添加)
+- 默认模型: deepseek-chat
+
+## XTY 中转站
+- Key3.5: sk-O8OPI8ksFC698g8F23B5A82f1060493fB1861d1dB4D79701
+- Key全能：sk-ygS7w7TCUEw4UvMiA077323d5e974f8a9fAa75B65c1127Fe
+- Base URL: https://api.xty.app
+- gpt-4.1-mini
+- gpt-5.4-mini
+- claude-3-haiku
+- claude-haiku-4-5-20251001
+- gemini-2.5-flash
+- gemini-3-flash-preview
+- glm-4.7
+- minimax-m2.7
+## 当前配置 (v2/config/config.yaml)
+- provider: deepseek
+- primary_model: deepseek-chat
+- base_url: https://api.deepseek.com

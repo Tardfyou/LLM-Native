@@ -24,14 +24,23 @@ paths:
   logs_dir: "${PROJECT_ROOT:-.}/logs"
   tests_dir: "${PROJECT_ROOT:-.}/tests"
 
-# LLM配置 - 支持DeepSeek
+# LLM配置 - 支持多 Provider (DeepSeek / XTY中转站)
 llm:
-  # 主模型
-  primary_model: "deepseek-chat"
+  # Provider 选择: "deepseek" 或 "xty"
+  provider: "xty"
 
-  # API密钥
+  # 主模型 (根据 provider 选择合适模型)
+  primary_model: "gpt-5.4-mini"
+
+  # API密钥配置 (硬编码在配置文件)
   api_keys:
-    deepseek: "${DEEPSEEK_API_KEY:-}"
+    deepseek: "sk-f1ed234b6c2240e1bed912e09e601c75"
+    xty: "sk-ygS7w7TCUEw4UvMiA077323d5e974f8a9fAa75B65c1127Fe"
+
+  # 各 Provider 的 Base URL
+  base_urls:
+    deepseek: "https://api.deepseek.com"
+    xty: "https://api.xty.app/v1"
 
   # 生成参数
   generation:

@@ -176,7 +176,7 @@ class CodeQLFlowEvidenceCollector(EvidenceCollector):
                         if isinstance(item, dict) and item.get("name")
                     ][:6],
                     "live_query_status": self._live_status(runtime_artifacts),
-                    "target_files": list((runtime_artifacts.get("live_inventory", {}) or {}).get("target_files", []) or [])[:6],
+                    "target_files": list((runtime_artifacts.get("live_inventory", {}) or {}).get("target_files", []) or [])[:8],
                     "existing_findings_count": int(runtime_artifacts.get("existing_findings_count", 0) or 0),
                     "coverage_status": "full" if runtime_artifacts.get("database_exists") else ("partial" if satisfied else "missing"),
                 }
@@ -197,7 +197,7 @@ class CodeQLFlowEvidenceCollector(EvidenceCollector):
                             source_line=0,
                         ),
                         summary=str(payload.get("summary", "") or ""),
-                        call_boundary=list(payload.get("target_files", []) or [])[:4],
+                        call_boundary=list(payload.get("target_files", []) or [])[:6],
                         call_edges=self._live_call_edges(runtime_artifacts)[:6],
                         api_terms=self._api_terms(source_contexts, runtime_artifacts)[:4],
                         verifier="codeql-db" if runtime_artifacts.get("database_exists") else "project-analyzer",

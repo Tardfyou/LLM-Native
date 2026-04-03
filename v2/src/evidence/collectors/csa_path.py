@@ -320,7 +320,7 @@ class CSAPathEvidenceCollector(EvidenceCollector):
         barrier_guards = self._dedupe([guard for item in patch_contracts for guard in (item.get("guards", []) or []) if str(guard).strip()])[:6]
         added_apis = self._dedupe([api for item in patch_contracts for api in (item.get("added_calls", []) or []) if str(api).strip()])[:8]
         removed_risky = self._dedupe([api for item in patch_contracts for api in (item.get("removed_calls", []) or []) if str(api).strip()])[:8]
-        target_files = self._dedupe([str(item.relative_file).strip() for item in source_contexts if str(item.relative_file).strip()])[:6]
+        target_files = self._dedupe([str(item.relative_file).strip() for item in source_contexts if str(item.relative_file).strip()])[:8]
 
         summary_parts: List[str] = []
         if contract_summaries:
@@ -367,7 +367,7 @@ class CSAPathEvidenceCollector(EvidenceCollector):
                 summary=str(payload.get("summary", "") or ""),
                 statements=list(contract_summaries[:4]),
                 guards=barrier_guards[:4],
-                call_boundary=target_files[:4],
+                call_boundary=target_files[:6],
                 call_edges=list(runtime_artifacts.get("call_edges", []) or [])[:6],
                 api_terms=added_apis[:4] + removed_risky[:2],
                 related_symbols=focus_functions[:6],

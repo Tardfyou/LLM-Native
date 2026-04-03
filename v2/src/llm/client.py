@@ -1,5 +1,5 @@
 """
-LLM客户端 - 支持DeepSeek模型
+LLM客户端 - 支持多 Provider (DeepSeek / XTY中转站)
 
 提供统一的LLM调用接口，支持:
 - 文本生成
@@ -9,15 +9,32 @@ LLM客户端 - 支持DeepSeek模型
 """
 
 import json
+import os
 import time
 from typing import Optional, List, Dict, Any, Callable
 
 from openai import OpenAI
+import httpx
 from loguru import logger
 
 
+# Provider 配置 (不含密钥，密钥在配置文件中)
+PROVIDER_CONFIGS = {
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "env_key": "DEEPSEEK_API_KEY",
+        "default_model": "deepseek-chat",
+    },
+    "xty": {
+        "base_url": "https://api.xty.app",
+        "env_key": "XTY_API_KEY",
+        "default_model": "gpt-3.5-turbo",
+    },
+}
+
+
 class LLMClient:
-    """DeepSeek LLM客户端"""
+    """多 Provider LLM客户端"""
 
     def __init__(self, config: Dict[str, Any]):
         """
@@ -27,21 +44,50 @@ class LLMClient:
             config: LLM配置字典
         """
         self.config = config
-        self.primary_model = config.get("primary_model", "deepseek-chat")
         self.log_calls = bool(config.get("log_calls", True))
 
-        # 获取API密钥
-        api_keys = config.get("api_keys", {})
-        deepseek_key = api_keys.get("deepseek")
+        # 确定 provider
+        self.provider = str(config.get("provider", "deepseek") or "deepseek").strip().lower()
+        if self.provider not in PROVIDER_CONFIGS:
+            self.provider = "deepseek"
 
-        if not deepseek_key:
-            raise ValueError("未配置DeepSeek API密钥")
+        provider_info = PROVIDER_CONFIGS[self.provider]
+
+        # 主模型
+        self.primary_model = str(
+            config.get("primary_model", provider_info.get("default_model", "")) or
+            provider_info.get("default_model", "")
+        ).strip()
+
+        # 获取API密钥 (优先配置文件，然后环境变量)
+        api_keys = config.get("api_keys", {})
+        api_key = str(api_keys.get(self.provider, "") or "").strip()
+        if not api_key:
+            env_key = provider_info.get("env_key", "")
+            api_key = os.environ.get(env_key, "").strip()
+
+        if not api_key:
+            raise ValueError(f"未配置 {self.provider.upper()} API密钥")
+
+        # Base URL
+        base_urls = config.get("base_urls", {})
+        default_base_url = provider_info.get("base_url", "")
+        base_url = str(base_urls.get(self.provider, default_base_url) or default_base_url).strip()
 
         # 初始化OpenAI兼容客户端
-        self.client = OpenAI(
-            api_key=deepseek_key,
-            base_url="https://api.deepseek.com/v1"
-        )
+        client_kwargs = {
+            "api_key": api_key,
+            "base_url": base_url,
+        }
+
+        # XTY 中转站需要特殊配置
+        if self.provider == "xty":
+            client_kwargs["http_client"] = httpx.Client(
+                base_url=base_url,
+                follow_redirects=True,
+            )
+
+        self.client = OpenAI(**client_kwargs)
 
         # 生成参数
         gen_config = config.get("generation", {})
@@ -51,7 +97,7 @@ class LLMClient:
         self.max_retries = gen_config.get("max_retries", 3)
 
         if self.log_calls:
-            logger.info(f"LLM客户端初始化完成: model={self.primary_model}")
+            logger.info(f"LLM客户端初始化完成: provider={self.provider}, model={self.primary_model}")
 
     def generate(
         self,

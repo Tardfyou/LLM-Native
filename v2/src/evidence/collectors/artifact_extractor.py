@@ -117,7 +117,7 @@ class ProjectArtifactExtractor:
     def collect_source_contexts(
         self,
         context: AnalyzerContext,
-        radius: int = 8,
+        radius: int = 12,
     ) -> Tuple[List[SourceArtifactContext], Dict[str, Any]]:
         project_root = self.project_root(context)
         project_info = self.project_info(project_root)
@@ -607,7 +607,7 @@ class ProjectArtifactExtractor:
         self,
         lines: List[str],
         anchor_line: int,
-        radius: int = 8,
+        radius: int = 12,
     ) -> Tuple[str, List[Tuple[int, str]]]:
         start = max(1, anchor_line - radius)
         end = min(len(lines), anchor_line + radius)

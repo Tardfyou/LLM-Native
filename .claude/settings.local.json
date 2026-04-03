@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(python -c \"from src.generate.agent import LangChainGenerateAgent; print\\(''Import OK''\\)\")"
+    ]
+  }
+}
