@@ -42,24 +42,6 @@ try:
 except ImportError:
     ANALYZER_SELECTOR_AVAILABLE = False
 
-def register_all_tools(tool_registry, config: dict = None, analyzer: str = "csa", silent: bool = False):
-    """
-    注册所有工具到工具注册中心
-
-    Args:
-        tool_registry: 工具注册中心实例
-        config: 配置字典
-        analyzer: 分析器类型 (csa/codeql/both)
-    """
-    build_tool_registry(
-        config=config or {},
-        options=ToolProviderOptions(
-            analyzer=analyzer,
-            silent=silent,
-        ),
-        tool_registry=tool_registry,
-    )
-
 
 __all__ = [
     # 文件操作
@@ -89,8 +71,6 @@ __all__ = [
     "ValidationResult",
     "ToolProviderOptions",
     "build_tool_registry",
-    # 工具注册函数
-    "register_all_tools",
 ]
 
 if CODEQL_AVAILABLE:

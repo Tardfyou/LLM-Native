@@ -56,8 +56,17 @@ data/knowledge/
 data/benchmarks/
 !data/benchmarks/.gitkeep
 !data/knowledge/.gitkeep
+codeql_dbs/
+v2/codeql_dbs/
+v2/scan_results/
+v2/backups/
+v2/tests/output/
+v2/tests/**/outputs/
+v2/tests/**/tmp_analysis/
+v2_experiments/
 
 # Configuration with secrets
+API_KEYS.txt
 llm_keys.yaml
 config/local_config.yaml
 
@@ -66,6 +75,9 @@ tmp/
 temp/
 *.tmp
 *.bak
+tmp_*.json
+prompt.txt
+.codex/
 
 # Docker
 .dockerignore

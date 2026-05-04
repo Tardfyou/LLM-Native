@@ -279,6 +279,7 @@ class ProjectAnalyzerTool(Tool):
         """查找compile_commands.json"""
         possible_paths = [
             root / 'compile_commands.json',
+            root / '.patchweaver_env' / 'compile_commands.json',
             root / 'build' / 'compile_commands.json',
             root / 'cmake-build-debug' / 'compile_commands.json',
             root / 'cmake-build-release' / 'compile_commands.json',

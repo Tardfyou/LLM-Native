@@ -227,7 +227,7 @@ class ArtifactReviewTool(Tool):
             return ToolResult(
                 success=False,
                 output="\n".join(lines),
-                error="生成产物结构审查未通过",
+                error="生成产物结构审查未通过（存在语义空壳、占位实现或高风险结构问题）",
                 metadata={
                     "artifact_path": resolved_path,
                     "analyzer": analyzer_id,
@@ -350,7 +350,7 @@ class ArtifactReviewTool(Tool):
         ):
             warnings.append("CodeQL 查询使用 `toString()` 近似建模 guard/边界条件；这通常不是稳定的语义约束。")
         if re.search(r"\bregexpMatch\s*\(", normalized):
-            findings.append("CodeQL 查询依赖 `regexpMatch(...)` 做漏洞/guard 识别；这通常是字符串匹配近似，不是稳定的语义建模。")
+            warnings.append("CodeQL 查询依赖 `regexpMatch(...)` 做漏洞/guard 识别；这通常只是近似建模，除非已绑定到真实参数/AST 关系，否则应继续收紧。")
         if re.search(
             r"getLocation\(\)\.getStartLine\(\)\s*[<>]=?\s*\w+\.getLocation\(\)\.getStartLine\(\)",
             normalized,
@@ -497,8 +497,9 @@ class ArtifactReviewTool(Tool):
             )
 
         if self._claims_stateful_modeling_without_implementation(code or ""):
-            findings.append(
-                "CSA 代码在注释/说明中声称使用 `ProgramState` 或路径敏感状态跟踪，但实现里没有对应的状态读写、约束传播或 guard 绑定。"
+            warnings.append(
+                "CSA 代码引入了 `ProgramState` / 路径敏感相关符号或说明，但实现里没有对应的状态读写、约束传播或 guard 绑定。"
+                " 如果当前路线本来就是 AST/实参/guard 建模，应删掉这类 stateful 话术；只有显式声明了状态建模却完全未落地时才应继续升级处理。"
             )
 
         if self._reports_release_as_bug_for_lifecycle(code or ""):
@@ -523,7 +524,7 @@ class ArtifactReviewTool(Tool):
             )
 
         if self._CSA_QUALITY_COMMENT_PATTERN.search(code or ""):
-            if callee_only_dispatch_reports or self._claims_stateful_modeling_without_implementation(code or ""):
+            if callee_only_dispatch_reports or self._has_empty_program_state_modeling(code or ""):
                 findings.append("CSA 代码仍含有“简化实现 / for now / placeholder”一类占位说明，而关键 guard/state 语义尚未真正落地。")
             else:
                 warnings.append("CSA 代码含有“简化实现 / for now / placeholder”一类说明注释；仅作提示，真正阻断仍以空壳 helper、空状态建模或 API 黑名单式报告为准。")

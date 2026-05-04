@@ -35,6 +35,11 @@ CONTROL_KEYWORDS = {
     "sizeof",
 }
 
+PSEUDO_CALLS = {
+    "assert",
+    "va_arg",
+}
+
 MEMORY_APIS = {
     "malloc",
     "calloc",
@@ -84,6 +89,8 @@ class SourceArtifactContext:
     hunk_index: int
     anchor_line: int
     function_name: str
+    function_start_line: int = 0
+    function_end_line: int = 0
     parameters: List[str] = field(default_factory=list)
     guard_exprs: List[str] = field(default_factory=list)
     call_targets: List[str] = field(default_factory=list)
@@ -108,7 +115,10 @@ class ProjectArtifactExtractor:
     """Extract concrete project/source/build artifacts for evidence collection."""
 
     FUNCTION_PATTERN = re.compile(
-        r"^\s*(?:[A-Za-z_][\w\s\*\(\)]*?\s+)?([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*\{?\s*$"
+        r"^\s*(?:[A-Za-z_][\w]*(?:[\s\*]+[A-Za-z_][\w]*)*[\s\*]+)?([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*\{?\s*$"
+    )
+    MULTILINE_FUNCTION_START_PATTERN = re.compile(
+        r"^\s*(?:[A-Za-z_][\w]*(?:[\s\*]+[A-Za-z_][\w]*)*[\s\*]+)?([A-Za-z_]\w*)\s*\(\s*$"
     )
     HUNK_PATTERN = re.compile(
         r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
@@ -117,7 +127,7 @@ class ProjectArtifactExtractor:
     def collect_source_contexts(
         self,
         context: AnalyzerContext,
-        radius: int = 12,
+        radius: int = 32,
     ) -> Tuple[List[SourceArtifactContext], Dict[str, Any]]:
         project_root = self.project_root(context)
         project_info = self.project_info(project_root)
@@ -151,8 +161,14 @@ class ProjectArtifactExtractor:
                     if anchor_line <= 0 or anchor_line > len(lines):
                         continue
 
-                    window_excerpt, window_lines = self.read_window(lines, anchor_line, radius=radius)
-                    function_name, parameters = self.find_function_context(lines, anchor_line)
+                    function_name, parameters, function_start, function_end = self.find_function_context(lines, anchor_line)
+                    window_excerpt, window_lines = self.read_window(
+                        lines,
+                        anchor_line,
+                        radius=radius,
+                        lower_bound=function_start,
+                        upper_bound=function_end,
+                    )
                     call_targets = self.extract_call_targets(window_lines)
                     guard_exprs = self.extract_guard_exprs(window_lines)
                     globals_seen = self.extract_globals(window_lines)
@@ -168,6 +184,8 @@ class ProjectArtifactExtractor:
                             hunk_index=hunk_index,
                             anchor_line=anchor_line,
                             function_name=function_name,
+                            function_start_line=function_start,
+                            function_end_line=function_end,
                             parameters=parameters,
                             guard_exprs=guard_exprs,
                             call_targets=call_targets,
@@ -191,32 +209,34 @@ class ProjectArtifactExtractor:
         return source_contexts, artifact_meta
 
     def derive_anchor_lines(self, lines: List[str], hunk: Dict[str, Any]) -> List[int]:
-        anchors: List[int] = []
         old_start = int(hunk.get("old_start", 0) or 0)
-        old_count = int(hunk.get("old_count", 0) or 0)
         new_start = int(hunk.get("new_start", 0) or 0)
+        removed_lines = [str(item).rstrip() for item in (hunk.get("removed_lines", []) or [])]
+        added_lines = [str(item).rstrip() for item in (hunk.get("added_lines", []) or [])]
 
-        if old_start > 0:
-            anchors.append(old_start)
-            if old_count > 6:
-                anchors.append(min(len(lines), old_start + max(old_count // 2, 1)))
-        elif new_start > 0:
-            anchors.append(new_start)
+        removed_matches = self._match_changed_lines(lines, removed_lines)
+        added_matches = self._match_changed_lines(lines, added_lines)
+        anchors: List[int] = []
 
-        removed_lines = [str(item).strip() for item in (hunk.get("removed_lines", []) or [])]
-        for removed_line in removed_lines:
-            if not removed_line or removed_line.startswith("#"):
-                continue
-            for index, source_line in enumerate(lines, start=1):
-                if source_line.strip() == removed_line:
-                    anchors.append(index)
-                    break
+        use_patched_source = self._uses_patched_source(removed_matches, added_matches)
+        if use_patched_source is not None:
+            anchors.extend(self._ordered_hunk_anchors(lines, hunk, use_patched_source=use_patched_source))
+
+        anchors.extend(removed_matches)
+        if not anchors and use_patched_source:
+            anchors.extend(added_matches)
+
+        if not anchors:
+            if old_start > 0:
+                anchors.append(old_start)
+            elif new_start > 0:
+                anchors.append(new_start)
 
         return self._dedupe_ints(anchors)[:6]
 
     def collect_codeql_artifacts(self, context: AnalyzerContext) -> Dict[str, Any]:
         project_root = self.project_root(context)
-        target_path = context.validate_path or str(project_root)
+        target_path = context.evidence_dir or context.validate_path or str(project_root)
         configured_base = str(((context.shared_analysis or {}).get("codeql_database_path", "")) or "")
         if not configured_base:
             configured_base = str(((context.shared_analysis or {}).get("codeql", {}) or {}).get("database_path", ""))
@@ -242,8 +262,9 @@ class ProjectArtifactExtractor:
         source_contexts: List[SourceArtifactContext],
     ) -> Dict[str, Any]:
         cache_key = {
-            "cache_version": 3,
+            "cache_version": 6,
             "patch_path": str(Path(context.patch_path).expanduser().resolve()),
+            "evidence_dir": str(Path(context.evidence_dir or "").expanduser().resolve()) if context.evidence_dir else "",
             "validate_path": str(Path(context.validate_path or "").expanduser().resolve()) if context.validate_path else "",
             "source_files": sorted({item.relative_file for item in source_contexts}),
         }
@@ -264,7 +285,7 @@ class ProjectArtifactExtractor:
             return payload
 
         project_root = self.project_root(context)
-        targets = self._select_runtime_targets(source_contexts, limit=3)
+        targets = self._select_runtime_targets(source_contexts, limit=5)
         snapshots: List[Dict[str, Any]] = []
         aggregated_edges: List[str] = []
         for item in targets:
@@ -329,8 +350,9 @@ class ProjectArtifactExtractor:
         project_root = self.project_root(context)
         database_path = str(base.get("database_path", "") or "")
         cache_key = {
-            "cache_version": 3,
+            "cache_version": 6,
             "patch_path": str(Path(context.patch_path).expanduser().resolve()),
+            "evidence_dir": str(Path(context.evidence_dir or "").expanduser().resolve()) if context.evidence_dir else "",
             "validate_path": str(Path(context.validate_path or "").expanduser().resolve()) if context.validate_path else "",
             "database_path": database_path,
             "source_files": sorted({item.relative_file for item in source_contexts}),
@@ -365,7 +387,7 @@ class ProjectArtifactExtractor:
         if database_path and not is_codeql_database_dir(database_path):
             ok, message = self._ensure_codeql_database(
                 database_path=database_path,
-                target_path=context.validate_path or str(project_root),
+                target_path=context.evidence_dir or context.validate_path or str(project_root),
                 codeql_path=codeql_path,
                 build_script=str(base.get("build_script", "") or ""),
             )
@@ -418,8 +440,9 @@ class ProjectArtifactExtractor:
         return payload
 
     def project_root(self, context: AnalyzerContext) -> Path:
-        validate_path = Path(context.validate_path or ".").expanduser().resolve()
-        return validate_path if validate_path.is_dir() else validate_path.parent
+        preferred_root = str(context.evidence_dir or context.validate_path or context.work_dir or ".").strip()
+        resolved = Path(preferred_root).expanduser().resolve()
+        return resolved if resolved.is_dir() else resolved.parent
 
     def project_info(self, project_root: Path) -> Dict[str, Any]:
         try:
@@ -510,6 +533,7 @@ class ProjectArtifactExtractor:
                     "removed_lines": [],
                     "added_lines": [],
                     "context_lines": [],
+                    "ordered_lines": [],
                 }
                 continue
 
@@ -518,10 +542,14 @@ class ProjectArtifactExtractor:
 
             if raw_line.startswith("-") and not raw_line.startswith("--- "):
                 current_hunk["removed_lines"].append(raw_line[1:])
+                current_hunk["ordered_lines"].append({"kind": "removed", "text": raw_line[1:]})
             elif raw_line.startswith("+") and not raw_line.startswith("+++ "):
                 current_hunk["added_lines"].append(raw_line[1:])
+                current_hunk["ordered_lines"].append({"kind": "added", "text": raw_line[1:]})
             else:
-                current_hunk["context_lines"].append(raw_line[1:] if raw_line.startswith(" ") else raw_line)
+                text = raw_line[1:] if raw_line.startswith(" ") else raw_line
+                current_hunk["context_lines"].append(text)
+                current_hunk["ordered_lines"].append({"kind": "context", "text": text})
 
         if current_hunk and current_file is not None:
             current_file.setdefault("hunks", []).append(current_hunk)
@@ -608,9 +636,15 @@ class ProjectArtifactExtractor:
         lines: List[str],
         anchor_line: int,
         radius: int = 12,
+        lower_bound: int = 0,
+        upper_bound: int = 0,
     ) -> Tuple[str, List[Tuple[int, str]]]:
         start = max(1, anchor_line - radius)
         end = min(len(lines), anchor_line + radius)
+        if lower_bound > 0:
+            start = max(start, lower_bound)
+        if upper_bound > 0:
+            end = min(end, upper_bound)
         window = [(line_no, lines[line_no - 1]) for line_no in range(start, end + 1)]
         excerpt = "\n".join(f"{line_no}: {text}" for line_no, text in window)
         return excerpt, window
@@ -619,17 +653,17 @@ class ProjectArtifactExtractor:
         self,
         lines: List[str],
         anchor_line: int,
-    ) -> Tuple[str, List[str]]:
+    ) -> Tuple[str, List[str], int, int]:
         search_start = min(max(anchor_line, 1), len(lines))
         for index in range(search_start - 1, -1, -1):
-            function_name, parameters = self._function_from_line(lines[index])
-            if function_name:
-                return function_name, parameters
+            function_name, parameters, function_start, function_end = self._function_context_from_index(lines, index)
+            if function_name and (function_end <= 0 or anchor_line <= function_end):
+                return function_name, parameters, function_start, function_end
         for index in range(search_start, min(len(lines), search_start + 6)):
-            function_name, parameters = self._function_from_line(lines[index])
+            function_name, parameters, function_start, function_end = self._function_context_from_index(lines, index)
             if function_name:
-                return function_name, parameters
-        return "", []
+                return function_name, parameters, function_start, function_end
+        return "", [], 0, 0
 
     def extract_parameters(self, signature: str) -> List[str]:
         params: List[str] = []
@@ -655,13 +689,24 @@ class ProjectArtifactExtractor:
         call_targets: List[str] = []
         for _line_no, text in window_lines:
             stripped = text.strip()
-            if not stripped or stripped.startswith("//") or stripped.startswith("*"):
+            if (
+                not stripped
+                or stripped.startswith("//")
+                or stripped.startswith("/*")
+                or stripped.startswith("*")
+                or stripped.startswith("**")
+            ):
                 continue
+            candidate_text = re.sub(r"/\*.*?\*/", "", text)
+            candidate_text = candidate_text.split("//", 1)[0]
             if self.FUNCTION_PATTERN.match(stripped):
                 continue
-            for name in re.findall(r"\b([A-Za-z_]\w*)\s*\(", text):
-                if name not in CONTROL_KEYWORDS:
-                    call_targets.append(name)
+            for name in re.findall(r"\b([A-Za-z_]\w*)\s*\(", candidate_text):
+                if name in CONTROL_KEYWORDS or name in PSEUDO_CALLS:
+                    continue
+                if any(ch.isalpha() for ch in name) and name.upper() == name:
+                    continue
+                call_targets.append(name)
         return self._dedupe(call_targets)[:10]
 
     def extract_globals(self, window_lines: List[Tuple[int, str]]) -> List[str]:
@@ -770,14 +815,20 @@ class ProjectArtifactExtractor:
             key=lambda item: (
                 0 if item.compile_command else 1,
                 0 if item.function_name else 1,
-                -(len(item.guard_exprs) + len(item.lock_calls) + len(item.state_ops)),
+                -(
+                    len(item.guard_exprs)
+                    + len(item.lock_calls)
+                    + len(item.state_ops)
+                    + len(item.memory_ops)
+                    + len(item.call_targets)
+                ),
                 -item.anchor_line,
             ),
         )
         chosen: List[SourceArtifactContext] = []
         seen = set()
         for item in ranked:
-            key = (item.relative_file, item.function_name or "", item.anchor_line)
+            key = (item.relative_file, item.function_name or f"line:{item.anchor_line}")
             if key in seen:
                 continue
             seen.add(key)
@@ -913,36 +964,43 @@ class ProjectArtifactExtractor:
             for edge in call_edges
             if relevant_function and edge.startswith(f"{relevant_function} ->")
         ] or call_edges[:12]
-        branch_kinds = self._dedupe(branch_map.get(relevant_function, []) or [
-            kind
-            for values in branch_map.values()
-            for kind in values
-        ])[:6]
+        if relevant_function:
+            branch_kinds = self._dedupe(branch_map.get(relevant_function, []) or [])[:6]
+            branch_conditions = self._dedupe(branch_conditions_map.get(relevant_function, []) or [])[:8]
+            state_statements = self._dedupe(state_statements_map.get(relevant_function, []) or [])[:12]
+            field_accesses = self._dedupe(field_access_map.get(relevant_function, []) or [])[:10]
+            return_statements = self._dedupe(return_map.get(relevant_function, []) or [])[:6]
+        else:
+            branch_kinds = self._dedupe([
+                kind
+                for values in branch_map.values()
+                for kind in values
+            ])[:6]
+            branch_conditions = self._dedupe([
+                condition
+                for values in branch_conditions_map.values()
+                for condition in values
+            ])[:8]
+            state_statements = self._dedupe([
+                statement
+                for values in state_statements_map.values()
+                for statement in values
+            ])[:12]
+            field_accesses = self._dedupe([
+                field
+                for values in field_access_map.values()
+                for field in values
+            ])[:10]
+            return_statements = self._dedupe([
+                statement
+                for values in return_map.values()
+                for statement in values
+            ])[:6]
         call_targets = self._dedupe([
             edge.split("->", 1)[1].strip()
             for edge in relevant_edges
             if "->" in edge
         ])[:10]
-        branch_conditions = self._dedupe(branch_conditions_map.get(relevant_function, []) or [
-            condition
-            for values in branch_conditions_map.values()
-            for condition in values
-        ])[:8]
-        state_statements = self._dedupe(state_statements_map.get(relevant_function, []) or [
-            statement
-            for values in state_statements_map.values()
-            for statement in values
-        ])[:12]
-        field_accesses = self._dedupe(field_access_map.get(relevant_function, []) or [
-            field
-            for values in field_access_map.values()
-            for field in values
-        ])[:10]
-        return_statements = self._dedupe(return_map.get(relevant_function, []) or [
-            statement
-            for values in return_map.values()
-            for statement in values
-        ])[:6]
 
         return {
             "source_file": source_context.relative_file,
@@ -1398,9 +1456,225 @@ class ProjectArtifactExtractor:
                 deduped.append(value)
         return deduped
 
+    def _match_changed_lines(self, lines: List[str], changed_lines: List[str]) -> List[int]:
+        matches: List[int] = []
+        for changed_line in changed_lines:
+            matched_line = self._unique_source_line(lines, changed_line)
+            if matched_line > 0:
+                matches.append(matched_line)
+        return self._dedupe_ints(matches)
+
+    def _uses_patched_source(
+        self,
+        removed_matches: List[int],
+        added_matches: List[int],
+    ) -> Optional[bool]:
+        if removed_matches and not added_matches:
+            return False
+        if added_matches and not removed_matches:
+            return True
+        if added_matches and len(added_matches) > len(removed_matches):
+            return True
+        if removed_matches and len(removed_matches) > len(added_matches):
+            return False
+        return None
+
+    def _ordered_hunk_anchors(
+        self,
+        lines: List[str],
+        hunk: Dict[str, Any],
+        *,
+        use_patched_source: bool,
+    ) -> List[int]:
+        ordered_lines = list(hunk.get("ordered_lines", []) or [])
+        if not ordered_lines:
+            return []
+
+        cursor = int(hunk.get("new_start", 0) or 0) if use_patched_source else int(hunk.get("old_start", 0) or 0)
+        if cursor <= 0:
+            return []
+
+        anchors: List[int] = []
+        last_source_line = 0
+        for entry in ordered_lines:
+            kind = str((entry or {}).get("kind", "") or "")
+            text = str((entry or {}).get("text", "") or "")
+            if kind == "context":
+                matched_line = self._unique_source_line(lines, text)
+                if matched_line > 0 and matched_line >= last_source_line:
+                    cursor = matched_line
+                last_source_line = min(max(cursor, 1), len(lines))
+                cursor = last_source_line + 1
+                continue
+            if kind == "removed":
+                if use_patched_source:
+                    continue
+                matched_line = self._unique_source_line(lines, text)
+                if matched_line > 0 and matched_line >= last_source_line:
+                    cursor = matched_line
+                last_source_line = min(max(cursor, 1), len(lines))
+                anchors.append(last_source_line)
+                cursor = last_source_line + 1
+                continue
+            if kind == "added":
+                if use_patched_source:
+                    matched_line = self._unique_source_line(lines, text)
+                    if matched_line > 0 and matched_line >= last_source_line:
+                        cursor = matched_line
+                    last_source_line = min(max(cursor, 1), len(lines))
+                    anchors.append(last_source_line)
+                    cursor = last_source_line + 1
+                else:
+                    anchor_line = last_source_line or min(max(cursor - 1, 1), len(lines))
+                    anchors.append(min(max(anchor_line, 1), len(lines)))
+        return self._dedupe_ints(anchors)
+
+    def _unique_source_line(self, lines: List[str], candidate: str) -> int:
+        stripped = str(candidate or "").strip()
+        if not self._is_informative_anchor_line(stripped):
+            return 0
+        matches = [
+            index
+            for index, source_line in enumerate(lines, start=1)
+            if source_line.strip() == stripped
+        ]
+        return matches[0] if len(matches) == 1 else 0
+
+    def _is_informative_anchor_line(self, stripped: str) -> bool:
+        if not stripped or stripped.startswith("#"):
+            return False
+        if stripped in {"{", "}"}:
+            return False
+        if stripped.startswith(("return", "break", "continue", "goto ")):
+            return False
+        return bool(re.search(r"[A-Za-z_]\w*", stripped))
+
+    def _function_context_from_index(
+        self,
+        lines: List[str],
+        index: int,
+    ) -> Tuple[str, List[str], int, int]:
+        function_name, parameters, signature_end = self._function_signature_from_index(lines, index)
+        if not function_name:
+            return "", [], 0, 0
+
+        function_start = index + 1
+        body_start = self._function_body_start(lines, index, signature_end)
+        if body_start <= 0:
+            return function_name, parameters, function_start, 0
+        return function_name, parameters, function_start, self._function_body_end(lines, body_start)
+
+    def _function_signature_from_index(
+        self,
+        lines: List[str],
+        index: int,
+    ) -> Tuple[str, List[str], int]:
+        function_name, parameters = self._function_from_line(lines[index])
+        if function_name:
+            return function_name, parameters, index
+        return self._multiline_function_details_from_index(lines, index)
+
+    def _function_body_start(
+        self,
+        lines: List[str],
+        start_index: int,
+        signature_end: int,
+    ) -> int:
+        in_block_comment = False
+        for cursor in range(start_index, min(len(lines), max(signature_end + 2, start_index + 12))):
+            code, in_block_comment = self._strip_non_code(lines[cursor], in_block_comment)
+            if not code:
+                continue
+            if "{" in code:
+                return cursor + 1
+            if ";" in code:
+                return 0
+        return 0
+
+    def _function_body_end(
+        self,
+        lines: List[str],
+        body_start_line: int,
+    ) -> int:
+        in_block_comment = False
+        depth = 0
+        for cursor in range(max(body_start_line - 1, 0), len(lines)):
+            code, in_block_comment = self._strip_non_code(lines[cursor], in_block_comment)
+            if not code:
+                continue
+            for ch in code:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}" and depth > 0:
+                    depth -= 1
+                    if depth == 0:
+                        return cursor + 1
+        return len(lines)
+
+    def _strip_non_code(
+        self,
+        line: str,
+        in_block_comment: bool,
+    ) -> Tuple[str, bool]:
+        result: List[str] = []
+        cursor = 0
+        in_single_quote = False
+        in_double_quote = False
+        text = str(line or "")
+
+        while cursor < len(text):
+            ch = text[cursor]
+            next_ch = text[cursor + 1] if cursor + 1 < len(text) else ""
+
+            if in_block_comment:
+                if ch == "*" and next_ch == "/":
+                    in_block_comment = False
+                    cursor += 2
+                else:
+                    cursor += 1
+                continue
+
+            if in_single_quote:
+                if ch == "\\" and cursor + 1 < len(text):
+                    cursor += 2
+                    continue
+                if ch == "'":
+                    in_single_quote = False
+                cursor += 1
+                continue
+
+            if in_double_quote:
+                if ch == "\\" and cursor + 1 < len(text):
+                    cursor += 2
+                    continue
+                if ch == '"':
+                    in_double_quote = False
+                cursor += 1
+                continue
+
+            if ch == "/" and next_ch == "/":
+                break
+            if ch == "/" and next_ch == "*":
+                in_block_comment = True
+                cursor += 2
+                continue
+            if ch == "'":
+                in_single_quote = True
+                cursor += 1
+                continue
+            if ch == '"':
+                in_double_quote = True
+                cursor += 1
+                continue
+
+            result.append(ch)
+            cursor += 1
+
+        return "".join(result), in_block_comment
+
     def _function_from_line(self, line: str) -> Tuple[str, List[str]]:
         stripped = line.strip()
-        if not stripped or stripped.startswith("//") or stripped.startswith("*"):
+        if not stripped or stripped.startswith("//") or stripped.startswith("*") or self._looks_like_control_line(stripped):
             return "", []
         match = self.FUNCTION_PATTERN.match(stripped)
         if not match:
@@ -1410,3 +1684,58 @@ class ProjectArtifactExtractor:
             return "", []
         signature = match.group(2)
         return function_name, self.extract_parameters(signature)
+
+    def _multiline_function_from_index(
+        self,
+        lines: List[str],
+        index: int,
+    ) -> Tuple[str, List[str]]:
+        function_name, parameters, _ = self._multiline_function_details_from_index(lines, index)
+        return function_name, parameters
+
+    def _multiline_function_details_from_index(
+        self,
+        lines: List[str],
+        index: int,
+    ) -> Tuple[str, List[str], int]:
+        if index < 0 or index >= len(lines):
+            return "", [], index
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith(("//", "*", "#")) or self._looks_like_control_line(stripped):
+            return "", [], index
+        match = self.MULTILINE_FUNCTION_START_PATTERN.match(stripped)
+        if not match:
+            return "", [], index
+        function_name = match.group(1)
+        if function_name in CONTROL_KEYWORDS:
+            return "", [], index
+
+        signature_parts = [stripped]
+        for cursor in range(index + 1, min(len(lines), index + 10)):
+            candidate = lines[cursor].strip()
+            if not candidate or candidate.startswith(("//", "*")):
+                continue
+            signature_parts.append(candidate)
+            joined = " ".join(signature_parts)
+            if "{" in candidate and ")" in joined:
+                signature = joined.split("(", 1)[-1].split(")", 1)[0]
+                return function_name, self.extract_parameters(signature), cursor
+            if ";" in candidate:
+                break
+        return "", [], index
+
+    def _looks_like_control_line(self, stripped: str) -> bool:
+        return stripped.startswith((
+            "if(",
+            "if (",
+            "while(",
+            "while (",
+            "for(",
+            "for (",
+            "switch(",
+            "switch (",
+            "case ",
+            "return ",
+            "assert(",
+            "assert (",
+        ))

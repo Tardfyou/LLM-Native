@@ -30,6 +30,19 @@ def _normalize_validate_path(validate_path):
     return None
 
 
+def _normalize_existing_dir(path_value, label: str):
+    if not path_value:
+        return None
+    candidate = Path(path_value).expanduser().resolve()
+    if not candidate.exists():
+        logger.warning(f"{label}不存在，将忽略: {path_value}")
+        return None
+    if not candidate.is_dir():
+        logger.warning(f"{label}不是目录，将忽略: {path_value}")
+        return None
+    return str(candidate)
+
+
 def _configure_generation_logging(args, analyzer: str):
     auto_selected = analyzer == "auto"
     use_live_table = should_use_live_table(
@@ -172,6 +185,121 @@ def cmd_generate(args):
     return 1
 
 
+def cmd_evidence(args):
+    """独立证据收集命令。"""
+    from ..core import Orchestrator
+    from ..display import LiveProgressTable
+
+    print_banner()
+
+    if not Path(args.patch).exists():
+        logger.error(f"补丁文件不存在: {args.patch}")
+        return 1
+    if not Path(args.evidence_dir).exists():
+        logger.error(f"证据收集目录不存在: {args.evidence_dir}")
+        return 1
+
+    patch_path = str(Path(args.patch).expanduser().resolve())
+    evidence_dir = str(Path(args.evidence_dir).expanduser().resolve())
+    analyzer = getattr(args, "analyzer", "auto")
+    use_live_table = _configure_generation_logging(args, analyzer)
+
+    config_path = resolve_config_path(args.config, __file__)
+    if config_path:
+        logger.info(f"使用配置文件: {config_path}")
+    else:
+        logger.warning("未找到配置文件，使用默认配置")
+
+    orchestrator = Orchestrator(
+        config_path=config_path,
+        analyzer=analyzer,
+    )
+    live_progress = LiveProgressTable(verbose=args.verbose, use_rich=use_live_table)
+    output_root = Path(args.output or "./evidence_output").expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    event_log_path = output_root / "run_events.jsonl"
+
+    def on_progress(event_or_task_id, status_or_event=None, **kwargs):
+        event_payload = None
+        if isinstance(event_or_task_id, dict):
+            event_payload = dict(event_or_task_id)
+            live_progress.update(event_payload)
+        elif isinstance(status_or_event, str):
+            analyzer_name = kwargs.get("analyzer", "unknown")
+            event_type = kwargs.get("event", status_or_event)
+            event_payload = {
+                "analyzer": analyzer_name,
+                "event": event_type,
+                **kwargs,
+            }
+            live_progress.update(event_payload)
+        else:
+            event_payload = {
+                "analyzer": event_or_task_id,
+                "event": status_or_event,
+                **kwargs,
+            }
+            live_progress.update(event_payload)
+
+        if event_payload is None:
+            return
+        if "timestamp" not in event_payload:
+            event_payload["timestamp"] = time.time()
+        try:
+            with event_log_path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(event_payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    live_progress.start()
+    start_time = time.time()
+    try:
+        result = orchestrator.collect_evidence(
+            patch_path=patch_path,
+            evidence_dir=evidence_dir,
+            output_dir=str(output_root),
+            analyzer=analyzer,
+            on_progress=on_progress,
+        )
+    finally:
+        live_progress.stop()
+        if args.verbose and not use_live_table:
+            live_progress.print_summary()
+
+    elapsed = time.time() - start_time
+    manifest_path = Path(result.artifacts.get("manifest", "") or output_root / "evidence_manifest.json")
+
+    if result.success:
+        print(f"\n{'=' * 60}")
+        print("✅ 证据收集完成")
+        print(f"{'=' * 60}")
+        print(f"  耗时: {elapsed:.2f}秒")
+        print(f"  Patch: {patch_path}")
+        print(f"  证据源码目录: {evidence_dir}")
+        print(f"  输出目录: {output_root}")
+        print(f"  分析器: {result.analyzer_type or analyzer}")
+        for analyzer_id, payload in (result.analyzer_results or {}).items():
+            if not isinstance(payload, dict):
+                continue
+            print(
+                f"  - {analyzer_id}: records={payload.get('evidence_records', 0)}, "
+                f"missing={len(payload.get('missing_evidence', []) or [])}, "
+                f"bundle={payload.get('evidence_bundle_path', '')}"
+            )
+        print(f"  Manifest: {manifest_path}")
+        print(f"  事件日志: {event_log_path}")
+        return 0
+
+    print(f"\n{'=' * 60}")
+    print("❌ 证据收集失败!")
+    print(f"{'=' * 60}")
+    print(f"错误: {result.error_message}")
+    print(f"  Patch: {patch_path}")
+    print(f"  证据源码目录: {evidence_dir}")
+    print(f"  输出目录: {output_root}")
+    return 1
+
+
 def cmd_refine(args):
     """基于已有输出执行纯精炼。"""
     from ..core import Orchestrator
@@ -203,10 +331,15 @@ def cmd_refine(args):
     output_root.mkdir(parents=True, exist_ok=True)
     event_log_path = output_root / "run_events.jsonl"
     normalized_validate_path = _normalize_validate_path(getattr(args, "validate_path", None))
+    evidence_input = _normalize_existing_dir(getattr(args, "evidence_input", None), "证据输出目录")
+    auto_evidence_manifest = Path(args.input).expanduser().resolve() / "evidence_manifest.json"
+    if not evidence_input and auto_evidence_manifest.exists():
+        evidence_input = str(Path(args.input).expanduser().resolve())
 
     print(f"输入目录: {Path(args.input).expanduser().resolve()}", flush=True)
     print(f"分析器: {analyzer or 'auto-from-session'}", flush=True)
     print(f"验证路径: {normalized_validate_path or '沿用会话中的验证路径'}", flush=True)
+    print(f"证据输入目录: {evidence_input or '未提供'}", flush=True)
     print(f"精炼输出目录: {output_root}", flush=True)
     print(f"事件日志: {event_log_path}", flush=True)
 
@@ -249,6 +382,7 @@ def cmd_refine(args):
             input_dir=args.input,
             validate_path=normalized_validate_path,
             patch_path=getattr(args, "patch", None),
+            evidence_input_dir=evidence_input,
             analyzer=analyzer,
             on_progress=on_progress,
             run_id=run_id,
@@ -300,6 +434,66 @@ def cmd_refine(args):
     print_validation_result(getattr(result, "validation_result", None), analyzer or "")
     print(f"  事件日志: {event_log_path}")
     print(f"\n  整合报告: {report_path}")
+    return 1
+
+
+def cmd_experiment(args):
+    """实验管理命令。"""
+    from ..experiments import (
+        audit_manifest,
+        default_experiment_root,
+        init_experiment_root,
+        rebuild_table_exports,
+        run_experiments,
+    )
+
+    print_banner()
+
+    root = getattr(args, "root", None)
+    action = getattr(args, "action", "")
+    config_path = resolve_config_path(args.config, __file__)
+
+    if action == "init":
+        layout = init_experiment_root(root=root, force=bool(getattr(args, "force", False)))
+        print("✅ 实验目录已初始化")
+        print(f"  根目录: {layout.root}")
+        print(f"  样本清单: {layout.manifest_path}")
+        print(f"  结果表格: {layout.tables_dir}")
+        return 0
+
+    if action == "audit":
+        result = audit_manifest(
+            root=root,
+            manifest_path=getattr(args, "manifest", None),
+            sample_id=getattr(args, "sample_id", None),
+        )
+        print("✅ 样本审查完成")
+        print(f"  根目录: {result['root']}")
+        print(f"  审查样本数: {result['audited']}")
+        return 0
+
+    if action == "run":
+        result = run_experiments(
+            root=root,
+            manifest_path=getattr(args, "manifest", None),
+            config_path=config_path,
+            sample_id=getattr(args, "sample_id", None),
+            run_all=bool(getattr(args, "all", False)),
+            generate_only=bool(getattr(args, "generate_only", False)),
+        )
+        print("✅ 实验运行完成")
+        print(f"  根目录: {result['root']}")
+        print(f"  选中样本数: {result['selected']}")
+        print(f"  执行生成次数: {result['executed']}")
+        return 0
+
+    if action == "summarize":
+        result = rebuild_table_exports(root=root or str(default_experiment_root()))
+        print("✅ 实验表格已重建 Markdown 导出")
+        print(f"  根目录: {result['root']}")
+        return 0
+
+    logger.error(f"未知实验操作: {action}")
     return 1
 
 

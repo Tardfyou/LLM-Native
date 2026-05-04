@@ -1,6 +1,15 @@
-CodeQL 首稿骨架参考。首轮生成时提供，后续修复专精。
+CodeQL 首稿骨架参考。首轮生成时提供，后续修复专精，仅供参考，实际怎么写自己决定。
 
 ```ql
+/**
+ * @name PatchGuidedChecker
+ * @description Patch-local detector query generated from a security fix.
+ * @kind problem
+ * @problem.severity warning
+ * @precision medium
+ * @id cpp/custom/patch-guided-checker
+ */
+
 import cpp
 import semmle.code.cpp.controlflow.Guards
 import semmle.code.cpp.controlflow.Dominance

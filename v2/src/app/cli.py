@@ -6,9 +6,11 @@ import argparse
 from typing import Optional, Sequence
 
 from .handlers import (
+    cmd_evidence,
     cmd_generate,
     cmd_refine,
     cmd_validate,
+    cmd_experiment,
     cmd_knowledge,
     cmd_test,
     cmd_mcp,
@@ -35,6 +37,14 @@ CLI_EPILOG = """
 
   # 基于已有输出执行 detector 精炼
   python main.py refine -i output/ -v tests/project
+
+  # 独立收集 refine 所需证据
+  python main.py evidence -p tests/patch.diff --evidence-dir tests/project -o evidence_output/
+
+  # 初始化并运行实验管理目录
+  python main.py experiment init
+  python main.py experiment audit --all
+  python main.py experiment run --all
 
   # 验证检测器
   python main.py validate --checker output/checker.so --target tests/test.c
@@ -91,6 +101,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gen_parser.set_defaults(func=cmd_generate)
 
+    evidence_parser = subparsers.add_parser("evidence", help="独立收集 refine 所需证据")
+    evidence_parser.add_argument("--patch", "-p", required=True, help="补丁文件路径")
+    evidence_parser.add_argument(
+        "--evidence-dir",
+        required=True,
+        help="证据收集根目录（源码/工程目录），与 validate-path 分离",
+    )
+    evidence_parser.add_argument("--output", "-o", help="证据输出目录")
+    evidence_parser.add_argument(
+        "--analyzer",
+        "-a",
+        default="auto",
+        help=(
+            "静态分析工具选择：支持 csa/codeql/both/auto，"
+            "也支持多分析器组合（如 csa,codeql 或 csa+codeql）。默认: auto"
+        ),
+    )
+    evidence_parser.add_argument("--verbose", action="store_true", default=True, help="显示详细输出 (默认: True)")
+    evidence_parser.add_argument(
+        "--no-live",
+        action="store_true",
+        default=False,
+        help="禁用实时表格显示（多分析器模式下使用简单输出）",
+    )
+    evidence_parser.set_defaults(func=cmd_evidence)
+
     refine_parser = subparsers.add_parser("refine", help="基于已有输出执行 detector 精炼")
     refine_parser.add_argument(
         "--input",
@@ -103,6 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-v",
         dest="validate_path",
         help="可选，覆盖已有输出中的验证路径(文件或目录)。未提供时优先复用已有输出中的路径",
+    )
+    refine_parser.add_argument(
+        "--evidence-input",
+        dest="evidence_input",
+        help="可选，独立 evidence 收集输出目录（evidence 命令产物）",
     )
     refine_parser.add_argument("--patch", "-p", help="可选，显式提供原始补丁路径（用于老输出目录回填）")
     refine_parser.add_argument(
@@ -137,10 +178,45 @@ def build_parser() -> argparse.ArgumentParser:
     val_parser.add_argument("--verbose", action="store_true", default=True, help="显示详细输出")
     val_parser.set_defaults(func=cmd_validate)
 
+    exp_parser = subparsers.add_parser("experiment", help="管理 v2 毕设实验")
+    exp_parser.add_argument(
+        "action",
+        choices=["init", "audit", "run", "summarize"],
+        help="实验操作：init 初始化目录，audit 审查样本，run 批量运行，summarize 重建表格导出",
+    )
+    exp_parser.add_argument(
+        "--root",
+        help="实验根目录，默认使用与 v2 同级的 v2_experiments/",
+    )
+    exp_parser.add_argument(
+        "--manifest",
+        help="样本清单 CSV，默认使用 <root>/manifests/samples.csv",
+    )
+    exp_parser.add_argument(
+        "--sample-id",
+        help="仅处理指定样本",
+    )
+    exp_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="处理清单中的全部样本",
+    )
+    exp_parser.add_argument(
+        "--generate-only",
+        action="store_true",
+        help="仅执行生成实验并写入生成/性能表，不触发 refine 或后端对比",
+    )
+    exp_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="init 时重建模板文件和空表格",
+    )
+    exp_parser.set_defaults(func=cmd_experiment)
+
     kb_parser = subparsers.add_parser("knowledge", help="知识库操作")
     kb_parser.add_argument("action", choices=["status", "search", "import"], help="操作类型")
     kb_parser.add_argument("--query", "-q", help="搜索查询")
-    kb_parser.add_argument("--top-k", type=int, default=3, help="返回结果数量")
+    kb_parser.add_argument("--top-k", type=int, default=2, help="返回结果数量")
     kb_parser.add_argument("--clear", action="store_true", help="导入前清空知识库")
     kb_parser.add_argument("--csa-only", action="store_true", help="仅导入CSA知识")
     kb_parser.add_argument("--codeql-only", action="store_true", help="仅导入CodeQL知识")

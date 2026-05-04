@@ -6,7 +6,7 @@
 - 分析器抽象基类和实现
 """
 
-from .orchestrator import Orchestrator, GenerationResult
+from .orchestrator import Orchestrator, GenerationResult, EvidenceCollectionResult
 from .analyzer_manager import AnalyzerManager
 from .analyzer_base import (
     AnalyzerType,
@@ -30,6 +30,7 @@ __all__ = [
     # 主编排器
     "Orchestrator",
     "GenerationResult",
+    "EvidenceCollectionResult",
     "AnalyzerManager",
 
     # 分析器基类

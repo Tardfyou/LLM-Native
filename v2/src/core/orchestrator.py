@@ -26,6 +26,7 @@ from typing import Dict, Any, Optional, List, Callable
 
 from loguru import logger
 
+from ..llm.usage import merge_usages, normalize_usage
 from ..prompts import PromptRepository
 from .analyzer_base import (
     AnalyzerResult,
@@ -34,6 +35,7 @@ from .analyzer_base import (
 )
 from .analyzer_manager import AnalyzerManager
 from .portfolio_controller import PortfolioController
+from ..validation.types import AnalyzerType, Diagnostic, ValidationResult, ValidationStage
 
 
 @dataclass
@@ -60,6 +62,21 @@ class GenerationResult:
     run_metrics: Dict[str, Any] = field(default_factory=dict)
     report_output_dir: str = ""
     analyzer_output_dirs: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class EvidenceCollectionResult:
+    """独立证据收集结果。"""
+
+    success: bool = False
+    patch_path: str = ""
+    evidence_dir: str = ""
+    output_dir: str = ""
+    analyzer_type: str = ""
+    error_message: str = ""
+    shared_analysis: Dict[str, Any] = field(default_factory=dict)
+    analyzer_results: Dict[str, Any] = field(default_factory=dict)
+    artifacts: Dict[str, str] = field(default_factory=dict)
 
 
 class Orchestrator:
@@ -171,28 +188,39 @@ class Orchestrator:
 
             logger.info(f"选择分析器: {analyzer_choice}")
 
-            # 2. PATCHWEAVER 共享分析上下文
-            if on_progress:
-                on_progress({
-                    "analyzer": "patchweaver",
-                    "event": "preflight_started",
-                    "timestamp": time.time(),
-                })
-            shared_analysis = self._analyze_patch_shared(
-                patch_path=patch_path,
-                selected_analyzers=selected_analyzers,
-            )
-            result.shared_analysis = shared_analysis
-            if on_progress:
-                patchweaver = shared_analysis.get("patchweaver", {})
-                plan = patchweaver.get("evidence_plan", {}) if isinstance(patchweaver, dict) else {}
-                on_progress({
-                    "analyzer": "patchweaver",
-                    "event": "preflight_completed",
-                    "timestamp": time.time(),
-                    "summary": patchweaver.get("summary", ""),
-                    "planned_evidence": len(plan.get("requirements", []) or []),
-                })
+            # 2. PATCHWEAVER 共享分析上下文（generate 默认关闭，避免与独立 evidence 收集重复）
+            if self._is_generate_preflight_enabled():
+                if on_progress:
+                    on_progress({
+                        "analyzer": "patchweaver",
+                        "event": "preflight_started",
+                        "timestamp": time.time(),
+                    })
+                shared_analysis = self._analyze_patch_shared(
+                    patch_path=patch_path,
+                    selected_analyzers=selected_analyzers,
+                )
+                result.shared_analysis = shared_analysis
+                if on_progress:
+                    patchweaver = shared_analysis.get("patchweaver", {})
+                    plan = patchweaver.get("evidence_plan", {}) if isinstance(patchweaver, dict) else {}
+                    on_progress({
+                        "analyzer": "patchweaver",
+                        "event": "preflight_completed",
+                        "timestamp": time.time(),
+                        "summary": patchweaver.get("summary", ""),
+                        "planned_evidence": len(plan.get("requirements", []) or []),
+                    })
+            else:
+                shared_analysis = {}
+                result.shared_analysis = {}
+                if on_progress:
+                    on_progress({
+                        "analyzer": "patchweaver",
+                        "event": "preflight_skipped",
+                        "timestamp": time.time(),
+                        "reason": "generate_preflight_disabled",
+                    })
 
             # 3. 执行生成
             if len(selected_analyzers) > 1:
@@ -239,11 +267,144 @@ class Orchestrator:
 
         return result
 
+    def collect_evidence(
+        self,
+        patch_path: str,
+        evidence_dir: str,
+        output_dir: str = None,
+        analyzer: str = None,
+        on_progress: Callable = None,
+    ) -> EvidenceCollectionResult:
+        """独立执行证据收集并落盘。"""
+        from .refinement_session import (
+            EVIDENCE_INPUT_MANIFEST,
+            EVIDENCE_INPUT_SCHEMA_VERSION,
+        )
+
+        self._ensure_initialized()
+
+        patch_path = str(Path(patch_path).expanduser().resolve())
+        evidence_dir = str(Path(evidence_dir).expanduser().resolve())
+        output_root = Path(output_dir or "./evidence_output").expanduser().resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        result = EvidenceCollectionResult(
+            patch_path=patch_path,
+            evidence_dir=evidence_dir,
+            output_dir=str(output_root),
+        )
+
+        try:
+            analyzer_choice = analyzer or self._select_analyzer(patch_path)
+            selected_analyzers = self._resolve_analyzers(analyzer_choice)
+            result.analyzer_type = (
+                ",".join(selected_analyzers)
+                if len(selected_analyzers) > 1
+                else (selected_analyzers[0] if selected_analyzers else "")
+            )
+
+            shared_analysis = self._analyze_patch_shared(
+                patch_path=patch_path,
+                selected_analyzers=selected_analyzers,
+            )
+            result.shared_analysis = shared_analysis
+
+            patchweaver_path = output_root / "patchweaver_plan.json"
+            patchweaver_path.write_text(
+                json.dumps(copy.deepcopy(shared_analysis or {}), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result.artifacts["patchweaver_plan"] = str(patchweaver_path)
+
+            manifest: Dict[str, Any] = {
+                "schema_version": EVIDENCE_INPUT_SCHEMA_VERSION,
+                "patch_path": patch_path,
+                "evidence_dir": evidence_dir,
+                "analyzer_choice": result.analyzer_type,
+                "shared_analysis_path": self._manifest_relpath(output_root, str(patchweaver_path)),
+                "artifacts": {},
+            }
+
+            for analyzer_id in selected_analyzers:
+                analyzer_output_dir = (output_root / analyzer_id).resolve()
+                analyzer_output_dir.mkdir(parents=True, exist_ok=True)
+                if on_progress:
+                    on_progress({
+                        "analyzer": analyzer_id,
+                        "event": "evidence_collection_started",
+                        "timestamp": time.time(),
+                    })
+
+                context = AnalyzerContext(
+                    patch_path=patch_path,
+                    output_dir=str(analyzer_output_dir),
+                    evidence_dir=evidence_dir,
+                    shared_analysis=copy.deepcopy(shared_analysis or {}),
+                )
+                analyzer_instance = self._create_analyzer(
+                    analyzer_type=analyzer_id,
+                    progress_callback=on_progress,
+                    suppress_output=True,
+                )
+                evidence_bundle = analyzer_instance.collect_evidence(context)
+                synthesis_input = analyzer_instance.build_synthesis_input(context, evidence_bundle)
+
+                evidence_bundle_path = analyzer_output_dir / "evidence_bundle.json"
+                evidence_bundle_path.write_text(
+                    json.dumps(evidence_bundle.to_dict(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                synthesis_input_path = analyzer_output_dir / "synthesis_input.json"
+                synthesis_input_path.write_text(
+                    json.dumps(synthesis_input.to_dict(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+                analyzer_report = {
+                    "success": True,
+                    "evidence_records": len(getattr(evidence_bundle, "records", []) or []),
+                    "missing_evidence": list(getattr(evidence_bundle, "missing_evidence", []) or []),
+                    "collected_analyzers": list(getattr(evidence_bundle, "collected_analyzers", []) or []),
+                    "evidence_bundle_path": str(evidence_bundle_path),
+                    "synthesis_input_path": str(synthesis_input_path),
+                }
+                result.analyzer_results[analyzer_id] = analyzer_report
+                manifest["artifacts"][analyzer_id] = {
+                    "analyzer_id": analyzer_id,
+                    "evidence_bundle_path": self._manifest_relpath(output_root, str(evidence_bundle_path)),
+                    "synthesis_input_path": self._manifest_relpath(output_root, str(synthesis_input_path)),
+                    "report_entry": copy.deepcopy(analyzer_report),
+                }
+
+                if on_progress:
+                    on_progress({
+                        "analyzer": analyzer_id,
+                        "event": "evidence_collection_completed",
+                        "timestamp": time.time(),
+                        "records": analyzer_report["evidence_records"],
+                        "missing": len(analyzer_report["missing_evidence"]),
+                    })
+
+            manifest_path = output_root / EVIDENCE_INPUT_MANIFEST
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result.artifacts["manifest"] = str(manifest_path)
+            result.success = bool(result.analyzer_results)
+            return result
+        except Exception as exc:
+            logger.exception("证据收集过程出错")
+            result.success = False
+            result.error_message = str(exc)
+            return result
+
     def refine(
         self,
         input_dir: str,
         validate_path: str = None,
         patch_path: str = None,
+        evidence_input_dir: str = None,
         analyzer: str = None,
         on_progress: Callable = None,
         run_id: str = None,
@@ -255,6 +416,7 @@ class Orchestrator:
             input_dir: generate 阶段输出目录
             validate_path: 可选，验证路径
             patch_path: 可选，显式覆盖原始补丁路径
+            evidence_input_dir: 可选，独立 evidence 收集输出目录
             analyzer: 可选，限制需要执行的分析器
             on_progress: 进度回调
 
@@ -266,7 +428,11 @@ class Orchestrator:
         self._ensure_initialized()
 
         loader = RefinementSessionLoader()
-        session = loader.load(input_dir=input_dir, patch_path_override=patch_path)
+        session = loader.load(
+            input_dir=input_dir,
+            patch_path_override=patch_path,
+            evidence_input_dir=evidence_input_dir,
+        )
         effective_validate_path = validate_path or session.validate_path or ""
         normalized_run_id = self._normalize_refinement_run_id(run_id)
         report_output_dir = self._build_refinement_report_output_dir(input_dir, normalized_run_id)
@@ -342,6 +508,7 @@ class Orchestrator:
                     patch_path=session.patch_path,
                     output_dir=analyzer_output_dir,
                     validate_path=effective_validate_path,
+                    evidence_dir=session.evidence_dir,
                     shared_analysis=result.shared_analysis,
                     on_progress=on_progress,
                 )
@@ -484,7 +651,7 @@ class Orchestrator:
         response = self._llm_client.generate(
             prompt=prompt,
             temperature=0.0,
-            max_tokens=600,
+            max_tokens=8192,
         )
         if not response:
             return []
@@ -599,6 +766,11 @@ class Orchestrator:
 
         return {}
 
+    def _is_generate_preflight_enabled(self) -> bool:
+        """是否在 generate 阶段启用 PATCHWEAVER preflight。"""
+        patchweaver_settings = self.config.get("patchweaver", {}) or {}
+        return bool(patchweaver_settings.get("generate_preflight_enabled", False))
+
     def _normalize_primary_pattern(
         self,
         shared_analysis: Dict[str, Any],
@@ -678,6 +850,10 @@ class Orchestrator:
             return analyzer_result
 
         analyzer_result.validation_result = analyzer.validate(analyzer_result, context)
+        analyzer_result.validation_result = self._normalize_validation_result(
+            analyzer_id=analyzer_id,
+            analyzer_result=analyzer_result,
+        )
         feedback_status = self._attach_validation_feedback(
             analyzer_id=analyzer_id,
             analyzer_result=analyzer_result,
@@ -696,6 +872,36 @@ class Orchestrator:
         )
         return analyzer_result
 
+    def _normalize_validation_result(
+        self,
+        analyzer_id: str,
+        analyzer_result: AnalyzerResult,
+    ) -> Any:
+        """规范化验证结果，避免将无关诊断传播到后续报告和 refine 输入。"""
+        validation_result = getattr(analyzer_result, "validation_result", None)
+        if validation_result is None:
+            return validation_result
+
+        metadata = copy.deepcopy(getattr(validation_result, "metadata", {}) or {})
+        diagnostics = list(getattr(validation_result, "diagnostics", []) or [])
+        metadata.setdefault("all_diagnostics_count", len(diagnostics))
+
+        if str(analyzer_id or "").strip().lower() != "csa":
+            metadata.setdefault("generated_diagnostics_count", len(diagnostics))
+            validation_result.metadata = metadata
+            return validation_result
+
+        checker_name = str(getattr(analyzer_result, "checker_name", "") or "").strip()
+        filtered = [
+            diagnostic for diagnostic in diagnostics
+            if self._is_generated_diagnostic(analyzer_id, diagnostic, checker_name)
+        ]
+        metadata["generated_diagnostics_count"] = len(filtered)
+        metadata["diagnostics_filtered"] = len(filtered) != len(diagnostics)
+        validation_result.diagnostics = filtered
+        validation_result.metadata = metadata
+        return validation_result
+
     def _refine_single_from_saved_artifact(
         self,
         analyzer_type: str,
@@ -703,6 +909,7 @@ class Orchestrator:
         patch_path: str,
         output_dir: str,
         validate_path: str,
+        evidence_dir: str,
         shared_analysis: Dict[str, Any],
         on_progress: Optional[Callable] = None,
     ) -> AnalyzerResult:
@@ -721,6 +928,12 @@ class Orchestrator:
                 patch_path=patch_path,
                 output_dir=output_dir or "./output",
                 validate_path=validate_path,
+                evidence_dir=evidence_dir,
+                evidence_bundle_raw=(
+                    getattr(artifact, "evidence_bundle_raw", {}) or {}
+                ) or (
+                    getattr(artifact, "post_validation_evidence_bundle_raw", {}) or {}
+                ),
                 shared_analysis=baseline_shared_analysis,
             )
             analyzer = self._create_analyzer(
@@ -734,13 +947,29 @@ class Orchestrator:
                 artifact=artifact,
                 validate_path=validate_path,
             )
-            result = self._validate_analyzer_result(
-                analyzer_id=analyzer_type,
-                analyzer=analyzer,
-                analyzer_result=result,
-                context=baseline_context,
-                on_progress=on_progress,
-            )
+            if getattr(result, "validation_result", None) is not None:
+                result.metadata["validation_requested"] = bool(validate_path)
+                result.metadata["shared_analysis_after_validation"] = self._augment_shared_analysis_with_validation_feedback(
+                    shared_analysis=baseline_shared_analysis,
+                    analyzer_result=result,
+                    phase="baseline_reused_validation",
+                )
+                if on_progress:
+                    on_progress({
+                        "analyzer": analyzer_type,
+                        "event": "baseline_validation_reused",
+                        "timestamp": time.time(),
+                        "diagnostics_count": len(getattr(result.validation_result, "diagnostics", []) or []),
+                        "summary": str(result.metadata.get("baseline_validation_summary", "") or ""),
+                    })
+            else:
+                result = self._validate_analyzer_result(
+                    analyzer_id=analyzer_type,
+                    analyzer=analyzer,
+                    analyzer_result=result,
+                    context=baseline_context,
+                    on_progress=on_progress,
+                )
             current_shared_analysis = result.metadata.get(
                 "shared_analysis_after_validation",
                 baseline_shared_analysis,
@@ -791,61 +1020,112 @@ class Orchestrator:
                     })
                 return result
 
-            if on_progress:
-                on_progress({
-                    "analyzer": analyzer_type,
-                    "event": "refinement_iteration_started",
-                    "timestamp": time.time(),
-                    "iteration": 1,
-                })
+            max_rounds = self._refinement_max_rounds()
+            current_result = result
+            current_artifact = copy.deepcopy(artifact)
+            attempted_rounds = 0
+            adopted_any = False
+            last_candidate: Optional[AnalyzerResult] = None
 
-            refinement_shared_analysis = self._augment_shared_analysis_with_validation_feedback(
-                shared_analysis=current_shared_analysis,
-                analyzer_result=result,
-                phase="refine_candidate",
-            )
-            refinement_context = AnalyzerContext(
-                patch_path=patch_path,
-                output_dir=output_dir or "./output",
-                validate_path=validate_path,
-                shared_analysis=refinement_shared_analysis,
-            )
-            candidate = analyzer.refine(
-                refinement_context,
-                artifact=artifact,
-                baseline_result=result,
-            )
-            candidate = self._validate_analyzer_result(
-                analyzer_id=analyzer_type,
-                analyzer=analyzer,
-                analyzer_result=candidate,
-                context=refinement_context,
-                on_progress=on_progress,
-            )
+            for iteration in range(1, max_rounds + 1):
+                if on_progress:
+                    on_progress({
+                        "analyzer": analyzer_type,
+                        "event": "refinement_iteration_started",
+                        "timestamp": time.time(),
+                        "iteration": iteration,
+                        "max_iterations": max_rounds,
+                    })
 
-            adopted = self._is_candidate_improvement(current=result, candidate=candidate)
-            final_result = candidate if adopted else result
-            final_result.metadata["refinement_attempted"] = True
-            final_result.metadata["refinement_adopted"] = adopted
-            final_result.metadata["refinement_iterations_attempted"] = 1
-            final_result.metadata["last_refinement_candidate_success"] = bool(candidate.success)
-            final_result.metadata["last_refinement_candidate_error"] = str(candidate.error_message or "")
-            final_result.metadata["last_refinement_candidate_artifact_review"] = (candidate.metadata or {}).get("artifact_review", {})
-            final_result.metadata["last_refinement_candidate_output_path"] = str(candidate.output_path or "")
+                refinement_shared_analysis = self._augment_shared_analysis_with_validation_feedback(
+                    shared_analysis=current_shared_analysis,
+                    analyzer_result=current_result,
+                    phase="refine_candidate",
+                )
+                refinement_context = AnalyzerContext(
+                    patch_path=patch_path,
+                    output_dir=output_dir or "./output",
+                    validate_path=validate_path,
+                    evidence_dir=evidence_dir,
+                    evidence_bundle_raw=(
+                        getattr(current_artifact, "evidence_bundle_raw", {}) or {}
+                    ) or (
+                        getattr(current_artifact, "post_validation_evidence_bundle_raw", {}) or {}
+                    ),
+                    shared_analysis=refinement_shared_analysis,
+                )
+                candidate = analyzer.refine(
+                    refinement_context,
+                    artifact=current_artifact,
+                    baseline_result=current_result,
+                )
+                candidate = self._validate_analyzer_result(
+                    analyzer_id=analyzer_type,
+                    analyzer=analyzer,
+                    analyzer_result=candidate,
+                    context=refinement_context,
+                    on_progress=on_progress,
+                )
+                last_candidate = candidate
+                attempted_rounds = iteration
+
+                adopted = self._should_adopt_refinement_candidate(
+                    current=current_result,
+                    candidate=candidate,
+                )
+                model_requested_stop = self._candidate_requested_stop(candidate)
+                if adopted:
+                    adopted_any = True
+                    current_result = candidate
+                    current_shared_analysis = candidate.metadata.get(
+                        "shared_analysis_after_validation",
+                        refinement_shared_analysis,
+                    )
+                    current_artifact = self._refresh_refinement_artifact(
+                        artifact=current_artifact,
+                        candidate=candidate,
+                    )
+
+                if on_progress:
+                    on_progress({
+                        "analyzer": analyzer_type,
+                        "event": "refinement_iteration_completed",
+                        "timestamp": time.time(),
+                        "iteration": iteration,
+                        "max_iterations": max_rounds,
+                        "adopted": adopted,
+                        "model_requested_stop": model_requested_stop,
+                        "success": candidate.success,
+                    })
+
+                # 只有当当前轮候选已被采纳且模型明确要求收束时，才允许提前结束。
+                # 若候选质量不够而被拒绝，后续轮次仍应继续尝试优化基线/当前产物。
+                if model_requested_stop and adopted:
+                    break
+
+            final_result = current_result
+            final_result.metadata["refinement_attempted"] = attempted_rounds > 0
+            final_result.metadata["refinement_adopted"] = adopted_any
+            final_result.metadata["refinement_iterations_attempted"] = attempted_rounds
+            final_result.metadata["refinement_skipped_reason"] = ""
+            if last_candidate is not None:
+                final_result.metadata["last_refinement_candidate_success"] = bool(last_candidate.success)
+                final_result.metadata["last_refinement_candidate_error"] = str(last_candidate.error_message or "")
+                final_result.metadata["last_refinement_candidate_artifact_review"] = (
+                    (last_candidate.metadata or {}).get("artifact_review", {})
+                )
+                final_result.metadata["last_refinement_candidate_output_path"] = str(last_candidate.output_path or "")
+            else:
+                final_result.metadata.setdefault("last_refinement_candidate_success", False)
+                final_result.metadata.setdefault("last_refinement_candidate_error", "")
+                final_result.metadata.setdefault("last_refinement_candidate_artifact_review", {})
+                final_result.metadata.setdefault("last_refinement_candidate_output_path", "")
             final_result.metadata.setdefault(
                 "shared_analysis_after_validation",
-                candidate.metadata.get("shared_analysis_after_validation", refinement_shared_analysis),
+                current_shared_analysis,
             )
 
             if on_progress:
-                on_progress({
-                    "analyzer": analyzer_type,
-                    "event": "refinement_iteration_completed",
-                    "timestamp": time.time(),
-                    "iteration": 1,
-                    "adopted": adopted,
-                    "success": candidate.success,
-                })
                 on_progress({
                     "analyzer": analyzer_type,
                     "event": "pipeline_completed",
@@ -896,7 +1176,6 @@ class Orchestrator:
             "verifier_backed_slices": entry.get("verifier_backed_slices", 0),
             "slice_kinds": entry.get("slice_kinds", {}),
             "evidence_escalation": entry.get("evidence_escalation", {}),
-            "evidence_summary": entry.get("evidence_summary", ""),
             "validation_feedback_records": entry.get("validation_feedback_records", 0),
             "validation_feedback_summary": entry.get("validation_feedback_summary", ""),
             "validation_feedback_bundle": entry.get("validation_feedback_bundle", {}),
@@ -905,16 +1184,28 @@ class Orchestrator:
             "post_validation_semantic_slice_records": entry.get("post_validation_semantic_slice_records", 0),
             "post_validation_context_summary_records": entry.get("post_validation_context_summary_records", 0),
             "post_validation_slice_coverage": entry.get("post_validation_slice_coverage", ""),
-            "post_validation_evidence_summary": entry.get("post_validation_evidence_summary", ""),
             "post_validation_evidence_bundle": entry.get("post_validation_evidence_bundle", {}),
             "synthesis_input": entry.get("synthesis_input", {}),
         }
+        fixed_validation = getattr(artifact, "fixed_validation_raw", {}) or {}
+        metadata["baseline_fixed_validation"] = fixed_validation
+        baseline_metrics = self._baseline_validation_metrics(entry=entry, fixed_validation=fixed_validation)
+        metadata.update(baseline_metrics)
+        metadata["baseline_validation_summary"] = self._baseline_validation_summary(
+            analyzer_type=analyzer_type,
+            entry=entry,
+            fixed_validation=fixed_validation,
+        )
 
         output_path = str(getattr(artifact, "output_path", "") or "").strip()
         source_path = str(getattr(artifact, "source_path", "") or "").strip()
         success = bool(output_path and Path(output_path).exists())
         if not success and source_path:
             success = Path(source_path).exists()
+        validation_result = self._validation_result_from_report_entry(
+            analyzer_type=analyzer_type,
+            validation=entry.get("validation", {}) if isinstance(entry.get("validation"), dict) else {},
+        )
 
         return AnalyzerResult(
             analyzer_type=analyzer_type,
@@ -924,7 +1215,87 @@ class Orchestrator:
             output_path=output_path,
             error_message="" if success else "基线产物不存在，无法执行精炼",
             metadata=metadata,
+            validation_result=validation_result,
         )
+
+    def _validation_result_from_report_entry(
+        self,
+        *,
+        analyzer_type: str,
+        validation: Dict[str, Any],
+    ) -> Optional[ValidationResult]:
+        if not validation:
+            return None
+        diagnostics: List[Diagnostic] = []
+        for item in validation.get("diagnostics", []) or []:
+            if not isinstance(item, dict):
+                continue
+            diagnostics.append(Diagnostic(
+                file_path=str(item.get("file_path", "") or ""),
+                line=int(item.get("line", 0) or 0),
+                column=int(item.get("column", 0) or 0),
+                severity=str(item.get("severity", "") or ""),
+                message=str(item.get("message", "") or ""),
+                source=str(item.get("source", analyzer_type) or analyzer_type),
+                code=str(item.get("code", "") or ""),
+                suggestion=str(item.get("suggestion", "") or ""),
+            ))
+        analyzer_enum = AnalyzerType.CODEQL if str(analyzer_type).lower() == "codeql" else AnalyzerType.CSA
+        return ValidationResult(
+            stage=ValidationStage.SEMANTIC,
+            analyzer=analyzer_enum,
+            success=bool(validation.get("success", False)),
+            diagnostics=diagnostics,
+            execution_time=float(validation.get("execution_time", 0.0) or 0.0),
+            error_message=str(validation.get("error_message", "") or ""),
+            metadata={
+                "environment_blocked": bool(validation.get("environment_blocked", False)),
+                "environment_block_reason": str(validation.get("environment_block_reason", "") or ""),
+                "validation_target": str(validation.get("validation_target", "") or ""),
+                "reused_from_generation": True,
+            },
+        )
+
+    def _baseline_validation_summary(
+        self,
+        *,
+        analyzer_type: str,
+        entry: Dict[str, Any],
+        fixed_validation: Dict[str, Any],
+    ) -> str:
+        metrics = self._baseline_validation_metrics(entry=entry, fixed_validation=fixed_validation)
+        fixed_available = bool(fixed_validation)
+        fixed_text = (
+            f"修复版误报数={metrics['baseline_fixed_diagnostics']}, fixed_silent={str(metrics['baseline_fixed_silent']).lower()}"
+            if fixed_available else
+            "修复版误报数=unknown, fixed_silent=unknown"
+        )
+        return (
+            f"Baseline validation ({analyzer_type}): 漏洞版命中={str(metrics['baseline_vuln_hit']).lower()}, "
+            f"漏洞版patch-scoped告警数={metrics['baseline_vuln_diagnostics']}, {fixed_text}, "
+            f"PDS={str(metrics['baseline_pds']).lower()}. 这些是精炼重要指标：保持漏洞版命中，同时优先降低修复版patch-scoped误报。"
+        )
+
+    def _baseline_validation_metrics(
+        self,
+        *,
+        entry: Dict[str, Any],
+        fixed_validation: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        validation = entry.get("validation", {}) if isinstance(entry.get("validation"), dict) else {}
+        vuln_count = int(validation.get("diagnostics_count", 0) or 0)
+        vuln_hit = bool(entry.get("semantic_target_hit", False) or vuln_count > 0)
+        fixed_count = int((fixed_validation or {}).get("diagnostics_count", 0) or 0)
+        fixed_available = bool(fixed_validation)
+        fixed_silent = fixed_available and fixed_count == 0 and bool(fixed_validation.get("success", False))
+        pds = vuln_hit and fixed_silent
+        return {
+            "baseline_vuln_hit": vuln_hit,
+            "baseline_vuln_diagnostics": vuln_count,
+            "baseline_fixed_diagnostics": fixed_count if fixed_available else None,
+            "baseline_fixed_silent": fixed_silent if fixed_available else None,
+            "baseline_pds": pds if fixed_available else None,
+        }
 
     def _build_refinement_shared_analysis(
         self,
@@ -936,7 +1307,6 @@ class Orchestrator:
         shared = copy.deepcopy(base_shared_analysis or {})
         patchweaver = dict(shared.get("patchweaver", {}) or {})
         baselines = dict(patchweaver.get("refinement_targets", {}) or {})
-        refinement_evidence_bundles = dict(patchweaver.get("refinement_evidence_bundles", {}) or {})
         history = list(patchweaver.get("validation_feedback_history", []) or [])
 
         for analyzer_id in selected_analyzers:
@@ -952,25 +1322,12 @@ class Orchestrator:
                 "validation_summary": str(entry.get("semantic_acceptance_summary", "") or "").strip(),
                 "refinement_summary": str(entry.get("validation_feedback_summary", "") or "").strip(),
             }
-            baseline_evidence_raw = (
-                getattr(artifact, "post_validation_evidence_bundle_raw", {}) or {}
-            ) or (
-                getattr(artifact, "evidence_bundle_raw", {}) or {}
-            ) or (
-                entry.get("post_validation_evidence_bundle", {}) or {}
-            ) or (
-                entry.get("evidence_bundle", {}) or {}
-            )
-            if baseline_evidence_raw:
-                refinement_evidence_bundles[analyzer_id] = copy.deepcopy(baseline_evidence_raw)
             for item in (entry.get("validation_feedback_history", []) or []):
                 if isinstance(item, dict):
                     history.append(copy.deepcopy(item))
 
         if baselines:
             patchweaver["refinement_targets"] = baselines
-        if refinement_evidence_bundles:
-            patchweaver["refinement_evidence_bundles"] = refinement_evidence_bundles
         if history:
             patchweaver["validation_feedback_history"] = history[-6:]
 
@@ -1035,13 +1392,6 @@ class Orchestrator:
             analyzer_result.metadata["post_validation_semantic_slice_records"] = post_slice_metrics.get("semantic_slice_count", 0)
             analyzer_result.metadata["post_validation_context_summary_records"] = post_slice_metrics.get("context_summary_count", 0)
             analyzer_result.metadata["post_validation_slice_coverage"] = post_slice_metrics.get("coverage", "")
-            analyzer_result.metadata["post_validation_evidence_summary"] = "\n".join(
-                EvidenceNormalizer.summarize_bundle(
-                    merged_bundle,
-                    analyzer=analyzer_id,
-                    limit=10,
-                )
-            )
             return {
                 "records": len(feedback_bundle.records),
                 "summary": analyzer_result.metadata.get("validation_feedback_summary", ""),
@@ -1078,25 +1428,90 @@ class Orchestrator:
         enriched["patchweaver"] = patchweaver
         return enriched
 
-    def _is_candidate_improvement(
+    def _refinement_max_rounds(self) -> int:
+        refine_config = self.config.get("refine", {}) or {}
+        try:
+            raw_value = int(refine_config.get("max_rounds", 2))
+        except (TypeError, ValueError):
+            raw_value = 2
+        return max(1, min(raw_value, 3))
+
+    def _candidate_has_applied_patch(self, candidate: Optional[AnalyzerResult]) -> bool:
+        metadata = getattr(candidate, "metadata", {}) or {}
+        refinement_agent = metadata.get("refinement_agent", {}) or {}
+        tool_history = refinement_agent.get("tool_history", []) or []
+        for item in tool_history:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("tool_name", "") or "").strip() != "apply_patch":
+                continue
+            if bool(item.get("success", False)):
+                return True
+        return False
+
+    def _candidate_has_source_update(
         self,
         current: AnalyzerResult,
         candidate: AnalyzerResult,
     ) -> bool:
-        """比较候选结果是否优于当前结果。"""
+        current_code = str(getattr(current, "checker_code", "") or "")
+        candidate_code = str(getattr(candidate, "checker_code", "") or "")
+        return bool(candidate_code) and candidate_code != current_code
+
+    def _should_adopt_refinement_candidate(
+        self,
+        current: AnalyzerResult,
+        candidate: AnalyzerResult,
+    ) -> bool:
+        """refine 只要真实落了 patch 且源码变化，就直接采纳，不再按分数回退。"""
         if candidate is None:
             return False
         if current is None:
-            return True
+            return self._candidate_has_applied_patch(candidate)
+        return self._candidate_has_applied_patch(candidate) and self._candidate_has_source_update(
+            current=current,
+            candidate=candidate,
+        )
 
-        current_score = self._validation_quality_score(current)
-        candidate_score = self._validation_quality_score(candidate)
-        if candidate_score != current_score:
-            return candidate_score > current_score
+    def _candidate_requested_stop(self, candidate: Optional[AnalyzerResult]) -> bool:
+        metadata = getattr(candidate, "metadata", {}) or {}
+        refinement_agent = metadata.get("refinement_agent", {}) or {}
+        return bool(refinement_agent.get("model_requested_stop", False))
 
-        current_evidence = int(current.metadata.get("post_validation_evidence_records", current.metadata.get("evidence_records", 0)) or 0)
-        candidate_evidence = int(candidate.metadata.get("post_validation_evidence_records", candidate.metadata.get("evidence_records", 0)) or 0)
-        return candidate_evidence > current_evidence
+    def _refresh_refinement_artifact(
+        self,
+        artifact,
+        candidate: AnalyzerResult,
+    ):
+        refreshed = copy.deepcopy(artifact)
+        candidate_meta = getattr(candidate, "metadata", {}) or {}
+        source_path = str(
+            candidate_meta.get("refinement_target_path", "")
+            or getattr(refreshed, "source_path", "")
+            or ""
+        ).strip()
+        output_path = str(getattr(candidate, "output_path", "") or "").strip()
+        checker_name = str(getattr(candidate, "checker_name", "") or "").strip()
+        checker_code = str(getattr(candidate, "checker_code", "") or "")
+
+        if source_path:
+            refreshed.source_path = source_path
+        if output_path:
+            refreshed.output_path = output_path
+        if checker_name:
+            refreshed.checker_name = checker_name
+        if checker_code:
+            refreshed.checker_code = checker_code
+
+        report_entry = dict(getattr(refreshed, "report_entry", {}) or {})
+        if source_path:
+            report_entry["source_path"] = source_path
+        if output_path:
+            report_entry["output_path"] = output_path
+        if checker_name:
+            report_entry["checker_name"] = checker_name
+        refreshed.report_entry = report_entry
+        return refreshed
 
     def _baseline_refine_skip_reason(
         self,
@@ -1108,6 +1523,9 @@ class Orchestrator:
         if not bool(getattr(review_result, "success", False)):
             return ""
         if self._validation_requested(analyzer_result):
+            baseline_pds = (getattr(analyzer_result, "metadata", {}) or {}).get("baseline_pds")
+            if baseline_pds is not True:
+                return ""
             if self._is_semantically_accepted(analyzer_result):
                 return "baseline_already_passes_strict_refine_review_and_validation"
             return ""
@@ -1130,16 +1548,6 @@ class Orchestrator:
 
     def _semantic_target_hit(self, analyzer_result: Optional[AnalyzerResult]) -> bool:
         return self._semantic_validation_has_hits(analyzer_result)
-
-    def _validation_quality_score(self, analyzer_result: AnalyzerResult) -> int:
-        score = 0
-        if analyzer_result.success:
-            score += 100
-        if bool(getattr(analyzer_result.validation_result, "success", False)):
-            score += 30
-        if self._semantic_validation_has_hits(analyzer_result):
-            score += 20
-        return score
 
     def _validation_requested(self, analyzer_result: Optional[AnalyzerResult]) -> bool:
         metadata = getattr(analyzer_result, "metadata", {}) or {}
@@ -1366,6 +1774,8 @@ class Orchestrator:
         functional_validation_passed = self._functional_validation_passed(analyzer_result)
         semantic_target_hit = self._semantic_target_hit(analyzer_result)
         evidence_effectiveness = self._build_evidence_effectiveness(metadata)
+        source_path = self._artifact_source_path(analyzer_result)
+        llm_usage = normalize_usage(metadata.get("llm_usage", {}))
         return {
             "success": analyzer_result.success,
             "validation_requested": validation_requested,
@@ -1377,13 +1787,19 @@ class Orchestrator:
             "checker_name": analyzer_result.checker_name,
             "artifact_display_name": self._artifact_display_name(analyzer_result),
             "output_path": analyzer_result.output_path,
-            "source_path": self._artifact_source_path(analyzer_result),
+            "source_path": source_path,
             "iterations": analyzer_result.iterations,
+            "compile_attempts": analyzer_result.compile_attempts,
             "error": analyzer_result.error_message,
             "validation": self._validation_result_to_dict(analyzer_result.validation_result),
+            "llm_usage": llm_usage,
+            "artifact_metrics": self._artifact_file_metrics(source_path),
+            "artifact_delta": self._artifact_delta_metrics(
+                metadata.get("baseline_source_path", ""),
+                source_path,
+            ),
             "artifact_review": metadata.get("artifact_review", {}),
             "evidence_records": metadata.get("evidence_records", 0),
-            "evidence_bundle": metadata.get("evidence_bundle", {}),
             "missing_evidence": metadata.get("missing_evidence", []),
             "evidence_degraded": metadata.get("evidence_degraded", False),
             "semantic_slice_records": metadata.get("semantic_slice_records", 0),
@@ -1392,10 +1808,8 @@ class Orchestrator:
             "verifier_backed_slices": metadata.get("verifier_backed_slices", 0),
             "slice_kinds": metadata.get("slice_kinds", {}),
             "evidence_escalation": metadata.get("evidence_escalation", {}),
-            "evidence_summary": metadata.get("evidence_summary", ""),
             "validation_feedback_records": metadata.get("validation_feedback_records", 0),
             "validation_feedback_summary": metadata.get("validation_feedback_summary", ""),
-            "validation_feedback_bundle": metadata.get("validation_feedback_bundle", {}),
             "validation_feedback_history": patchweaver_after_validation.get("validation_feedback_history", []),
             "refinement_attempted": metadata.get("refinement_attempted", False),
             "refinement_adopted": metadata.get("refinement_adopted", False),
@@ -1410,8 +1824,6 @@ class Orchestrator:
             "post_validation_semantic_slice_records": metadata.get("post_validation_semantic_slice_records", 0),
             "post_validation_context_summary_records": metadata.get("post_validation_context_summary_records", 0),
             "post_validation_slice_coverage": metadata.get("post_validation_slice_coverage", ""),
-            "post_validation_evidence_summary": metadata.get("post_validation_evidence_summary", ""),
-            "post_validation_evidence_bundle": metadata.get("post_validation_evidence_bundle", {}),
             "synthesis_input": metadata.get("synthesis_input", {}),
             "evidence_effectiveness": evidence_effectiveness,
         }
@@ -1500,6 +1912,49 @@ class Orchestrator:
         suffix = ".ql" if analyzer_id == "codeql" else ".cpp"
         return str(Path(work_dir).expanduser().resolve() / f"{checker_name}{suffix}")
 
+    def _artifact_file_metrics(self, path_value: Any) -> Dict[str, Any]:
+        raw = str(path_value or "").strip()
+        if not raw:
+            return {}
+        path = Path(raw).expanduser()
+        if not path.exists() or not path.is_file():
+            return {}
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return {}
+        lines = text.splitlines()
+        nonempty_lines = sum(1 for line in lines if line.strip())
+        return {
+            "path": str(path.resolve()),
+            "total_lines": len(lines),
+            "nonempty_lines": nonempty_lines,
+            "char_count": len(text),
+            "byte_count": path.stat().st_size,
+        }
+
+    def _artifact_delta_metrics(self, baseline_path: Any, current_path: Any) -> Dict[str, Any]:
+        baseline = self._artifact_file_metrics(baseline_path)
+        current = self._artifact_file_metrics(current_path)
+        if not baseline or not current:
+            return {}
+
+        delta_total = int(current.get("total_lines", 0) or 0) - int(baseline.get("total_lines", 0) or 0)
+        delta_nonempty = int(current.get("nonempty_lines", 0) or 0) - int(baseline.get("nonempty_lines", 0) or 0)
+        baseline_nonempty = int(baseline.get("nonempty_lines", 0) or 0)
+        growth_ratio = round(delta_nonempty / baseline_nonempty, 6) if baseline_nonempty > 0 else None
+        return {
+            "baseline_path": baseline.get("path", ""),
+            "current_path": current.get("path", ""),
+            "baseline_total_lines": baseline.get("total_lines", 0),
+            "current_total_lines": current.get("total_lines", 0),
+            "baseline_nonempty_lines": baseline.get("nonempty_lines", 0),
+            "current_nonempty_lines": current.get("nonempty_lines", 0),
+            "delta_total_lines": delta_total,
+            "delta_nonempty_lines": delta_nonempty,
+            "growth_ratio": growth_ratio,
+        }
+
     def _resolve_portfolio_decision(
         self,
         analyzer_results: Dict[str, AnalyzerResult],
@@ -1538,6 +1993,7 @@ class Orchestrator:
         if not validation_result:
             return {}
 
+        metadata = copy.deepcopy(getattr(validation_result, "metadata", {}) or {})
         diagnostics = []
         for d in (getattr(validation_result, "diagnostics", []) or []):
             diagnostics.append({
@@ -1551,6 +2007,9 @@ class Orchestrator:
                 "suggestion": getattr(d, "suggestion", ""),
             })
 
+        diagnostics_count = len(diagnostics)
+        all_diagnostics_count = int(metadata.get("all_diagnostics_count", diagnostics_count) or 0)
+        generated_diagnostics_count = int(metadata.get("generated_diagnostics_count", diagnostics_count) or 0)
         return {
             "stage": getattr(getattr(validation_result, "stage", None), "value", ""),
             "analyzer": getattr(getattr(validation_result, "analyzer", None), "value", ""),
@@ -1558,37 +2017,16 @@ class Orchestrator:
             "execution_time": float(getattr(validation_result, "execution_time", 0.0) or 0.0),
             "error_message": getattr(validation_result, "error_message", ""),
             "diagnostics": diagnostics,
-            "diagnostics_count": len(diagnostics),
+            "diagnostics_count": diagnostics_count,
+            "all_diagnostics_count": all_diagnostics_count,
+            "generated_diagnostics_count": generated_diagnostics_count,
             "warnings_count": sum(1 for d in diagnostics if d.get("severity") == "warning"),
             "errors_count": sum(1 for d in diagnostics if d.get("severity") == "error"),
+            "environment_blocked": bool(metadata.get("environment_blocked", False)),
+            "environment_block_reason": str(metadata.get("environment_block_reason", "") or ""),
+            "validation_target": str(metadata.get("validation_target", "") or ""),
+            "diagnostics_filtered": bool(metadata.get("diagnostics_filtered", False)),
         }
-
-    def _persist_evidence_bundles(
-        self,
-        analyzer_dir: Path,
-        analyzer_info: Dict[str, Any],
-    ):
-        """将完整 evidence bundle 单独落盘，供 refine 恢复。"""
-        if not isinstance(analyzer_info, dict):
-            return
-
-        evidence_bundle = analyzer_info.get("evidence_bundle", {}) or {}
-        if evidence_bundle:
-            evidence_path = analyzer_dir / "evidence_bundle.json"
-            evidence_path.write_text(
-                json.dumps(evidence_bundle, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            analyzer_info["evidence_bundle_path"] = str(evidence_path)
-
-        post_validation_bundle = analyzer_info.get("post_validation_evidence_bundle", {}) or {}
-        if post_validation_bundle:
-            post_validation_path = analyzer_dir / "post_validation_evidence_bundle.json"
-            post_validation_path.write_text(
-                json.dumps(post_validation_bundle, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            analyzer_info["post_validation_evidence_bundle_path"] = str(post_validation_path)
 
     def _manifest_relpath(
         self,
@@ -1644,28 +2082,102 @@ class Orchestrator:
 
             analyzer_dir = analyzer_dirs.get(analyzer_id)
             result_path = analyzer_dir / "result.json" if analyzer_dir is not None else None
+            report_entry = self._refinement_report_entry(
+                analyzer_id=analyzer_id,
+                analyzer_info=analyzer_info,
+                patch_path=str(getattr(result, "patch_path", "") or ""),
+            )
             manifest["artifacts"][analyzer_id] = {
                 "analyzer_id": analyzer_id,
                 "checker_name": str(analyzer_info.get("checker_name", "") or "").strip(),
                 "source_path": self._manifest_relpath(output_root, source_path),
                 "output_path": self._manifest_relpath(output_root, output_path),
                 "result_path": self._manifest_relpath(output_root, str(result_path or "")),
-                "evidence_bundle_path": self._manifest_relpath(
-                    output_root,
-                    str(analyzer_info.get("evidence_bundle_path", "") or ""),
-                ),
-                "post_validation_evidence_bundle_path": self._manifest_relpath(
-                    output_root,
-                    str(analyzer_info.get("post_validation_evidence_bundle_path", "") or ""),
-                ),
-                "report_entry": copy.deepcopy(analyzer_info),
-                "evidence_bundle_raw": copy.deepcopy(analyzer_info.get("evidence_bundle", {}) or {}),
-                "post_validation_evidence_bundle_raw": copy.deepcopy(
-                    analyzer_info.get("post_validation_evidence_bundle", {}) or {}
-                ),
+                "report_entry": report_entry,
             }
 
         return manifest
+
+    def _refinement_report_entry(
+        self,
+        *,
+        analyzer_id: str,
+        analyzer_info: Dict[str, Any],
+        patch_path: str,
+    ) -> Dict[str, Any]:
+        entry = copy.deepcopy(analyzer_info or {})
+        validation = entry.get("validation", {}) if isinstance(entry.get("validation"), dict) else {}
+        diagnostics = validation.get("diagnostics", []) if isinstance(validation.get("diagnostics"), list) else []
+        patch_targets = self._extract_patch_targets(Path(str(patch_path or "")).expanduser())
+        checker_name = str(entry.get("checker_name", "") or "").strip()
+        scoped_diagnostics = [
+            diagnostic for diagnostic in diagnostics
+            if self._diagnostic_in_patch_targets(diagnostic, patch_targets)
+            and self._is_generated_diagnostic(analyzer_id, diagnostic, checker_name)
+        ]
+        if validation:
+            validation["all_diagnostics_count"] = len(diagnostics)
+            validation["generated_diagnostics_count"] = self._count_generated_diagnostics(
+                analyzer_id,
+                diagnostics,
+                checker_name,
+            )
+            validation["patch_targets"] = patch_targets
+            validation["diagnostics"] = scoped_diagnostics
+            validation["diagnostics_count"] = len(scoped_diagnostics)
+            validation["warnings_count"] = sum(1 for item in scoped_diagnostics if str(item.get("severity", "")) == "warning")
+            validation["errors_count"] = sum(1 for item in scoped_diagnostics if str(item.get("severity", "")) == "error")
+            entry["validation"] = validation
+        return entry
+
+    def _count_generated_diagnostics(
+        self,
+        analyzer_id: str,
+        diagnostics: List[Any],
+        checker_name: str = "",
+    ) -> int:
+        return sum(
+            1 for diagnostic in diagnostics
+            if self._is_generated_diagnostic(analyzer_id, diagnostic, checker_name)
+        )
+
+    def _is_generated_diagnostic(self, analyzer_id: str, diagnostic: Any, checker_name: str = "") -> bool:
+        if str(analyzer_id or "").strip().lower() != "csa":
+            return True
+        if isinstance(diagnostic, dict):
+            values = [(diagnostic or {}).get(key, "") for key in ("message", "code", "checker", "check_name")]
+        else:
+            values = [getattr(diagnostic, key, "") for key in ("message", "code", "checker", "check_name")]
+        text = " ".join(str(value or "") for value in values)
+        expected = f"custom.{checker_name.strip()}" if checker_name.strip() else "custom."
+        return expected in text
+
+    def _diagnostic_in_patch_targets(self, diagnostic: Any, patch_targets: List[str]) -> bool:
+        targets = [str(target or "").strip().replace("\\", "/") for target in (patch_targets or []) if str(target or "").strip()]
+        if not targets:
+            return True
+        raw_path = str((diagnostic or {}).get("file_path", (diagnostic or {}).get("path", "")) or "")
+        normalized = raw_path.replace("\\", "/")
+        return any(normalized == target or normalized.endswith("/" + target) for target in targets)
+
+    def _extract_patch_targets(self, patch_path: Path) -> List[str]:
+        targets: List[str] = []
+        try:
+            text = patch_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return targets
+        for line in text.splitlines():
+            if line.startswith("+++ b/"):
+                rel = line[len("+++ b/"):].strip()
+                if rel and rel != "/dev/null" and rel not in targets:
+                    targets.append(rel)
+            elif line.startswith("diff --git "):
+                parts = line.split()
+                if len(parts) >= 4 and parts[3].startswith("b/"):
+                    rel = parts[3][2:].strip()
+                    if rel and rel not in targets:
+                        targets.append(rel)
+        return targets
 
     def _resolve_result_output_root(
         self,
@@ -1701,16 +2213,93 @@ class Orchestrator:
         analyzer_dir.mkdir(parents=True, exist_ok=True)
         return analyzer_dir
 
+    def _load_existing_saved_analyzer_results(
+        self,
+        output_root: Path,
+    ) -> Dict[str, Dict[str, Any]]:
+        """恢复同一输出目录下已保存的分析器结果，避免单分析器重跑时覆盖其他分析器条目。"""
+        existing: Dict[str, Dict[str, Any]] = {}
+
+        final_report_path = output_root / "final_report.json"
+        if final_report_path.exists():
+            try:
+                final_report = json.loads(final_report_path.read_text(encoding="utf-8"))
+                for analyzer_id in ("csa", "codeql"):
+                    payload = final_report.get(analyzer_id, {})
+                    if isinstance(payload, dict) and payload:
+                        existing[analyzer_id] = copy.deepcopy(payload)
+            except Exception:
+                pass
+
+        for analyzer_id in ("csa", "codeql"):
+            if analyzer_id in existing:
+                continue
+            result_path = output_root / analyzer_id / "result.json"
+            if not result_path.exists():
+                continue
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict) and payload:
+                    existing[analyzer_id] = payload
+            except Exception:
+                continue
+
+        return existing
+
+    def _merge_analyzer_results_for_save(
+        self,
+        result: GenerationResult,
+        output_root: Path,
+    ) -> Dict[str, Dict[str, Any]]:
+        """将本轮结果与输出目录中已有结果合并。"""
+        merged: Dict[str, Dict[str, Any]] = {}
+        existing = self._load_existing_saved_analyzer_results(output_root)
+
+        for analyzer_id in ("csa", "codeql"):
+            current = result.analyzer_results.get(analyzer_id, {})
+            if isinstance(current, dict) and current:
+                merged[analyzer_id] = copy.deepcopy(current)
+                continue
+
+            previous = existing.get(analyzer_id, {})
+            if isinstance(previous, dict) and previous:
+                merged[analyzer_id] = copy.deepcopy(previous)
+
+        return merged
+
+    def _compute_merged_session_status(
+        self,
+        analyzer_results: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        normalized = [
+            payload
+            for payload in analyzer_results.values()
+            if isinstance(payload, dict) and payload
+        ]
+        validation_requested = any(bool(item.get("validation_requested", False)) for item in normalized)
+        generation_success = any(bool(item.get("success", False)) for item in normalized)
+        semantic_success = any(bool(item.get("semantic_acceptance", False)) for item in normalized)
+        success = semantic_success if validation_requested else generation_success
+        analyzer_ids = [analyzer_id for analyzer_id in ("csa", "codeql") if analyzer_results.get(analyzer_id)]
+        return {
+            "analyzer_type": ",".join(analyzer_ids),
+            "generation_success": generation_success,
+            "semantic_success": semantic_success,
+            "success": success,
+        }
+
     def save_result(self, result: GenerationResult, output_dir: str):
         """保存生成结果 - 包含完整的整合报告"""
         from .refinement_session import REFINEMENT_INPUT_MANIFEST
 
         output_path = self._resolve_result_output_root(result, output_dir)
+        merged_analyzer_results = self._merge_analyzer_results_for_save(result, output_path)
+        merged_session_status = self._compute_merged_session_status(merged_analyzer_results)
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
         # 1) 保存 CSA 产物
-        csa_info = result.analyzer_results.get("csa", {}) if isinstance(result.analyzer_results.get("csa"), dict) else {}
+        csa_info = merged_analyzer_results.get("csa", {}) if isinstance(merged_analyzer_results.get("csa"), dict) else {}
         csa_dir = self._resolve_analyzer_result_dir(result, "csa", output_path, csa_info)
         csa_artifacts = result.analyzer_artifacts.get("csa", {}) if isinstance(result.analyzer_artifacts.get("csa"), dict) else {}
         csa_checker_code = csa_artifacts.get("checker_code", "") or ""
@@ -1730,10 +2319,9 @@ class Orchestrator:
                     shutil.copy2(so_src, so_dst)
                 csa_info["output_path"] = str(so_dst)
                 logger.info(f"CSA 检测器已保存: {so_dst}")
-        self._persist_evidence_bundles(csa_dir, csa_info)
 
         # 2) 保存 CodeQL 产物
-        codeql_info = result.analyzer_results.get("codeql", {})
+        codeql_info = merged_analyzer_results.get("codeql", {})
         codeql_dir = self._resolve_analyzer_result_dir(
             result,
             "codeql",
@@ -1749,10 +2337,9 @@ class Orchestrator:
                 codeql_info["output_path"] = str(qdst)
                 codeql_info["source_path"] = str(qdst)
                 logger.info(f"CodeQL 查询已保存: {qdst}")
-        self._persist_evidence_bundles(codeql_dir, codeql_info)
 
         # 3) 保存结果 JSON
-        csa_validation = result.analyzer_results.get("csa", {}).get("validation", {})
+        csa_validation = merged_analyzer_results.get("csa", {}).get("validation", {})
         if not csa_validation:
             # 兜底：主验证结果恰好是 CSA 时也写入
             vr = self._validation_result_to_dict(result.validation_result)
@@ -1774,6 +2361,11 @@ class Orchestrator:
         )
 
         # 4) 保存验证反馈产物
+        original_analyzer_results = result.analyzer_results
+        original_analyzer_type = result.analyzer_type
+        result.analyzer_results = merged_analyzer_results
+        if merged_session_status.get("analyzer_type"):
+            result.analyzer_type = str(merged_session_status.get("analyzer_type", "") or "")
         validation_feedback_report = self._collect_validation_feedback_report(result)
         validation_feedback_path = output_path / "validation_feedback.json"
         validation_feedback_path.write_text(
@@ -1789,19 +2381,19 @@ class Orchestrator:
         report_data = {
             "meta": {
                 "generated_at": timestamp,
-                "analyzer_type": result.analyzer_type,
+                "analyzer_type": merged_session_status.get("analyzer_type", "") or result.analyzer_type,
                 "workflow_mode": result.workflow_mode,
                 "patch_path": result.patch_path,
                 "validate_path": result.validate_path,
-                "success": result.success,
-                "generation_success": result.generation_success,
-                "semantic_success": result.semantic_success,
-                "error_message": result.error_message if not result.success else None,
+                "success": merged_session_status.get("success", result.success),
+                "generation_success": merged_session_status.get("generation_success", result.generation_success),
+                "semantic_success": merged_session_status.get("semantic_success", result.semantic_success),
+                "error_message": result.error_message if not merged_session_status.get("success", result.success) else None,
                 "preferred_analyzer": (result.portfolio_decision or {}).get("preferred_analyzer", ""),
                 "run_metrics_summary": run_metrics.get("summary", ""),
             },
-            "csa": result.analyzer_results.get("csa", {}),
-            "codeql": result.analyzer_results.get("codeql", {}),
+            "csa": merged_analyzer_results.get("csa", {}),
+            "codeql": merged_analyzer_results.get("codeql", {}),
             "patchweaver": patchweaver_report,
             "validation_feedback": validation_feedback_report,
             "portfolio": result.portfolio_decision,
@@ -1819,7 +2411,11 @@ class Orchestrator:
         patchweaver_path = output_path / "patchweaver_plan.json"
         patchweaver_dump = dict(result.shared_analysis or {})
         patchweaver_section = patchweaver_dump.get("patchweaver", {}) if isinstance(patchweaver_dump.get("patchweaver"), dict) else {}
-        for key in ("summary", "patch_facts", "mechanism_graph", "evidence_plan", "evidence_bundle"):
+        if isinstance(patchweaver_section, dict):
+            for transient_key in ("evidence_bundle", "refinement_evidence_bundles", "validation_feedback"):
+                patchweaver_section.pop(transient_key, None)
+            patchweaver_dump["patchweaver"] = patchweaver_section
+        for key in ("summary", "patch_facts", "mechanism_graph", "evidence_plan"):
             if key not in patchweaver_dump and key in patchweaver_section:
                 patchweaver_dump[key] = patchweaver_section.get(key)
         patchweaver_path.write_text(
@@ -1850,6 +2446,8 @@ class Orchestrator:
             encoding='utf-8'
         )
         logger.info(f"整合报告已保存: {report_path}")
+        result.analyzer_results = original_analyzer_results
+        result.analyzer_type = original_analyzer_type
 
         # 6) 生成 Markdown 报告
         self._generate_markdown_report(report_data, output_path)
@@ -1880,15 +2478,12 @@ class Orchestrator:
                 "evidence_escalation": analyzer_info.get("evidence_escalation", {}),
                 "validation_feedback_records": analyzer_info.get("validation_feedback_records", 0),
                 "validation_feedback_summary": analyzer_info.get("validation_feedback_summary", ""),
-                "validation_feedback_bundle": analyzer_info.get("validation_feedback_bundle", {}),
                 "validation_feedback_history": analyzer_info.get("validation_feedback_history", []),
                 "post_validation_evidence_records": analyzer_info.get("post_validation_evidence_records", 0),
                 "post_validation_missing_evidence": analyzer_info.get("post_validation_missing_evidence", []),
                 "post_validation_semantic_slice_records": analyzer_info.get("post_validation_semantic_slice_records", 0),
                 "post_validation_context_summary_records": analyzer_info.get("post_validation_context_summary_records", 0),
                 "post_validation_slice_coverage": analyzer_info.get("post_validation_slice_coverage", ""),
-                "post_validation_evidence_summary": analyzer_info.get("post_validation_evidence_summary", ""),
-                "post_validation_evidence_bundle": analyzer_info.get("post_validation_evidence_bundle", {}),
             }
         return report
 
@@ -1900,6 +2495,8 @@ class Orchestrator:
         patchweaver = copy.deepcopy(
             result.shared_analysis.get("patchweaver", {}) if isinstance(result.shared_analysis, dict) else {}
         )
+        for key in ("evidence_bundle", "refinement_evidence_bundles", "validation_feedback"):
+            patchweaver.pop(key, None)
 
         combined_history: List[Dict[str, Any]] = list(patchweaver.get("validation_feedback_history", []) or [])
         for analyzer_id in ("csa", "codeql"):
@@ -1967,6 +2564,10 @@ class Orchestrator:
             if analyzer_metrics:
                 metrics["analyzers"][analyzer_id] = analyzer_metrics
 
+        overall_usage = self._aggregate_llm_usage_from_events(events)
+        if overall_usage["call_count"] > 0:
+            metrics["llm_usage"] = overall_usage
+
         summaries: List[str] = []
         if metrics.get("preflight_seconds") is not None:
             summaries.append(f"preflight={metrics['preflight_seconds']:.1f}s")
@@ -1982,6 +2583,8 @@ class Orchestrator:
                 summaries.append(f"{analyzer_id}={total_seconds:.1f}s({bottleneck})")
             else:
                 summaries.append(f"{analyzer_id}={total_seconds:.1f}s")
+        if metrics.get("llm_usage", {}).get("available"):
+            summaries.append(f"tokens={metrics['llm_usage'].get('total_tokens', 0)}")
         if summaries:
             metrics["summary"] = " | ".join(summaries)
 
@@ -2015,9 +2618,19 @@ class Orchestrator:
         tool_seconds = self._sum_event_pairs(events, "agent_tool_called", "agent_tool_result")
         if tool_seconds is not None:
             metrics["agent_tool_seconds"] = tool_seconds
-        llm_seconds = self._sum_event_pairs(events, "agent_llm_call_started", "agent_think_completed")
+        llm_seconds = self._sum_event_pairs(events, "agent_llm_call_started", "agent_llm_call_completed")
         if llm_seconds is not None:
             metrics["agent_llm_seconds"] = llm_seconds
+        agent_usage = self._aggregate_llm_usage_from_events(events, event_name="agent_llm_call_completed")
+        tool_usage = self._aggregate_llm_usage_from_events(events, event_name="tool_result")
+        total_usage = merge_usages([agent_usage, tool_usage])
+        if total_usage["call_count"] > 0:
+            metrics["llm_usage"] = {
+                "agent": agent_usage,
+                "tool": tool_usage,
+                "total": total_usage,
+            }
+            metrics["llm_calls"] = total_usage["call_count"]
 
         early_search_count = 0
         deferred_patch_reads = 0
@@ -2116,6 +2729,25 @@ class Orchestrator:
             return None
         return round(total, 3)
 
+    def _aggregate_llm_usage_from_events(
+        self,
+        events: List[Dict[str, Any]],
+        event_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        usages: List[Dict[str, Any]] = []
+        for item in events:
+            if event_name and str(item.get("event", "")).strip() != event_name:
+                continue
+            raw_usage = item.get("llm_usage", {})
+            if not isinstance(raw_usage, dict):
+                continue
+            usage = normalize_usage(raw_usage)
+            if usage["call_count"] <= 0 and usage["available"]:
+                usage["call_count"] = 1
+            if usage["call_count"] > 0 or usage["available"]:
+                usages.append(usage)
+        return merge_usages(usages)
+
     def _generate_markdown_report(
         self,
         report_data: Dict[str, Any],
@@ -2135,7 +2767,7 @@ class Orchestrator:
         semantic_success = bool(report_data.get("meta", {}).get("semantic_success", report_data["meta"]["success"]))
         if workflow_mode == "refine":
             if self._report_has_unadopted_refinement(report_data):
-                lines.append("**状态**: ⚠️ 保留基线产物；本轮精炼候选未通过质量门或未被采纳")
+                lines.append("**状态**: ⚠️ 保持当前产物；本轮精炼未产生可采纳更新")
             elif semantic_success and self._report_has_target_hit(report_data):
                 lines.append("**状态**: ✅ 精炼后命中验证目标并通过功能验证")
             elif semantic_success:
@@ -2176,7 +2808,7 @@ class Orchestrator:
         if workflow_mode == "refine" and csa.get("refinement_attempted"):
             lines.append(f"- **精炼尝试**: {csa.get('refinement_iterations_attempted', 0)} 轮")
             lines.append(
-                f"- **精炼采纳**: {'✅ 已采纳新产物' if csa.get('refinement_adopted') else '⚠️ 未采纳，当前保留基线产物'}"
+                f"- **精炼采纳**: {'✅ 已采纳新产物' if csa.get('refinement_adopted') else '⚠️ 未采纳，当前保持原产物'}"
             )
             if not csa.get("refinement_adopted") and csa.get("last_refinement_candidate_error"):
                 lines.append(f"- **最近候选失败**: {csa.get('last_refinement_candidate_error')}")
@@ -2254,7 +2886,7 @@ class Orchestrator:
         if workflow_mode == "refine" and codeql.get("refinement_attempted"):
             lines.append(f"- **精炼尝试**: {codeql.get('refinement_iterations_attempted', 0)} 轮")
             lines.append(
-                f"- **精炼采纳**: {'✅ 已采纳新产物' if codeql.get('refinement_adopted') else '⚠️ 未采纳，当前保留基线产物'}"
+                f"- **精炼采纳**: {'✅ 已采纳新产物' if codeql.get('refinement_adopted') else '⚠️ 未采纳，当前保持原产物'}"
             )
             if not codeql.get("refinement_adopted") and codeql.get("last_refinement_candidate_error"):
                 lines.append(f"- **最近候选失败**: {codeql.get('last_refinement_candidate_error')}")
@@ -2459,6 +3091,9 @@ class Orchestrator:
                         parts.append(f"{display}={value:.1f}s")
                 if isinstance(analyzer_metrics.get("first_material_action_seconds"), (int, float)):
                     parts.append(f"first_action={analyzer_metrics['first_material_action_seconds']:.1f}s")
+                llm_usage = ((analyzer_metrics.get("llm_usage") or {}).get("total", {}) if isinstance(analyzer_metrics.get("llm_usage"), dict) else {})
+                if isinstance(llm_usage, dict) and llm_usage.get("available"):
+                    parts.append(f"tokens={llm_usage.get('total_tokens', 0)}")
                 if analyzer_metrics.get("deferred_patch_reads") or analyzer_metrics.get("deferred_knowledge_searches"):
                     parts.append(
                         "deferrals={patch}/{knowledge}".format(

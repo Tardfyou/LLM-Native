@@ -12,8 +12,10 @@ class RefinementRequest:
     target_path: str
     source_path: str = ""
     validate_path: str = ""
+    evidence_dir: str = ""
+    evidence_bundle_raw: Dict[str, Any] = field(default_factory=dict)
+    baseline_validation_summary: str = ""
     checker_name: str = ""
-    extra_context: str = ""
     max_iterations: int = 12
 
 

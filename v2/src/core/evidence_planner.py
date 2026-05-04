@@ -39,9 +39,15 @@ class PatchFactsExtractor:
     """Extract patch-scoped facts from diff text and patch metadata."""
 
     FUNCTION_NAME_PATTERN = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+    FUNCTION_SIGNATURE_PATTERN = re.compile(
+        r"^\s*(?:[A-Za-z_][\w]*(?:[\s\*]+[A-Za-z_][\w]*)*[\s\*]+)?([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{\s*$"
+    )
     CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
     CWE_PATTERN = re.compile(r"\bCWE-\d+\b", re.IGNORECASE)
     ISSUE_PATTERN = re.compile(r"\b(?:fixes|issue|bug|ticket|gh-|#)\s*[:#-]?\s*([A-Za-z0-9_.-]+)\b", re.IGNORECASE)
+    DECLARATION_PATTERN = re.compile(
+        r"^\s*(?P<type>(?:const\s+|volatile\s+|signed\s+|unsigned\s+)*[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)\s+(?P<vars>[^;=]+);\s*$"
+    )
     EXCLUDED_CALL_NAMES = {
         "if",
         "for",
@@ -59,6 +65,7 @@ class PatchFactsExtractor:
         patch_text = self._read_text(patch_path)
         additions, deletions = self._collect_changed_lines(patch_text)
         added_guards = [line.strip() for line in additions if re.search(r"\b(if|switch|while)\s*\(", line)]
+        type_widenings = self._collect_type_widenings(additions, deletions)
         removed_risky_ops = [
             line.strip()
             for line in deletions
@@ -66,8 +73,22 @@ class PatchFactsExtractor:
         ]
         added_api_calls = self._extract_api_calls(additions)
         patch_functions = self._extract_patch_functions(patch_text)
-        fix_patterns = self._extract_fix_patterns(patch_analysis, additions)
+        recovered_functions = self._recover_patch_functions_from_source(patch_path)
         patch_intent = self._extract_patch_intent(patch_text)
+        intent_functions = self._extract_intent_functions(patch_intent)
+        inferred_patterns = self._infer_patterns_from_patch(
+            patch_analysis=patch_analysis,
+            patch_intent=patch_intent,
+            type_widenings=type_widenings,
+            additions=additions,
+            deletions=deletions,
+        )
+        fix_patterns = self._extract_fix_patterns(
+            patch_analysis=patch_analysis,
+            additions=additions,
+            type_widenings=type_widenings,
+            inferred_patterns=inferred_patterns,
+        )
         reference_hints = self._extract_reference_hints(patch_text)
 
         strategy = patch_analysis.get("detection_strategy", {}) or {}
@@ -77,7 +98,15 @@ class PatchFactsExtractor:
             for pattern in patterns
             for func_name in (pattern.get("affected_functions", []) or [])
             if func_name
-        } | set(patch_functions))
+        } | set(patch_functions) | set(recovered_functions) | set(intent_functions))
+        pattern_tokens = [
+            item.get("type", "unknown")
+            for item in patterns
+            if str(item.get("type", "") or "").strip()
+        ]
+        for token in inferred_patterns:
+            if token not in pattern_tokens:
+                pattern_tokens.append(token)
 
         facts = [
             PatchFact(
@@ -95,7 +124,7 @@ class PatchFactsExtractor:
                 fact_type="vulnerability_patterns",
                 label="Vulnerability patterns inferred from patch",
                 attributes={
-                    "patterns": [item.get("type", "unknown") for item in patterns],
+                    "patterns": pattern_tokens,
                     "descriptions": [item.get("description", "") for item in patterns],
                 },
             ),
@@ -126,6 +155,15 @@ class PatchFactsExtractor:
                     fact_type="removed_risky_operations",
                     label="Patch removes risky operations",
                     attributes={"operations": removed_risky_ops[:12]},
+                )
+            )
+
+        for item in type_widenings:
+            facts.append(
+                PatchFact(
+                    fact_type="type_widening",
+                    label="Patch widens arithmetic carriers",
+                    attributes=item,
                 )
             )
 
@@ -206,33 +244,102 @@ class PatchFactsExtractor:
 
     def _extract_patch_functions(self, patch_text: str) -> List[str]:
         functions: List[str] = []
+        current_function = ""
         for raw_line in (patch_text or "").splitlines():
+            if raw_line.startswith("diff --git "):
+                current_function = ""
+                continue
             if raw_line.startswith("@@"):
                 suffix = raw_line.split("@@", 2)[-1].strip()
-                for match in self.FUNCTION_NAME_PATTERN.findall(suffix):
-                    name = str(match).strip()
-                    if name and name not in self.EXCLUDED_CALL_NAMES and name not in functions:
-                        functions.append(name)
+                current_function = self._extract_function_signature_name(suffix)
+                if current_function and current_function not in functions:
+                    functions.append(current_function)
                 continue
 
-            if not raw_line or raw_line[:1] not in {" ", "-", "+"}:
+            if not raw_line or raw_line[:1] not in {" ", "-", "+"} or raw_line.startswith(("--- ", "+++ ")):
                 continue
 
             candidate = raw_line[1:].strip()
             if not candidate or candidate.startswith("#"):
                 continue
-            if not candidate.endswith("{"):
+            signature_name = self._extract_function_signature_name(candidate)
+            if signature_name:
+                current_function = signature_name
+                if raw_line[:1] in {"+", "-"} and signature_name not in functions:
+                    functions.append(signature_name)
                 continue
-            for match in self.FUNCTION_NAME_PATTERN.findall(candidate):
-                name = str(match).strip()
-                if name and name not in self.EXCLUDED_CALL_NAMES and name not in functions:
-                    functions.append(name)
+            if raw_line[:1] in {"+", "-"} and current_function and current_function not in functions:
+                functions.append(current_function)
         return functions
+
+    def _extract_function_signature_name(self, candidate: str) -> str:
+        stripped = str(candidate or "").strip()
+        if not stripped or not stripped.endswith("{"):
+            return ""
+        match = self.FUNCTION_SIGNATURE_PATTERN.match(stripped)
+        if not match:
+            return ""
+        name = str(match.group(1) or "").strip()
+        if not name or name in self.EXCLUDED_CALL_NAMES:
+            return ""
+        return name
+
+    def _recover_patch_functions_from_source(self, patch_path: str) -> List[str]:
+        try:
+            from ..evidence.collectors.artifact_extractor import ProjectArtifactExtractor
+        except Exception:
+            return []
+
+        patch_file = Path(str(patch_path or "")).expanduser().resolve()
+        if not patch_file.exists():
+            return []
+
+        extractor = ProjectArtifactExtractor()
+        functions: List[str] = []
+        root_candidates = [
+            candidate
+            for candidate in [patch_file.parent, *patch_file.parents[:4]]
+            if candidate and candidate.exists() and candidate.is_dir()
+        ]
+
+        for file_entry in extractor.parse_patch(str(patch_file)):
+            patch_rel = str(file_entry.get("old_path") or file_entry.get("new_path") or "").strip()
+            if not patch_rel:
+                continue
+
+            resolved = None
+            for root in root_candidates:
+                resolved = extractor.resolve_project_file(root, patch_rel)
+                if resolved is not None and resolved.exists():
+                    break
+            if resolved is None or not resolved.exists():
+                continue
+
+            try:
+                lines = resolved.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+
+            for hunk in file_entry.get("hunks", []) or []:
+                anchors = [
+                    int(hunk.get("old_start", 0) or 0),
+                    int(hunk.get("new_start", 0) or 0),
+                ]
+                for anchor in anchors:
+                    if anchor <= 0:
+                        continue
+                    function_name, _parameters, _start, _end = extractor.find_function_context(lines, anchor)
+                    if function_name and function_name not in functions:
+                        functions.append(function_name)
+                        break
+        return functions[:8]
 
     def _extract_fix_patterns(
         self,
         patch_analysis: Dict[str, Any],
         additions: Sequence[str],
+        type_widenings: Sequence[Dict[str, Any]],
+        inferred_patterns: Sequence[str],
     ) -> List[str]:
         patterns: List[str] = []
         for item in patch_analysis.get("vulnerability_patterns", []) or []:
@@ -253,6 +360,15 @@ class PatchFactsExtractor:
             if any(all(marker in line for marker in markers) for line in lowered_additions):
                 if label not in patterns:
                     patterns.append(label)
+        if type_widenings:
+            for label in ("integer widening", "counter widening", "wide accumulator"):
+                if label not in patterns:
+                    patterns.append(label)
+        if "integer_overflow" in inferred_patterns and "overflow-safe accumulator" not in patterns:
+            patterns.append("overflow-safe accumulator")
+        if any(self._looks_like_overflow_guard(line) for line in lowered_additions):
+            if "overflow bounds check" not in patterns:
+                patterns.append("overflow bounds check")
         return patterns
 
     def _extract_patch_intent(self, patch_text: str) -> Dict[str, Any]:
@@ -313,6 +429,136 @@ class PatchFactsExtractor:
             "issues": issues[:6],
         }
 
+    def _collect_type_widenings(
+        self,
+        additions: Sequence[str],
+        deletions: Sequence[str],
+    ) -> List[Dict[str, Any]]:
+        widened: List[Dict[str, Any]] = []
+        seen = set()
+        deleted_decls = [item for item in (self._parse_declaration(line) for line in deletions) if item]
+        added_decls = [item for item in (self._parse_declaration(line) for line in additions) if item]
+
+        for old_type, old_vars, old_line in deleted_decls:
+            old_rank = self._type_rank(old_type)
+            if old_rank <= 0:
+                continue
+            for new_type, new_vars, new_line in added_decls:
+                new_rank = self._type_rank(new_type)
+                shared = [var for var in old_vars if var in new_vars]
+                if new_rank <= old_rank or not shared:
+                    continue
+                key = (old_type, new_type, tuple(shared))
+                if key in seen:
+                    continue
+                seen.add(key)
+                widened.append(
+                    {
+                        "old_type": old_type,
+                        "new_type": new_type,
+                        "variables": shared[:8],
+                        "variable_count": len(shared),
+                        "deleted_declaration": old_line,
+                        "added_declaration": new_line,
+                    }
+                )
+        return widened[:4]
+
+    def _parse_declaration(self, line: str) -> tuple[str, List[str], str] | None:
+        stripped = str(line or "").strip()
+        if not stripped or "(" in stripped or ")" in stripped or "=" in stripped:
+            return None
+        match = self.DECLARATION_PATTERN.match(stripped)
+        if not match:
+            return None
+        type_name = self._normalize_type(match.group("type"))
+        variables: List[str] = []
+        for chunk in str(match.group("vars") or "").split(","):
+            candidate = re.sub(r"\[[^\]]*\]", "", chunk).strip()
+            symbol_match = re.search(r"([A-Za-z_]\w*)$", candidate)
+            if symbol_match:
+                variables.append(symbol_match.group(1))
+        variables = [item for item in variables if item]
+        if not type_name or not variables:
+            return None
+        return type_name, variables[:12], stripped
+
+    def _normalize_type(self, raw_type: str) -> str:
+        lowered = " ".join(str(raw_type or "").strip().lower().split())
+        aliases = {
+            "sqlite3_int64": "i64",
+            "sqlite_int64": "i64",
+            "int64_t": "i64",
+            "long long int": "long long",
+            "unsigned long long int": "unsigned long long",
+            "sqlite3_uint64": "u64",
+            "uint64_t": "u64",
+        }
+        return aliases.get(lowered, lowered)
+
+    def _type_rank(self, type_name: str) -> int:
+        normalized = self._normalize_type(type_name)
+        if normalized in {"char", "short", "unsigned char", "unsigned short"}:
+            return 1
+        if normalized in {"int", "unsigned int", "long", "unsigned long"}:
+            return 2
+        if normalized in {"size_t", "ssize_t", "long long", "unsigned long long", "i64", "u64"}:
+            return 3
+        return 0
+
+    def _extract_intent_functions(self, patch_intent: Dict[str, Any]) -> List[str]:
+        subject = str(patch_intent.get("subject", "") or "")
+        summary = str(patch_intent.get("summary", "") or "")
+        functions: List[str] = []
+        for token in re.findall(r"\b([A-Za-z_]\w{4,})\b", f"{subject} {summary}"):
+            lowered = token.lower()
+            if lowered in {"patch", "integer", "overflow", "fix", "subject", "fossilorigin", "name"}:
+                continue
+            if token.startswith(("CVE_", "CWE_")):
+                continue
+            if "_" not in token and not any(ch.isupper() for ch in token[1:]):
+                continue
+            if token not in functions:
+                functions.append(token)
+        return functions[:6]
+
+    def _infer_patterns_from_patch(
+        self,
+        patch_analysis: Dict[str, Any],
+        patch_intent: Dict[str, Any],
+        type_widenings: Sequence[Dict[str, Any]],
+        additions: Sequence[str],
+        deletions: Sequence[str],
+    ) -> List[str]:
+        inferred: List[str] = []
+        subject = str(patch_intent.get("subject", "") or "").lower()
+        summary = str(patch_intent.get("summary", "") or "").lower()
+        text = " ".join([subject, summary] + [str(line).lower() for line in additions] + [str(line).lower() for line in deletions])
+        if ("integer overflow" in text or "overflow fix" in text or "arithmetic" in text) and type_widenings:
+            inferred.append("integer_overflow")
+        elif type_widenings and any(token in text for token in ("overflow", "widen", "counter", "accumulator")):
+            inferred.append("integer_overflow")
+        elif any(self._looks_like_overflow_guard(str(line).lower()) for line in additions):
+            inferred.append("integer_overflow")
+
+        strategy = patch_analysis.get("detection_strategy", {}) or {}
+        primary = str(strategy.get("primary_pattern", "") or "").strip()
+        if primary and primary not in inferred:
+            inferred.append(primary)
+        return inferred
+
+    def _looks_like_overflow_guard(self, lowered_line: str) -> bool:
+        text = str(lowered_line or "").strip()
+        if not text:
+            return False
+        if any(limit in text for limit in ("size_max", "int_max", "uint_max", "long_max", "ssize_max")):
+            return True
+        return bool(
+            "/" in text
+            and any(op in text for op in (">", ">=", "<", "<="))
+            and any(token in text for token in ("count", "size", "len", "bytes", "capacity", "elem"))
+        )
+
 
 class EvidencePlanner:
     """Plan evidence requirements from patch semantics and analyzer capabilities."""
@@ -334,7 +580,6 @@ class EvidencePlanner:
         hypotheses: List[str] = []
         planner_notes: List[str] = []
         escalation_triggers: List[str] = []
-        fallback_collectors: List[str] = []
 
         self._require(
             requirements,
@@ -375,17 +620,6 @@ class EvidencePlanner:
             hypotheses.append("The vulnerability mechanism crosses file boundaries and should not be captured with local-only reasoning.")
             self._require(
                 requirements,
-                EvidenceType.CONTEXT_SUMMARY.value,
-                reason="Cross-file patch suggests build/module context is needed to scope evidence extraction.",
-                priority=84,
-                preferred_analyzers=self._find_supporting_analyzers(
-                    analyzer_catalog, EvidenceType.CONTEXT_SUMMARY.value
-                ),
-                confidence=0.8,
-                mechanism_refs=["strategy"],
-            )
-            self._require(
-                requirements,
                 EvidenceType.SEMANTIC_SLICE.value,
                 reason="Cross-file patch suggests a verifier-backed semantic slice is needed, not just a project summary.",
                 priority=86,
@@ -393,6 +627,17 @@ class EvidencePlanner:
                     analyzer_catalog, EvidenceType.SEMANTIC_SLICE.value
                 ),
                 confidence=0.83,
+                mechanism_refs=["strategy"],
+            )
+            self._require(
+                requirements,
+                EvidenceType.CALL_CHAIN.value,
+                reason="Cross-file patch needs interprocedural call edges, not only local edited-line context.",
+                priority=82,
+                preferred_analyzers=self._find_supporting_analyzers(
+                    analyzer_catalog, EvidenceType.CALL_CHAIN.value
+                ),
+                confidence=0.78,
                 mechanism_refs=["strategy"],
             )
 
@@ -428,7 +673,7 @@ class EvidencePlanner:
                 mechanism_refs=["pattern_0"],
             )
 
-        if pattern_types & {"buffer_overflow", "null_dereference", "integer_overflow"}:
+        if pattern_types & {"buffer_overflow", "null_dereference"}:
             hypotheses.append("The fix strengthens a guard or bound that should be captured as a reusable precondition.")
             self._require(
                 requirements,
@@ -453,13 +698,38 @@ class EvidencePlanner:
                 confidence=0.86,
                 mechanism_refs=["pattern_0"],
             )
+
+        if "integer_overflow" in pattern_types:
+            hypotheses.append("The fix widens arithmetic carriers or restores a wider numeric domain before a size-related sink.")
             self._require(
                 requirements,
-                EvidenceType.CONTEXT_SUMMARY.value,
-                reason="Buffer-overflow fixes need a compact contract summary of removed risky sinks, patch-added barriers, and safe replacement APIs.",
+                EvidenceType.SEMANTIC_SLICE.value,
+                reason="Arithmetic-overflow fixes need the concrete accumulator/sink slice, not a patch headline.",
+                priority=90,
+                preferred_analyzers=self._find_supporting_analyzers(
+                    analyzer_catalog, EvidenceType.SEMANTIC_SLICE.value
+                ),
+                confidence=0.9,
+                mechanism_refs=["pattern_0"],
+            )
+            self._require(
+                requirements,
+                EvidenceType.STATE_TRANSITION.value,
+                reason="Need local numeric-domain transitions such as int32 accumulator to i64 accumulator before the sink.",
+                priority=84,
+                preferred_analyzers=self._find_supporting_analyzers(
+                    analyzer_catalog, EvidenceType.STATE_TRANSITION.value
+                ),
+                confidence=0.82,
+                mechanism_refs=["pattern_0"],
+            )
+            self._require(
+                requirements,
+                EvidenceType.DATAFLOW_CANDIDATE.value,
+                reason="Need candidate flow from narrow counters/length carriers into the downstream allocation or formatting sink.",
                 priority=82,
                 preferred_analyzers=self._find_supporting_analyzers(
-                    analyzer_catalog, EvidenceType.CONTEXT_SUMMARY.value
+                    analyzer_catalog, EvidenceType.DATAFLOW_CANDIDATE.value
                 ),
                 confidence=0.8,
                 mechanism_refs=["pattern_0"],
@@ -489,13 +759,14 @@ class EvidencePlanner:
                 confidence=0.88,
                 mechanism_refs=["pattern_0"],
             )
+            # API_CONTRACT 已剔除，同步信息可从 SEMANTIC_SLICE.api_terms 获取
             self._require(
                 requirements,
-                EvidenceType.API_CONTRACT.value,
-                reason="Need concrete synchronization/API evidence such as mutex or atomic operations.",
+                EvidenceType.SEMANTIC_SLICE.value,
+                reason="Race-condition fixes need semantic slice with synchronization API terms.",
                 priority=82,
                 preferred_analyzers=self._find_supporting_analyzers(
-                    analyzer_catalog, EvidenceType.API_CONTRACT.value
+                    analyzer_catalog, EvidenceType.SEMANTIC_SLICE.value
                 ),
                 confidence=0.8,
                 mechanism_refs=["pattern_0"],
@@ -514,15 +785,27 @@ class EvidencePlanner:
 
         if pattern_types & {"command_injection", "path_traversal", "sql_injection", "taint_tracking"}:
             hypotheses.append("The vulnerability depends on source-to-sink propagation and API semantics.")
+            # API_CONTRACT 已剔除，source/sink 信息可从 SEMANTIC_SLICE.api_terms 获取
             self._require(
                 requirements,
-                EvidenceType.API_CONTRACT.value,
+                EvidenceType.SEMANTIC_SLICE.value,
                 reason="Patch semantics likely involve source/sink or sanitizer APIs.",
                 priority=86,
                 preferred_analyzers=self._find_supporting_analyzers(
-                    analyzer_catalog, EvidenceType.API_CONTRACT.value
+                    analyzer_catalog, EvidenceType.SEMANTIC_SLICE.value
                 ),
                 confidence=0.8,
+                mechanism_refs=["pattern_0"],
+            )
+            self._require(
+                requirements,
+                EvidenceType.DATAFLOW_CANDIDATE.value,
+                reason="Taint tracking requires dataflow evidence.",
+                priority=84,
+                preferred_analyzers=self._find_supporting_analyzers(
+                    analyzer_catalog, EvidenceType.DATAFLOW_CANDIDATE.value
+                ),
+                confidence=0.78,
                 mechanism_refs=["pattern_0"],
             )
 
@@ -553,21 +836,6 @@ class EvidencePlanner:
             escalation_triggers.append("metadata_available")
 
         uncertainty_budget = "high" if len(escalation_triggers) >= 2 else ("medium" if escalation_triggers else "low")
-        if uncertainty_budget != "low" or any(
-            fact.fact_type in {"patch_intent", "external_references"} for fact in patch_facts
-        ):
-            fallback_collectors.append("metadata_intent")
-            self._require(
-                requirements,
-                EvidenceType.METADATA_HINT.value,
-                reason="Patch intent / external references should be aligned with analyzer evidence when uncertainty remains non-trivial.",
-                priority=76 if uncertainty_budget == "high" else 68,
-                preferred_analyzers=self._find_supporting_analyzers(
-                    analyzer_catalog, EvidenceType.METADATA_HINT.value
-                ),
-                confidence=0.74 if uncertainty_budget == "high" else 0.66,
-                mechanism_refs=["patch"],
-            )
 
         recommended_analyzers = self._rank_analyzers(analyzer_catalog, list(requirements.values()))
         coverage_gaps = self._detect_coverage_gaps(list(requirements.values()), selected, analyzer_catalog)
@@ -575,8 +843,6 @@ class EvidencePlanner:
             planner_notes.append("Selected analyzers do not cover every planned evidence primitive.")
             if "selected_coverage_gap" not in escalation_triggers:
                 escalation_triggers.append("selected_coverage_gap")
-            if "metadata_intent" not in fallback_collectors:
-                fallback_collectors.append("metadata_intent")
 
         return EvidencePlan(
             primary_pattern=primary_pattern,
@@ -590,7 +856,6 @@ class EvidencePlanner:
             coverage_gaps=coverage_gaps,
             uncertainty_budget=uncertainty_budget,
             escalation_triggers=escalation_triggers,
-            fallback_collectors=fallback_collectors,
         )
 
     def _resolve_primary_pattern(
@@ -617,6 +882,8 @@ class EvidencePlanner:
         removed_ops: List[str] = []
         added_guards: List[str] = []
         added_apis: List[str] = []
+        type_widening = False
+        intent_tokens: List[str] = []
         for fact in patch_facts:
             if fact.fact_type == "removed_risky_operations":
                 removed_ops.extend(str(item).strip().lower() for item in (fact.attributes.get("operations", []) or []))
@@ -624,10 +891,19 @@ class EvidencePlanner:
                 added_guards.extend(str(item).strip().lower() for item in (fact.attributes.get("guards", []) or []))
             elif fact.fact_type == "added_api_calls":
                 added_apis.extend(str(item).strip().lower() for item in (fact.attributes.get("apis", []) or []))
+            elif fact.fact_type == "type_widening":
+                type_widening = True
+            elif fact.fact_type == "patch_intent":
+                text = " ".join(
+                    str(fact.attributes.get(key, "") or "")
+                    for key in ("subject", "summary")
+                ).lower()
+                intent_tokens.extend(re.findall(r"[a-z0-9_+-]+", text))
 
         removed_text = "\n".join(removed_ops)
         guard_text = "\n".join(added_guards)
         api_text = " ".join(added_apis)
+        intent_text = " ".join(intent_tokens)
 
         removed_buffer_ops = any(token in removed_text for token in ("strcpy", "strcat", "sprintf", "memcpy", "memmove"))
         added_bounds_barrier = any(token in guard_text for token in ("sizeof", "capacity", "out_size", "len", "bytes", "written"))
@@ -638,6 +914,9 @@ class EvidencePlanner:
         removed_null_sink = any(token in removed_text for token in ("->", "*", "["))
         if removed_null_sink and any(token in guard_text for token in ("null", "!ptr", "!record", "!user")):
             return "null_dereference"
+
+        if type_widening and any(token in intent_text for token in ("integer", "overflow", "counter", "accumulator")):
+            return "integer_overflow"
 
         return "unknown"
 
@@ -839,5 +1118,4 @@ class PatchWeaverPreflight:
             coverage_gaps=plan.coverage_gaps,
             uncertainty_budget=plan.uncertainty_budget,
             escalation_triggers=plan.escalation_triggers,
-            fallback_collectors=plan.fallback_collectors,
         )

@@ -488,8 +488,8 @@ class SearchKnowledgeTool(Tool):
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "返回结果数量 (默认3，最多10)",
-                    "default": 3,
+                    "description": "返回结果数量 (默认2，最多10)",
+                    "default": 2,
                     "minimum": 1,
                     "maximum": 10
                 },
@@ -1015,35 +1015,7 @@ class SearchKnowledgeTool(Tool):
         return all_results
 
     def _format_result_excerpt(self, content: str, query_hints: Dict[str, Any]) -> str:
-        text = str(content or "")
-        limit = 1800 if (query_hints.get("exact_api") or query_hints.get("relookup_mode")) else 1000
-        if len(text) <= limit:
-            return text
-
-        lowered = text.lower()
-        anchors: List[int] = []
-        for symbol in query_hints.get("symbol_tokens", []) or []:
-            pos = lowered.find(symbol)
-            if pos >= 0:
-                anchors.append(pos)
-        if query_hints.get("relookup_mode"):
-            for term in RELOOKUP_DOCUMENT_TERMS:
-                pos = lowered.find(term)
-                if pos >= 0:
-                    anchors.append(pos)
-                    break
-
-        if anchors:
-            start = max(0, min(anchors) - 260)
-            end = min(len(text), start + limit)
-            snippet = text[start:end]
-            if start > 0:
-                snippet = "...\n" + snippet
-            if end < len(text):
-                snippet = snippet + "\n..."
-            return snippet
-
-        return text[:limit] + "..."
+        return str(content or "")
 
     def _is_relookup_seed_document(self, content: str) -> bool:
         lower = str(content or "").lower()
@@ -1100,7 +1072,7 @@ class SearchKnowledgeTool(Tool):
     def execute(
         self,
         query: str,
-        top_k: int = 3,
+        top_k: int = 2,
         analyzer: str = None,
         min_similarity: float = None
     ) -> ToolResult:

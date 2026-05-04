@@ -70,10 +70,10 @@ class GenerationToolkit:
             {"patch_path": self._request.patch_path, "analysis_depth": "deep"},
         )
 
-    def search_knowledge(self, query: str, top_k: int = 3) -> "ToolResult":
+    def search_knowledge(self, query: str, top_k: int = 2) -> "ToolResult":
         return self._run(
             "search_knowledge",
-            {"query": query, "top_k": max(1, min(int(top_k or 3), 8))},
+            {"query": query, "top_k": max(1, min(int(top_k or 2), 8))},
         )
 
     def generate_codeql_query(
@@ -167,6 +167,7 @@ class GenerationToolkit:
             success=result.success,
             error=result.error,
             summary=self._summarize_tool_result(result),
+            llm_usage=self._tool_llm_usage(result),
         )
         return result
 
@@ -221,3 +222,19 @@ class GenerationToolkit:
             source = result.output or result.error or str(result.metadata or {})
         text = " ".join(str(source).split())
         return text[:200]
+
+    def _tool_llm_usage(self, result: "ToolResult") -> Dict[str, Any]:
+        metadata = dict(result.metadata or {})
+        raw_usage = metadata.get("llm_usage", {})
+        if not isinstance(raw_usage, dict):
+            return {}
+        if not any(int(raw_usage.get(key, 0) or 0) > 0 for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+            return {}
+        return {
+            "prompt_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
+            "total_tokens": int(raw_usage.get("total_tokens", 0) or 0),
+            "call_count": int(raw_usage.get("call_count", 1) or 1),
+            "available": bool(raw_usage.get("available", True)),
+            "model": str(raw_usage.get("model", "") or "").strip(),
+        }

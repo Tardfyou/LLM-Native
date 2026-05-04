@@ -3,12 +3,12 @@
 
 # 版本
 version: "2.2.0"
-description: "基于补丁文件的Clang-18检测器自动生成框架 (智能体模式 + CodeQL 支持)"
+description: "基于补丁文件的静态分析漏洞检测器自动生成框架 (精炼+evidence)"
 
 project:
   name: "LLVM Checker Generator"
   version: "2.2.0"
-  description: "基于补丁文件的Clang-18检测器自动生成框架 (智能体模式 + CodeQL支持)"
+  description: "基于补丁文件的静态分析漏洞检测器自动生成框架 (精炼+evidence)"
 
 # MCP工具标准化配置（新增）
 mcp:
@@ -24,30 +24,40 @@ paths:
   logs_dir: "${PROJECT_ROOT:-.}/logs"
   tests_dir: "${PROJECT_ROOT:-.}/tests"
 
-# LLM配置 - 支持多 Provider (DeepSeek / XTY中转站)
+# LLM配置 - 支持多 Provider (DeepSeek / XTY中转站 / PackyAPI)
 llm:
-  # Provider 选择: "deepseek" 或 "xty"
-  provider: "xty"
+  # Provider 选择: "deepseek" / "xty" / "packyapi"
+  provider: "packyapi"
 
   # 主模型 (根据 provider 选择合适模型)
-  primary_model: "gpt-5.4-mini"
+  primary_model: "gpt-5.5"
 
   # API密钥配置 (硬编码在配置文件)
   api_keys:
     deepseek: "sk-f1ed234b6c2240e1bed912e09e601c75"
     xty: "sk-ygS7w7TCUEw4UvMiA077323d5e974f8a9fAa75B65c1127Fe"
+    packyapi: "sk-sWgsnXSC7tFcNLwvje0mgaa9r3W7HMry0c8TmR0UulO3IoKb"
 
   # 各 Provider 的 Base URL
   base_urls:
     deepseek: "https://api.deepseek.com"
     xty: "https://api.xty.app/v1"
+    packyapi: "https://www.packyapi.com/v1"
 
   # 生成参数
   generation:
     temperature: 0.7
-    max_tokens: 8192
+    max_tokens: 128000
     timeout: 120
     max_retries: 3
+
+  # 生成系统 LLM token 配置
+  generate:
+    max_tokens: 256000
+
+  # 精炼系统 LLM token 配置
+  refine:
+    max_tokens: 256000
 
 # 智能体配置 (新架构)
 agent:
@@ -55,11 +65,19 @@ agent:
   verbose: true                # 打印详细过程
   stream_output: true          # 流式输出 LLM 响应
   temperature: 0.3             # 智能体默认温度
-  refine_temperature: 0.1      # refine 智能体温度，仅作用于精炼
+  generate_temperature: 0.15   # generate 阶段兜底温度
+  generate_patch_analysis_temperature: 0.08
+  generate_plan_temperature: 0.25
+  generate_rag_check_temperature: 0.0
+  generate_draft_temperature: 0.18
+  generate_repair_temperature: 0.05
+  refine_temperature: 0.1      # refine 阶段兜底温度
+  refine_decision_temperature: 0.08
+  refine_repair_temperature: 0.04
   require_relevant_knowledge_before_generation: true
-  required_knowledge_min_similarity: 0.35
+  required_knowledge_min_similarity: 0.7
   required_knowledge_min_results: 1
-  required_knowledge_top_k: 3
+  required_knowledge_top_k: 2
 
   # 是否向 agent 注册 select_analyzer 工具
   enable_analyzer_selection: true  # 启用智能工具选择
@@ -68,6 +86,7 @@ agent:
 patchweaver:
   enabled: true
   preflight_analysis: true
+  generate_preflight_enabled: false  # generate 阶段默认不跑 PATCHWEAVER preflight；证据请走 evidence 子命令
   max_planned_requirements: 8
 
 quality_gates:
@@ -75,15 +94,17 @@ quality_gates:
     enabled: true
 
 refine:
+  max_rounds: 3
   structural_candidate:
-    enabled: true
+    enabled: false
     allowed_families:
       csa: []
       codeql: []
 
 validation:
   semantic:
-    timeout: 120
+    timeout: 720
+    csa_jobs: 8
     codeql_auto_create_db: true
 
 # CodeQL配置 (新增)
@@ -153,8 +174,8 @@ knowledge_base:
 
   # 检索配置
   retrieval:
-    top_k: 3
-    similarity_threshold: 0.2
+    top_k: 2
+    similarity_threshold: 0.7
 
   # CodeQL 知识库
   codeql_knowledge:

@@ -43,7 +43,7 @@ class CodeQLAnalyzer(BaseAnalyzer):
         name="CodeQL",
         description="全局/跨文件语义查询，擅长污点传播与复杂模式匹配。",
         best_for=["sql_injection", "command_injection", "path_traversal", "taint_tracking"],
-        evidence_types=["dataflow_candidate", "call_chain", "api_contract", "context_summary", "semantic_slice", "metadata_hint", "diagnostic"],
+        evidence_types=["patch_fact", "semantic_slice", "dataflow_candidate", "call_chain"],
         detector_artifacts=["ql_query"],
         strengths=["interprocedural", "global_semantics", "api_modeling"],
         validation_modes=["query_parse", "semantic"],
@@ -132,11 +132,12 @@ class CodeQLAnalyzer(BaseAnalyzer):
         # 设置工具的工作目录
         self._setup_tool_work_dirs(work_dir, context.validate_path)
 
-        self._emit_progress("evidence_collection_started")
-        evidence_bundle = self.collect_evidence(context)
+        from .evidence_schema import EvidenceBundle
+
+        evidence_bundle = EvidenceBundle()
         synthesis_input = self.build_synthesis_input(context, evidence_bundle)
         self._emit_progress(
-            "evidence_collection_completed",
+            "evidence_loaded",
             records=len(getattr(evidence_bundle, "records", []) or []),
             missing=len(getattr(evidence_bundle, "missing_evidence", []) or []),
         )
@@ -200,13 +201,6 @@ class CodeQLAnalyzer(BaseAnalyzer):
         self._setup_tool_work_dirs(work_dir, context.validate_path)
         from ..evidence.normalizer import EvidenceNormalizer
 
-        extra_context = self._join_context_blocks(
-            self._build_extra_context(context.shared_analysis),
-            self._build_runtime_path_context(context, work_dir),
-            self._build_evidence_context(evidence_bundle),
-            self._build_synthesis_context(synthesis_input),
-        )
-
         vuln_type = self._infer_vulnerability_type(
             context.shared_analysis,
             context.patch_path,
@@ -220,7 +214,6 @@ class CodeQLAnalyzer(BaseAnalyzer):
                 patch_path=context.patch_path,
                 work_dir=work_dir,
                 validate_path=context.validate_path or "",
-                extra_context=extra_context,
                 max_iterations=int((self.config.get("agent", {}) or {}).get("max_iterations", 12) or 12),
             )
         )
@@ -283,6 +276,17 @@ class CodeQLAnalyzer(BaseAnalyzer):
                 "evidence_summary": self._build_evidence_context(evidence_bundle),
                 "synthesis_input": synthesis_input.to_dict(),
                 "synthesis_summary": synthesis_input.to_prompt_block(),
+                "generation_agent": {
+                    "final_message": agent_result.final_message,
+                    "tool_history": agent_result.metadata.get("tool_history", []),
+                    "notes": agent_result.metadata.get("notes", []),
+                    "plan": agent_result.metadata.get("plan", {}),
+                    "rag_match": agent_result.metadata.get("rag_match", False),
+                    "rag_check_result": agent_result.metadata.get("rag_check_result", ""),
+                    "llm_usage": agent_result.metadata.get("llm_usage", {}),
+                    "llm_usage_by_phase": agent_result.metadata.get("llm_usage_by_phase", {}),
+                },
+                "llm_usage": agent_result.metadata.get("llm_usage", {}),
             },
         )
 
@@ -300,10 +304,10 @@ class CodeQLAnalyzer(BaseAnalyzer):
         work_dir = self._create_work_dir(context.output_dir)
         self._setup_tool_work_dirs(work_dir, context.validate_path)
 
-        evidence_bundle = self.collect_evidence(context)
+        evidence_bundle = self.restore_refinement_evidence_bundle(context)
         synthesis_input = self.build_synthesis_input(context, evidence_bundle)
         self._emit_progress(
-            "evidence_collection_completed",
+            "evidence_loaded",
             records=len(getattr(evidence_bundle, "records", []) or []),
             missing=len(getattr(evidence_bundle, "missing_evidence", []) or []),
         )
@@ -326,17 +330,6 @@ class CodeQLAnalyzer(BaseAnalyzer):
         staged_target = self._stage_refinement_artifact(
             source_path=refinement_baseline_path,
             work_dir=work_dir,
-        )
-        extra_context = self._join_context_blocks(
-            self._build_extra_context(context.shared_analysis),
-            self._build_runtime_path_context(context, work_dir),
-            self._build_evidence_context(evidence_bundle),
-            self._build_synthesis_context(synthesis_input),
-            self._build_refinement_context(
-                artifact=artifact,
-                baseline_result=baseline_result,
-                synthesis_input=synthesis_input,
-            ),
         )
         vuln_type = self._infer_vulnerability_type(
             context.shared_analysis,
@@ -361,8 +354,10 @@ class CodeQLAnalyzer(BaseAnalyzer):
                 target_path=staged_target,
                 source_path=refinement_baseline_path,
                 validate_path=context.validate_path or "",
+                evidence_dir=context.evidence_dir or "",
+                evidence_bundle_raw=context.evidence_bundle_raw if isinstance(context.evidence_bundle_raw, dict) else {},
+                baseline_validation_summary=str((baseline_result.metadata or {}).get("baseline_validation_summary", "") or ""),
                 checker_name=Path(staged_target).stem,
-                extra_context=extra_context,
                 max_iterations=int((self.config.get("agent", {}) or {}).get("max_iterations", 12) or 12),
             )
         )
@@ -413,6 +408,7 @@ class CodeQLAnalyzer(BaseAnalyzer):
                 "work_dir": work_dir,
                 "patch_path": context.patch_path,
                 "refinement_target_path": staged_target,
+                "baseline_source_path": str(getattr(artifact, "source_path", "") or ""),
                 "vulnerability_type": vuln_type,
                 "artifact_review": review_metadata,
                 "evidence_bundle": evidence_bundle.to_dict(),
@@ -431,7 +427,13 @@ class CodeQLAnalyzer(BaseAnalyzer):
                 "refinement_agent": {
                     "final_message": agent_result.final_message,
                     "tool_history": agent_result.metadata.get("tool_history", []),
+                    "model_requested_stop": bool(agent_result.metadata.get("model_requested_stop", False)),
+                    "last_decision_action": str(agent_result.metadata.get("last_decision_action", "") or ""),
+                    "last_repair_action": str(agent_result.metadata.get("last_repair_action", "") or ""),
+                    "llm_usage": agent_result.metadata.get("llm_usage", {}),
+                    "llm_usage_by_phase": agent_result.metadata.get("llm_usage_by_phase", {}),
                 },
+                "llm_usage": agent_result.metadata.get("llm_usage", {}),
             },
         )
         self._emit_progress(
@@ -563,26 +565,3 @@ class CodeQLAnalyzer(BaseAnalyzer):
                     return pattern_type
 
         return "unknown"
-
-    def _build_extra_context(self, shared_analysis: Dict[str, Any]) -> str:
-        """构建额外上下文"""
-        base_context = super()._build_extra_context(shared_analysis)
-
-        if not shared_analysis:
-            return base_context
-
-        lines = [base_context] if base_context else []
-
-        # 添加 CodeQL 特定的上下文
-        vuln_type = self._infer_vulnerability_type(shared_analysis, "")
-        if vuln_type and vuln_type != "unknown":
-            lines.append(f"- 推断漏洞类型: {vuln_type}")
-        else:
-            lines.append("- 漏洞类型暂不确定: 不要根据 patch 关键词强行贴具体标签，应围绕 PATCHWEAVER 给出的证据与语义机制生成自定义查询。")
-        lines.append("- CodeQL 生成约束: 使用可复用谓词、AST/数据流关系和 analyzer-native 语义，不要退化成 API 名称或关键词匹配。")
-        lines.append("- CodeQL barrier 约束: guard/barrier 必须绑定到同一调用、同一参数或同一关键变量关系，不能因为附近出现任意 if/比较就整体静默。")
-        lines.append("- CodeQL 泛化要求: 允许以 patch 为语义锚点，但最终查询必须覆盖同类别漏洞，而不是只命中 patch 点位。")
-        lines.append("- CodeQL 结构要求: 保持单个最终 `from ... where ... select ...`，语法修复只改报错核心片段。")
-        lines.append("- CodeQL 知识来源: 漏洞族特定谓词、source/sink/barrier 语义应优先从高相关知识库结果中补齐。")
-
-        return "\n".join(lines)

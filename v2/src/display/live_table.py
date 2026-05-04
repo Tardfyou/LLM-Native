@@ -258,6 +258,14 @@ class LiveProgressTable:
             progress.end_time = time.time()
             progress.last_update = time.time()
 
+        elif event_type == "preflight_skipped":
+            progress.status = AnalyzerStatus.COMPLETED
+            progress.phase = "预分析已跳过"
+            reason = str(event.get("reason", "") or "").strip()
+            progress.last_result = reason or "按配置跳过"
+            progress.end_time = time.time()
+            progress.last_update = time.time()
+
         elif event_type == "started":
             progress.status = AnalyzerStatus.RUNNING
             progress.phase = "初始化"
@@ -368,7 +376,7 @@ class LiveProgressTable:
             adopted = bool(event.get("adopted", False))
             success = bool(event.get("success", False))
             progress.last_result = (
-                f"{'采用候选' if adopted else '保留基线'} | "
+                f"{'采用候选' if adopted else '保持当前产物'} | "
                 f"{'候选通过' if success else '候选未通过'}"
             )
             self._append_recent_event(progress, progress.last_result)
@@ -496,6 +504,64 @@ class LiveProgressTable:
                 if raw_preview:
                     progress.last_result = raw_preview[:180]
                     self._append_recent_event(progress, f"raw: {raw_preview[:180]}")
+                progress.last_update = time.time()
+            elif agent_event == "validation_failure":
+                progress.phase = "验证失败，准备修复"
+                title = str(event.get("title", "") or "").strip()
+                repeat = int(event.get("repeated_failure_count", 0) or 0)
+                preview = str(event.get("preview", "") or "").strip().replace("\n", " ")
+                signature = str(event.get("failure_signature", "") or "").strip()
+                msg = f"{title or 'validation_failure'} | repeat={repeat}"
+                if signature:
+                    msg += f" | sig={signature[:140]}"
+                progress.last_error = preview[:220] or msg
+                progress.last_result = msg[:220]
+                self._push_message(progress, msg[:300])
+                if preview:
+                    self._append_recent_event(progress, preview[:220])
+                progress.last_update = time.time()
+            elif agent_event == "repair_decision_started":
+                progress.phase = "修复决策中"
+                repeat = int(event.get("repeated_failure_count", 0) or 0)
+                title = str(event.get("latest_failure_title", "") or "").strip()
+                preview = str(event.get("latest_failure_preview", "") or "").strip().replace("\n", " ")
+                msg = f"修复输入: {title or '-'} | repeat={repeat}"
+                progress.last_result = msg
+                self._append_recent_event(progress, (preview or msg)[:220])
+                progress.last_update = time.time()
+            elif agent_event == "repair_decision_completed":
+                progress.phase = "修复决策完成"
+                action = str(event.get("action", "") or "").strip()
+                summary = str(event.get("summary", "") or "").strip()
+                edits_count = int(event.get("edits_count", 0) or 0)
+                progress.last_result = f"repair_action={action or '-'} | edits={edits_count} | {summary or '-'}"
+                self._append_recent_event(progress, progress.last_result[:220])
+                progress.last_update = time.time()
+            elif agent_event == "repair_apply_failed":
+                progress.phase = "修复应用失败"
+                stage = str(event.get("stage", "") or "").strip()
+                error = str(event.get("error", "") or "").strip().replace("\n", " ")
+                progress.last_error = error[:220]
+                progress.last_result = f"{stage or 'repair'} failed"
+                self._append_recent_event(progress, f"{stage}: {error[:220]}")
+                progress.last_update = time.time()
+            elif agent_event == "repair_applied":
+                progress.phase = "修复已应用"
+                artifact_path = str(event.get("artifact_path", "") or "").strip()
+                progress.output_path = artifact_path or progress.output_path
+                progress.last_result = "edits applied"
+                self._append_recent_event(progress, "edits applied")
+                progress.last_update = time.time()
+            elif agent_event == "repair_loop_stopped":
+                progress.phase = "修复循环终止"
+                reason = str(event.get("reason", "") or "").strip()
+                repeat = int(event.get("repeated_failure_count", 0) or 0)
+                preview = str(event.get("latest_failure_preview", "") or "").strip().replace("\n", " ")
+                progress.last_error = preview[:240]
+                progress.last_result = f"{reason or 'stopped'} | repeat={repeat}"
+                self._append_recent_event(progress, progress.last_result)
+                if preview:
+                    self._append_recent_event(progress, preview[:240])
                 progress.last_update = time.time()
             elif agent_event == "think_started":
                 progress.phase = "思考中"
@@ -814,7 +880,7 @@ class LiveProgressTable:
         elif event_type == "refinement_iteration_started":
             self._simple_print(f"   轮次: {event.get('iteration', 0)}")
         elif event_type == "refinement_iteration_completed":
-            verdict = "采用候选" if event.get("adopted") else "保留基线"
+            verdict = "采用候选" if event.get("adopted") else "保持当前产物"
             self._simple_print(f"   轮次: {event.get('iteration', 0)} | {verdict} | success={bool(event.get('success', False))}")
         elif event_type == "refinement_iteration_skipped":
             self._simple_print(f"   跳过: {str(event.get('reason', '') or '基线已满足严格精炼质量门')}")
@@ -845,6 +911,49 @@ class LiveProgressTable:
             self._simple_print(f"   决策解析失败: {error or '-'}")
             if raw_preview:
                 self._simple_print(f"   原始预览: {raw_preview[:180]}")
+        elif event_type == "agent_validation_failure":
+            title = str(event.get("title", "") or "").strip()
+            repeat = int(event.get("repeated_failure_count", 0) or 0)
+            signature = str(event.get("failure_signature", "") or "").strip()
+            preview = str(event.get("preview", "") or "").strip()
+            self._simple_print(f"   验证失败: {title or '-'} | repeat={repeat}")
+            if signature:
+                self._simple_print(f"   失败签名: {signature[:260]}")
+            if preview:
+                self._simple_print(f"   诊断预览: {preview[:500]}")
+        elif event_type == "agent_repair_decision_started":
+            title = str(event.get("latest_failure_title", "") or "").strip()
+            repeat = int(event.get("repeated_failure_count", 0) or 0)
+            preview = str(event.get("latest_failure_preview", "") or "").strip()
+            self._simple_print(f"   修复输入: {title or '-'} | repeat={repeat}")
+            if preview:
+                self._simple_print(f"   最近失败: {preview[:500]}")
+        elif event_type == "agent_repair_decision_completed":
+            action = str(event.get("action", "") or "").strip()
+            summary = str(event.get("summary", "") or "").strip()
+            edits_count = int(event.get("edits_count", 0) or 0)
+            self._simple_print(f"   修复决策: {action or '-'} | edits={edits_count} | {summary or '-'}")
+        elif event_type == "agent_repair_apply_failed":
+            stage = str(event.get("stage", "") or "").strip()
+            error = str(event.get("error", "") or "").strip()
+            self._simple_print(f"   修复应用失败: {stage or '-'}")
+            if error:
+                self._simple_print(f"   错误: {error[:500]}")
+        elif event_type == "agent_repair_applied":
+            artifact_path = str(event.get("artifact_path", "") or "").strip()
+            self._simple_print("   修复已应用: edits applied")
+            if artifact_path:
+                self._simple_print(f"   产物: {artifact_path}")
+        elif event_type == "agent_repair_loop_stopped":
+            reason = str(event.get("reason", "") or "").strip()
+            repeat = int(event.get("repeated_failure_count", 0) or 0)
+            signature = str(event.get("latest_failure_signature", "") or "").strip()
+            preview = str(event.get("latest_failure_preview", "") or "").strip()
+            self._simple_print(f"   修复循环终止: {reason or '-'} | repeat={repeat}")
+            if signature:
+                self._simple_print(f"   失败签名: {signature[:260]}")
+            if preview:
+                self._simple_print(f"   最近失败: {preview[:500]}")
         elif event_type == "agent_tool_called":
             tool_name = str(event.get("tool_name", "") or "").strip()
             args_preview = str(event.get("args_preview", "") or "").strip()
@@ -878,6 +987,12 @@ class LiveProgressTable:
             "agent_run_completed",
             "agent_decision_completed",
             "agent_decision_parse_failed",
+            "agent_validation_failure",
+            "agent_repair_decision_started",
+            "agent_repair_decision_completed",
+            "agent_repair_apply_failed",
+            "agent_repair_applied",
+            "agent_repair_loop_stopped",
         }
         if event_type in important_events:
             return True

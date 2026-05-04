@@ -53,8 +53,3 @@ def _replace_env_vars(content: str) -> str:
         return os.environ.get(var_name, default)
 
     return re.sub(pattern, replacer, content)
-
-
-def get_default_config_path() -> str:
-    """获取默认配置文件路径"""
-    return str(Path(__file__).parent.parent.parent / "config" / "config.yaml")

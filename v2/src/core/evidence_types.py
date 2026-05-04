@@ -8,20 +8,18 @@ from typing import Any, Dict, List
 
 
 class EvidenceType(str, Enum):
-    """Supported evidence primitives."""
+    """Persisted evidence primitives consumed by refine."""
 
     PATCH_FACT = "patch_fact"
-    CALL_CHAIN = "call_chain"
-    DATAFLOW_CANDIDATE = "dataflow_candidate"
-    PATH_GUARD = "path_guard"
-    STATE_TRANSITION = "state_transition"
-    ALLOCATION_LIFECYCLE = "allocation_lifecycle"
-    API_CONTRACT = "api_contract"
-    CONTEXT_SUMMARY = "context_summary"
     SEMANTIC_SLICE = "semantic_slice"
-    METADATA_HINT = "metadata_hint"
-    DIAGNOSTIC = "diagnostic"
-    VALIDATION_OUTCOME = "validation_outcome"
+    DATAFLOW_CANDIDATE = "dataflow_candidate"
+    CALL_CHAIN = "call_chain"
+    PATH_GUARD = "path_guard"
+    ALLOCATION_LIFECYCLE = "allocation_lifecycle"
+    STATE_TRANSITION = "state_transition"
+
+    # `directory_tree` is query-time derived context from `evidence_dir`,
+    # not a persisted bundle record type.
 
 
 class MechanismNodeKind(str, Enum):
@@ -91,7 +89,6 @@ class EvidencePlan:
     coverage_gaps: List[str] = field(default_factory=list)
     uncertainty_budget: str = "normal"
     escalation_triggers: List[str] = field(default_factory=list)
-    fallback_collectors: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -103,5 +100,4 @@ class EvidencePlan:
             "coverage_gaps": list(self.coverage_gaps),
             "uncertainty_budget": self.uncertainty_budget,
             "escalation_triggers": list(self.escalation_triggers),
-            "fallback_collectors": list(self.fallback_collectors),
         }

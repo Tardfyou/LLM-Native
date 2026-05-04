@@ -25,6 +25,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 
+from ..llm.usage import extract_usage_from_response, merge_usages
 from ..prompts import PromptRepository
 from .models import GenerationRequest, GenerationResult
 from .toolkit import GenerationToolkit, GenerationTracker
@@ -79,8 +80,10 @@ class GenerateWorkflowState(TypedDict, total=False):
     latest_failure_title: str
     latest_failure_text: str
     latest_failure_lines: List[int]
+    latest_failure_signature: str
     repeated_failure_count: int
     latest_patch_result: str
+    last_repair_action: str
     raw_plan_text: str
     raw_draft_text: str
     raw_decision_text: str
@@ -88,6 +91,13 @@ class GenerateWorkflowState(TypedDict, total=False):
 
 class LangChainGenerateAgent:
     """简化的 Generate Agent"""
+
+    _PHASE_TEMPERATURES = {
+        "plan": ("generate_plan_temperature", 0.25),
+        "rag_check": ("generate_rag_check_temperature", 0.0),
+        "draft": ("generate_draft_temperature", 0.18),
+        "repair": ("generate_repair_temperature", 0.05),
+    }
 
     def __init__(
         self,
@@ -114,17 +124,30 @@ class LangChainGenerateAgent:
         )
         gate_config = ((self.config.get("quality_gates", {}) or {}).get("artifact_review", {}) or {})
         self.artifact_review_required = bool(gate_config.get("enabled", True))
-        self.model = (
-            llm_override
-            if llm_override is not None
-            else build_langchain_chat_model(
-                config=self.config,
-                temperature_key="generate_temperature",
-                default_temperature=0.15,
-            )
-        )
+        self._phase_temperatures = {
+            phase: self._resolve_phase_temperature(temperature_key, default_temperature)
+            for phase, (temperature_key, default_temperature) in self._PHASE_TEMPERATURES.items()
+        }
+        if llm_override is not None:
+            self._phase_models = {
+                phase: llm_override
+                for phase in self._PHASE_TEMPERATURES
+            }
+        else:
+            self._phase_models = {
+                phase: build_langchain_chat_model(
+                    config=self.config,
+                    temperature_override=self._phase_temperatures[phase],
+                    default_temperature=default_temperature,
+                    generation_config_key="generate",
+                )
+                for phase, (_, default_temperature) in self._PHASE_TEMPERATURES.items()
+            }
+        self.model = self._phase_models["draft"]
+        self._current_llm_usage: List[Dict[str, Any]] = []
 
     def run(self, request: GenerationRequest) -> GenerationResult:
+        self._current_llm_usage = []
         tracker = GenerationTracker(request=request)
         toolkit = GenerationToolkit(
             tool_registry=self.tool_registry,
@@ -169,8 +192,10 @@ class LangChainGenerateAgent:
                     "latest_failure_title": "",
                     "latest_failure_text": "",
                     "latest_failure_lines": [],
+                    "latest_failure_signature": "",
                     "repeated_failure_count": 0,
                     "latest_patch_result": "",
+                    "last_repair_action": "",
                     "raw_plan_text": "",
                     "raw_draft_text": "",
                     "raw_decision_text": "",
@@ -211,12 +236,9 @@ class LangChainGenerateAgent:
                     "final_message": "无法读取补丁内容。",
                     "notes": [self._make_note("bootstrap.read_patch", patch_result.error or "")],
                 }
-            notes = list(state.get("notes", []) or [])
-            if request.extra_context:
-                notes.append(self._make_note("request.extra_context", request.extra_context, limit=2200))
             return {
                 "patch_text": patch_result.output or "",
-                "notes": notes,
+                "notes": list(state.get("notes", []) or []),
                 "route": "analyze_patch",
             }
 
@@ -254,7 +276,7 @@ class LangChainGenerateAgent:
                 analysis_text=str(state.get("analysis_text", "") or ""),
             )
             self._emit_progress("plan_started", iteration=model_turns)
-            raw_text = self._invoke_json_prompt(system_prompt, prompt)
+            raw_text = self._invoke_json_prompt(system_prompt, prompt, phase="plan")
             parsed_plan, parse_error = self._parse_plan(raw_text)
             notes = list(state.get("notes", []) or [])
             if parse_error:
@@ -290,7 +312,7 @@ class LangChainGenerateAgent:
         def search_knowledge(state: GenerateWorkflowState) -> GenerateWorkflowState:
             plan_data = dict(state.get("plan", {}) or {})
             query = str(plan_data.get("knowledge_query", "") or "").strip()
-            result = toolkit.search_knowledge(query=query, top_k=3)
+            result = toolkit.search_knowledge(query=query, top_k=2)
             notes = list(state.get("notes", []) or [])
             if result.success:
                 notes.append(self._make_note(f"search_knowledge:{query}", result.output or "", limit=2600))
@@ -316,7 +338,7 @@ class LangChainGenerateAgent:
                 knowledge_text=str(state.get("knowledge_text", "") or ""),
             )
             self._emit_progress("rag_check_started", iteration=model_turns)
-            raw_text = self._invoke_json_prompt(system_prompt, prompt)
+            raw_text = self._invoke_json_prompt(system_prompt, prompt, phase="rag_check")
             rag_result, parse_error = self._parse_rag_check(raw_text)
             notes = list(state.get("notes", []) or [])
             if parse_error:
@@ -367,7 +389,7 @@ class LangChainGenerateAgent:
                 notes=list(state.get("notes", []) or []),
             )
             self._emit_progress("draft_started", iteration=model_turns, checker_name=checker_name)
-            raw_text = self._invoke_json_prompt(system_prompt, prompt)
+            raw_text = self._invoke_json_prompt(system_prompt, prompt, phase="draft")
             draft_payload, parse_error = self._parse_draft(raw_text)
             notes = list(state.get("notes", []) or [])
             if parse_error:
@@ -447,6 +469,32 @@ class LangChainGenerateAgent:
                 "notes": notes,
             }
 
+        def validation_failure(
+            state: GenerateWorkflowState,
+            *,
+            title: str,
+            text: str,
+            artifact_text: str,
+            notes: List[str],
+        ) -> GenerateWorkflowState:
+            failure_update = self._failure_state_update(state, title=title, text=text)
+            self._emit_progress(
+                "validation_failure",
+                iteration=int(state.get("model_turns", 0) or 0),
+                title=title,
+                artifact_path=str(state.get("artifact_path", "") or ""),
+                repeated_failure_count=failure_update.get("repeated_failure_count", 0),
+                failure_signature=failure_update.get("latest_failure_signature", ""),
+                failure_lines=failure_update.get("latest_failure_lines", []),
+                preview=self._failure_preview(text, limit=1200),
+            )
+            return {
+                "route": "repair_decide",
+                "artifact_text": artifact_text,
+                "notes": notes,
+                **failure_update,
+            }
+
         def validate(state: GenerateWorkflowState) -> GenerateWorkflowState:
             notes = list(state.get("notes", []) or [])
             artifact_path = str(state.get("artifact_path", "") or "").strip()
@@ -482,17 +530,13 @@ class LangChainGenerateAgent:
                 )
                 notes.append(self._make_note("validate.lsp_validate", lsp_result.output or lsp_result.error or "", limit=2200))
                 if not lsp_result.success:
-                    failure_update = self._failure_state_update(
+                    return validation_failure(
                         state,
                         title="validate.lsp_validate",
                         text=lsp_result.output or lsp_result.error or "",
+                        artifact_text=artifact_text,
+                        notes=notes,
                     )
-                    return {
-                        "route": "repair_decide",
-                        "artifact_text": artifact_text,
-                        "notes": notes,
-                        **failure_update,
-                    }
 
                 if self.artifact_review_required:
                     review_result = toolkit.review_artifact(
@@ -503,17 +547,13 @@ class LangChainGenerateAgent:
                     )
                     notes.append(self._make_note("validate.review_artifact", review_result.output or review_result.error or "", limit=2200))
                     if not review_result.success:
-                        failure_update = self._failure_state_update(
+                        return validation_failure(
                             state,
                             title="validate.review_artifact",
                             text=review_result.output or review_result.error or "",
+                            artifact_text=artifact_text,
+                            notes=notes,
                         )
-                        return {
-                            "route": "repair_decide",
-                            "artifact_text": artifact_text,
-                            "notes": notes,
-                            **failure_update,
-                        }
 
                 compile_result = toolkit.compile_artifact(
                     artifact_path=artifact_path,
@@ -521,17 +561,13 @@ class LangChainGenerateAgent:
                 )
                 notes.append(self._make_note("validate.compile_artifact", compile_result.output or compile_result.error or "", limit=2200))
                 if not compile_result.success:
-                    failure_update = self._failure_state_update(
+                    return validation_failure(
                         state,
                         title="validate.compile_artifact",
                         text=compile_result.output or compile_result.error or "",
+                        artifact_text=artifact_text,
+                        notes=notes,
                     )
-                    return {
-                        "route": "repair_decide",
-                        "artifact_text": artifact_text,
-                        "notes": notes,
-                        **failure_update,
-                    }
             else:
                 # CodeQL: Review -> Analyze
                 if self.artifact_review_required:
@@ -543,32 +579,24 @@ class LangChainGenerateAgent:
                     )
                     notes.append(self._make_note("validate.review_artifact", review_result.output or review_result.error or "", limit=2200))
                     if not review_result.success:
-                        failure_update = self._failure_state_update(
+                        return validation_failure(
                             state,
                             title="validate.review_artifact",
                             text=review_result.output or review_result.error or "",
+                            artifact_text=artifact_text,
+                            notes=notes,
                         )
-                        return {
-                            "route": "repair_decide",
-                            "artifact_text": artifact_text,
-                            "notes": notes,
-                            **failure_update,
-                        }
 
                 analyze_result = toolkit.analyze_artifact(artifact_path=artifact_path)
                 notes.append(self._make_note("validate.codeql_analyze", analyze_result.output or analyze_result.error or "", limit=2200))
                 if not analyze_result.success:
-                    failure_update = self._failure_state_update(
+                    return validation_failure(
                         state,
                         title="validate.codeql_analyze",
                         text=analyze_result.output or analyze_result.error or "",
+                        artifact_text=artifact_text,
+                        notes=notes,
                     )
-                    return {
-                        "route": "repair_decide",
-                        "artifact_text": artifact_text,
-                        "notes": notes,
-                        **failure_update,
-                    }
 
             return {
                 "route": "finish",
@@ -583,6 +611,18 @@ class LangChainGenerateAgent:
 
             # 检测重复失败循环：同一错误重复3次以上，终止
             if repeated_failure_count >= 3:
+                self._emit_progress(
+                    "repair_loop_stopped",
+                    iteration=model_turns - 1,
+                    reason="repeated_failure",
+                    repeated_failure_count=repeated_failure_count,
+                    latest_failure_title=str(state.get("latest_failure_title", "") or ""),
+                    latest_failure_signature=str(state.get("latest_failure_signature", "") or ""),
+                    latest_failure_preview=self._failure_preview(str(state.get("latest_failure_text", "") or ""), limit=1200),
+                    artifact_path=str(state.get("artifact_path", "") or ""),
+                    last_repair_action=str(state.get("last_repair_action", "") or ""),
+                    latest_patch_result=str(state.get("latest_patch_result", "") or ""),
+                )
                 return {
                     "route": "finish",
                     "model_turns": model_turns - 1,
@@ -600,18 +640,29 @@ class LangChainGenerateAgent:
 
             prompt = self._render_repair_prompt(
                 task_prompt=task_prompt,
-                request=request,
                 checker_name=str(state.get("checker_name", "") or ""),
                 artifact_path=str(state.get("artifact_path", "") or ""),
                 artifact_text=str(state.get("artifact_text", "") or ""),
-                patch_text=str(state.get("patch_text", "") or ""),
                 latest_failure_title=str(state.get("latest_failure_title", "") or ""),
                 latest_failure_text=str(state.get("latest_failure_text", "") or ""),
             )
-            self._emit_progress("repair_decision_started", iteration=model_turns)
-            raw_text = self._invoke_json_prompt(system_prompt, prompt)
+            self._emit_progress(
+                "repair_decision_started",
+                iteration=model_turns,
+                repeated_failure_count=repeated_failure_count,
+                latest_failure_title=str(state.get("latest_failure_title", "") or ""),
+                latest_failure_signature=str(state.get("latest_failure_signature", "") or ""),
+                latest_failure_preview=self._failure_preview(str(state.get("latest_failure_text", "") or ""), limit=1000),
+            )
+            raw_text = self._invoke_json_prompt(system_prompt, prompt, phase="repair")
             decision, parse_error = self._parse_decision(raw_text)
             if parse_error:
+                self._emit_progress(
+                    "decision_parse_failed",
+                    iteration=model_turns,
+                    error=parse_error,
+                    raw_preview=(raw_text or "")[:1000],
+                )
                 return {
                     "route": "finish",
                     "model_turns": model_turns,
@@ -626,12 +677,15 @@ class LangChainGenerateAgent:
                 iteration=model_turns,
                 action=decision.get("action", ""),
                 summary=decision.get("summary", ""),
+                edits_count=len(list(decision.get("edits", []) or [])),
+                latest_failure_signature=str(state.get("latest_failure_signature", "") or ""),
             )
             return {
                 "route": self._route_from_decision(decision),
                 "model_turns": model_turns,
                 "decision": decision,
                 "raw_decision_text": raw_text[:2000],
+                "last_repair_action": str(decision.get("action", "") or "").strip(),
                 "final_message": str(decision.get("summary", "") or "").strip(),
             }
 
@@ -660,6 +714,12 @@ class LangChainGenerateAgent:
             )
             if synthesized["error"]:
                 notes.append(self._make_note("repair.exact_edits", str(synthesized["error"]), limit=1800))
+                self._emit_progress(
+                    "repair_apply_failed",
+                    stage="exact_edits",
+                    error=str(synthesized["error"]),
+                    artifact_path=artifact_path,
+                )
                 return {
                     "route": "repair_decide",
                     "notes": notes,
@@ -678,6 +738,12 @@ class LangChainGenerateAgent:
                 )
                 notes.append(self._make_note("repair.preflight_lsp", lsp_result.output or lsp_result.error or "", limit=2200))
                 if not lsp_result.success:
+                    self._emit_progress(
+                        "repair_apply_failed",
+                        stage="preflight_lsp",
+                        error=self._failure_preview(lsp_result.output or lsp_result.error or "", limit=1000),
+                        artifact_path=artifact_path,
+                    )
                     return {
                         "route": "repair_decide",
                         "notes": notes,
@@ -690,11 +756,22 @@ class LangChainGenerateAgent:
             notes.append(self._make_note("repair.write_artifact", write_result.output or write_result.error or "", limit=2200))
 
             if not write_result.success:
+                self._emit_progress(
+                    "repair_apply_failed",
+                    stage="write_artifact",
+                    error=self._failure_preview(write_result.output or write_result.error or "", limit=1000),
+                    artifact_path=artifact_path,
+                )
                 return {
                     "route": "repair_decide",
                     "notes": notes,
                     "latest_patch_result": write_result.output or write_result.error or "",
                 }
+            self._emit_progress(
+                "repair_applied",
+                artifact_path=artifact_path,
+                patch_preview=patch[:1000],
+            )
             return {
                 "route": "validate",
                 "artifact_text": resulting_content,
@@ -833,6 +910,8 @@ class LangChainGenerateAgent:
                 "plan": dict(final_state.get("plan", {}) or {}),
                 "rag_match": bool(final_state.get("rag_match", False)),
                 "rag_check_result": str(final_state.get("rag_check_result", "") or ""),
+                "llm_usage": self._summarize_llm_usage(),
+                "llm_usage_by_phase": self._llm_usage_by_phase(),
             },
         )
         self._emit_progress(
@@ -867,7 +946,6 @@ class LangChainGenerateAgent:
                 "VALIDATE_PATH": request.validate_path or "未提供",
                 "MAX_ITERATIONS": int(request.max_iterations or self.max_iterations),
                 "ANALYZER_POLICY": self._render_analyzer_policy(request.analyzer),
-                "EXTRA_CONTEXT": request.extra_context or "无额外上下文",
             },
             strict=True,
         )
@@ -907,6 +985,11 @@ class LangChainGenerateAgent:
         rag_check_result: str,
         notes: List[str],
     ) -> str:
+        draft_knowledge_text = (
+            knowledge_text or "无检索结果"
+            if rag_match
+            else "RAG 未通过，已省略检索结果，避免把不相关骨架注入首稿上下文。"
+        )
         return self.prompt_repository.render(
             "generate.agent.draft",
             {
@@ -915,7 +998,7 @@ class LangChainGenerateAgent:
                 "ARTIFACT_PATH": artifact_path,
                 "PATCH_TEXT": patch_text,
                 "ANALYSIS_TEXT": analysis_text,
-                "KNOWLEDGE_TEXT": knowledge_text or "无检索结果",
+                "KNOWLEDGE_TEXT": draft_knowledge_text,
                 "RAG_MATCH": "符合" if rag_match else "不符合",
                 "RAG_CHECK_RESULT": rag_check_result,
                 "REFERENCE_SKELETON": self._render_reference_skeleton(request.analyzer),
@@ -927,11 +1010,9 @@ class LangChainGenerateAgent:
     def _render_repair_prompt(
         self,
         task_prompt: str,
-        request: GenerationRequest,
         checker_name: str,
         artifact_path: str,
         artifact_text: str,
-        patch_text: str,
         latest_failure_title: str,
         latest_failure_text: str,
     ) -> str:
@@ -942,7 +1023,6 @@ class LangChainGenerateAgent:
                 "CHECKER_NAME": checker_name,
                 "ARTIFACT_PATH": artifact_path,
                 "ARTIFACT_TEXT": artifact_text,
-                "PATCH_TEXT": patch_text,
                 "LATEST_FAILURE_TITLE": latest_failure_title or "无",
                 "LATEST_FAILURE_TEXT": latest_failure_text or "无",
             },
@@ -957,12 +1037,14 @@ class LangChainGenerateAgent:
         prompt_id = "generate.agent.reference.csa" if str(analyzer or "").strip().lower() == "csa" else "generate.agent.reference.codeql"
         return self.prompt_repository.render(prompt_id, {}, strict=True)
 
-    def _invoke_json_prompt(self, system_prompt: str, prompt: str) -> str:
+    def _invoke_json_prompt(self, system_prompt: str, prompt: str, *, phase: str) -> str:
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=prompt),
         ]
-        model = self.model
+        model = self._phase_models.get(phase, self.model)
+        phase_temperature = self._phase_temperatures.get(phase)
+        model_name = self._resolve_model_name(model)
         bound = None
         if hasattr(model, "bind"):
             try:
@@ -971,18 +1053,92 @@ class LangChainGenerateAgent:
                 bound = None
         if bound is not None and hasattr(bound, "invoke"):
             try:
-                return self._extract_raw_response_text(bound.invoke(messages))
+                return self._invoke_with_usage(
+                    invoker=bound,
+                    messages=messages,
+                    phase=phase,
+                    model_name=model_name,
+                )
             except Exception as exc:
                 self._emit_progress("model_bind_fallback", error=str(exc))
 
         if hasattr(model, "invoke"):
-            return self._extract_raw_response_text(model.invoke(messages))
+            return self._invoke_with_usage(
+                invoker=model,
+                messages=messages,
+                phase=phase,
+                model_name=model_name,
+            )
 
         if hasattr(model, "generate"):
+            self._emit_progress("agent_think_started", phase=phase, model=model_name)
+            self._emit_progress("agent_llm_call_started", phase=phase, model=model_name)
             prompt_text = f"{system_prompt}\n\n{prompt}"
-            return str(model.generate(prompt_text) or "")
+            content = str(model.generate(prompt_text, temperature=phase_temperature) or "")
+            usage = {}
+            if hasattr(model, "get_last_usage"):
+                try:
+                    usage = dict(model.get_last_usage() or {})
+                except Exception:
+                    usage = {}
+            self._record_llm_usage(phase=phase, usage=usage)
+            self._emit_progress("agent_llm_call_completed", phase=phase, model=model_name, llm_usage=usage)
+            self._emit_progress("agent_think_completed", phase=phase, model=model_name, llm_usage=usage)
+            return content
 
         raise TypeError("generate agent 的 llm_override 不支持 bind/invoke/generate 接口。")
+
+    def _invoke_with_usage(
+        self,
+        invoker: Any,
+        messages: List[Any],
+        *,
+        phase: str,
+        model_name: str,
+    ) -> str:
+        self._emit_progress("agent_think_started", phase=phase, model=model_name)
+        self._emit_progress("agent_llm_call_started", phase=phase, model=model_name)
+        response = invoker.invoke(messages)
+        usage = extract_usage_from_response(response, fallback_model=model_name)
+        self._record_llm_usage(phase=phase, usage=usage)
+        self._emit_progress("agent_llm_call_completed", phase=phase, model=model_name, llm_usage=usage)
+        self._emit_progress("agent_think_completed", phase=phase, model=model_name, llm_usage=usage)
+        return self._extract_raw_response_text(response)
+
+    def _record_llm_usage(self, *, phase: str, usage: Dict[str, Any]):
+        normalized = dict(usage or {})
+        normalized["phase"] = phase
+        self._current_llm_usage.append(normalized)
+
+    def _summarize_llm_usage(self) -> Dict[str, Any]:
+        usage = merge_usages(self._current_llm_usage)
+        usage["phases"] = len({str(item.get("phase", "") or "").strip() for item in self._current_llm_usage if str(item.get("phase", "") or "").strip()})
+        return usage
+
+    def _llm_usage_by_phase(self) -> Dict[str, Any]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for item in self._current_llm_usage:
+            phase = str(item.get("phase", "") or "unknown").strip() or "unknown"
+            grouped.setdefault(phase, []).append(item)
+        return {phase: merge_usages(items) for phase, items in grouped.items()}
+
+    def _resolve_model_name(self, model: Any) -> str:
+        for attr in ("model_name", "model", "primary_model"):
+            token = str(getattr(model, attr, "") or "").strip()
+            if token:
+                return token
+        return ""
+
+    def _resolve_phase_temperature(self, temperature_key: str, default_temperature: float) -> float:
+        agent_config = self.config.get("agent", {}) if isinstance(self.config.get("agent", {}), dict) else {}
+        temperature = agent_config.get(temperature_key)
+        if temperature is None:
+            temperature = agent_config.get("generate_temperature")
+        if temperature is None:
+            temperature = agent_config.get("temperature")
+        if temperature is None:
+            temperature = default_temperature
+        return float(temperature)
 
     def _extract_raw_response_text(self, response: Any) -> str:
         if response is None:
@@ -1250,19 +1406,56 @@ class LangChainGenerateAgent:
     ) -> Dict[str, Any]:
         failure_text = str(text or "").strip()
         failure_lines = self._extract_failure_lines(failure_text)
-        previous_key = str(state.get("latest_failure_title", "") or "")
+        failure_signature = self._failure_signature(title, failure_text)
+        previous_key = str(state.get("latest_failure_signature", "") or "")
         repeated_failure_count = int(state.get("repeated_failure_count", 0) or 0)
-        if title and title == previous_key:
+        if failure_signature and failure_signature == previous_key:
             repeated_failure_count += 1
         else:
-            repeated_failure_count = 1 if title else 0
+            repeated_failure_count = 1 if failure_signature else 0
 
         return {
             "latest_failure_title": title,
             "latest_failure_text": failure_text,
             "latest_failure_lines": failure_lines,
+            "latest_failure_signature": failure_signature,
             "repeated_failure_count": repeated_failure_count,
         }
+
+    def _failure_signature(self, title: str, text: str) -> str:
+        cleaned = self._strip_ansi(str(text or ""))
+        interesting: List[str] = []
+        for raw_line in cleaned.splitlines():
+            line = " ".join(raw_line.strip().split())
+            if not line:
+                continue
+            lower = line.lower()
+            if (
+                "error" in lower
+                or "fatal" in lower
+                or "could not resolve" in lower
+                or "failed" in lower
+                or "失败" in line
+                or "无法" in line
+            ):
+                interesting.append(line)
+            if len(interesting) >= 3:
+                break
+        if not interesting:
+            interesting = [" ".join(cleaned.strip().split())[:500]]
+        joined = " | ".join(interesting)
+        joined = re.sub(r"/(?:[^/\s]+/){2,}[^:\s]+", "<path>", joined)
+        joined = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", joined, flags=re.IGNORECASE)
+        joined = re.sub(r"\s+", " ", joined).strip()
+        return f"{title}:{joined[:700]}" if title else joined[:700]
+
+    def _failure_preview(self, text: str, limit: int = 1000) -> str:
+        cleaned = self._strip_ansi(str(text or "")).strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned[:limit] + ("\n...[truncated]" if len(cleaned) > limit else "")
+
+    def _strip_ansi(self, text: str) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", str(text or ""))
 
     def _extract_failure_lines(self, text: str) -> List[int]:
         patterns = [

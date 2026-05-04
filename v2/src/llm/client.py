@@ -1,5 +1,5 @@
 """
-LLM客户端 - 支持多 Provider (DeepSeek / XTY中转站)
+LLM客户端 - 支持多 Provider (DeepSeek / XTY中转站 / PackyAPI)
 
 提供统一的LLM调用接口，支持:
 - 文本生成
@@ -13,24 +13,16 @@ import os
 import time
 from typing import Optional, List, Dict, Any, Callable
 
-from openai import OpenAI
 import httpx
 from loguru import logger
+from openai import OpenAI
 
-
-# Provider 配置 (不含密钥，密钥在配置文件中)
-PROVIDER_CONFIGS = {
-    "deepseek": {
-        "base_url": "https://api.deepseek.com",
-        "env_key": "DEEPSEEK_API_KEY",
-        "default_model": "deepseek-chat",
-    },
-    "xty": {
-        "base_url": "https://api.xty.app",
-        "env_key": "XTY_API_KEY",
-        "default_model": "gpt-3.5-turbo",
-    },
-}
+from .packy_stream import (
+    collect_packy_text_and_tools_response,
+    collect_packy_text_response,
+)
+from .provider_config import PROVIDER_CONFIGS, resolve_provider_name
+from .usage import empty_usage, extract_usage_from_response, normalize_usage
 
 
 class LLMClient:
@@ -47,9 +39,7 @@ class LLMClient:
         self.log_calls = bool(config.get("log_calls", True))
 
         # 确定 provider
-        self.provider = str(config.get("provider", "deepseek") or "deepseek").strip().lower()
-        if self.provider not in PROVIDER_CONFIGS:
-            self.provider = "deepseek"
+        self.provider = resolve_provider_name(config.get("provider", "deepseek"))
 
         provider_info = PROVIDER_CONFIGS[self.provider]
 
@@ -71,8 +61,12 @@ class LLMClient:
 
         # Base URL
         base_urls = config.get("base_urls", {})
-        default_base_url = provider_info.get("base_url", "")
+        default_base_url = str(provider_info.get("base_url", "") or "").strip()
         base_url = str(base_urls.get(self.provider, default_base_url) or default_base_url).strip()
+        self.base_url = base_url
+        self.api_key = api_key
+        self.force_stream_text = bool(provider_info.get("force_stream_text", False))
+        self.force_stream_tools = bool(provider_info.get("force_stream_tools", False))
 
         # 初始化OpenAI兼容客户端
         client_kwargs = {
@@ -89,12 +83,19 @@ class LLMClient:
 
         self.client = OpenAI(**client_kwargs)
 
-        # 生成参数
+        # 生成系统默认参数。优先读取 llm.generate.*，再回退到旧的 llm.generation.*。
         gen_config = config.get("generation", {})
+        generate_config = config.get("generate", {})
+        if not isinstance(gen_config, dict):
+            gen_config = {}
+        if not isinstance(generate_config, dict):
+            generate_config = {}
         self.temperature = gen_config.get("temperature", 0.7)
-        self.max_tokens = gen_config.get("max_tokens", 8192)
+        self.max_tokens = generate_config.get("max_tokens", gen_config.get("max_tokens", 16384))
         self.timeout = gen_config.get("timeout", 120)
         self.max_retries = gen_config.get("max_retries", 3)
+        self.stream = bool(gen_config.get("stream", True))
+        self._last_usage: Dict[str, Any] = empty_usage()
 
         if self.log_calls:
             logger.info(f"LLM客户端初始化完成: provider={self.provider}, model={self.primary_model}")
@@ -125,15 +126,22 @@ class LLMClient:
                 if self.log_calls:
                     logger.info(f"LLM调用: model={self.primary_model}, temp={temp}, tokens={tokens}")
 
-                response = self.client.chat.completions.create(
-                    model=self.primary_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temp,
-                    max_tokens=tokens,
-                    timeout=self.timeout
-                )
-
-                answer = response.choices[0].message.content
+                if self.stream or self.force_stream_text:
+                    answer = self._stream_generate(
+                        prompt=prompt,
+                        temperature=temp,
+                        max_tokens=tokens,
+                    )
+                else:
+                    response = self.client.chat.completions.create(
+                        model=self.primary_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=temp,
+                        max_tokens=tokens,
+                        timeout=self.timeout
+                    )
+                    self._last_usage = extract_usage_from_response(response, fallback_model=self.primary_model)
+                    answer = response.choices[0].message.content or ""
                 if self.log_calls:
                     logger.info(f"LLM响应: {len(answer)} 字符")
                 return answer
@@ -147,6 +155,51 @@ class LLMClient:
 
         logger.error("LLM调用最终失败")
         return None
+
+    def _stream_generate(
+        self,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        """以流式方式生成纯文本响应，减少大响应阻塞。"""
+        if self.provider == "packyapi":
+            response = collect_packy_text_response(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                model=self.primary_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=float(self.timeout),
+            )
+            self._last_usage = normalize_usage(response.get("llm_usage", {}), model=self.primary_model)
+            return str(response.get("content", "") or "")
+
+        response = self.client.chat.completions.create(
+            model=self.primary_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            timeout=self.timeout,
+        )
+
+        content_parts: List[str] = []
+        last_usage = empty_usage()
+        for chunk in response:
+            usage = extract_usage_from_response(chunk, fallback_model=self.primary_model)
+            if usage["available"]:
+                last_usage = usage
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            text = getattr(delta, "content", None) if delta is not None else None
+            if text:
+                content_parts.append(text)
+        self._last_usage = last_usage
+        return "".join(content_parts)
 
     def chat_with_tools(
         self,
@@ -179,7 +232,7 @@ class LLMClient:
                 if self.log_calls:
                     logger.info(f"LLM调用(工具): model={self.primary_model}, tools={len(tools)}, stream={stream}")
 
-                if stream:
+                if stream or self.force_stream_tools:
                     return self._stream_chat_with_tools(
                         messages, tools, temp, tokens, on_chunk
                     )
@@ -215,6 +268,24 @@ class LLMClient:
         on_chunk: Callable[[str], None] = None
     ) -> Dict[str, Any]:
         """流式输出"""
+        if self.provider == "packyapi":
+            response = collect_packy_text_and_tools_response(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                model=self.primary_model,
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=float(self.timeout),
+                on_chunk=on_chunk,
+            )
+            self._last_usage = normalize_usage(response.get("llm_usage", {}), model=self.primary_model)
+            return {
+                "content": response.get("content", ""),
+                "tool_calls": response.get("tool_calls", []),
+            }
+
         response = self.client.chat.completions.create(
             model=self.primary_model,
             messages=messages,
@@ -228,8 +299,12 @@ class LLMClient:
 
         content = ""
         tool_calls_data: Dict[int, Dict[str, Any]] = {}
+        last_usage = empty_usage()
 
         for chunk in response:
+            usage = extract_usage_from_response(chunk, fallback_model=self.primary_model)
+            if usage["available"]:
+                last_usage = usage
             delta = chunk.choices[0].delta
 
             # 内容输出
@@ -271,6 +346,7 @@ class LLMClient:
                 "arguments": args
             })
 
+        self._last_usage = last_usage
         return {
             "content": content,
             "tool_calls": tool_calls
@@ -278,6 +354,7 @@ class LLMClient:
 
     def _parse_tool_response(self, response) -> Dict[str, Any]:
         """解析工具调用响应"""
+        self._last_usage = extract_usage_from_response(response, fallback_model=self.primary_model)
         message = response.choices[0].message
 
         tool_calls = []
@@ -298,6 +375,9 @@ class LLMClient:
             "content": message.content or "",
             "tool_calls": tool_calls
         }
+
+    def get_last_usage(self) -> Dict[str, Any]:
+        return normalize_usage(self._last_usage, model=self.primary_model)
 
 
 # 全局客户端实例

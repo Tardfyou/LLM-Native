@@ -10,7 +10,6 @@ class GenerationRequest:
     patch_path: str
     work_dir: str
     validate_path: str = ""
-    extra_context: str = ""
     max_iterations: int = 12
 
 

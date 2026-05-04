@@ -87,20 +87,6 @@ class PromptRepository:
             rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
         return rendered
 
-    def load_legacy_text(self, filename: str) -> Optional[str]:
-        for prompt_dir in self._prompt_dirs:
-            prompt_path = prompt_dir / filename
-            if prompt_path.exists():
-                return prompt_path.read_text(encoding="utf-8")
-        return None
-
-    def load_legacy_yaml(self, filename: str) -> Optional[Dict[str, Any]]:
-        content = self.load_legacy_text(filename)
-        if content is None:
-            return None
-        data = yaml.safe_load(content)
-        return data if isinstance(data, dict) else None
-
     def _load_manifest(self) -> tuple[Optional[Path], Dict[str, PromptDefinition]]:
         for prompt_dir in self._prompt_dirs:
             manifest_path = prompt_dir / self.MANIFEST_NAME

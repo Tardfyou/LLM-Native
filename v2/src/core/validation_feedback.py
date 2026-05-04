@@ -17,7 +17,6 @@ from .evidence_schema import (
     EvidenceRecord,
     EvidenceScope,
 )
-from .evidence_types import EvidenceType
 
 
 class ValidationFeedbackBuilder:
@@ -38,7 +37,7 @@ class ValidationFeedbackBuilder:
             records.append(
                 EvidenceRecord(
                     evidence_id=f"{analyzer_id}_semantic_overall",
-                    type=EvidenceType.VALIDATION_OUTCOME.value,
+                    type="validation_outcome",
                     analyzer=analyzer_id,
                     scope=EvidenceScope(repo=repo_name, file=target_name, function="semantic_validation"),
                     location=EvidenceLocation(),

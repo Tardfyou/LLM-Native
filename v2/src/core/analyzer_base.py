@@ -55,6 +55,8 @@ class AnalyzerContext:
     patch_path: str
     output_dir: str
     validate_path: Optional[str] = None
+    evidence_dir: Optional[str] = None
+    evidence_bundle_raw: Dict[str, Any] = field(default_factory=dict)
     shared_analysis: Dict[str, Any] = field(default_factory=dict)
     work_dir: str = ""
 
@@ -308,219 +310,6 @@ class BaseAnalyzer(ABC):
         os.makedirs(work_dir, exist_ok=True)
         return work_dir
 
-    def _build_extra_context(
-        self,
-        shared_analysis: Dict[str, Any]
-    ) -> str:
-        """
-        构建额外上下文字符串
-
-        Args:
-            shared_analysis: 共享补丁分析结果
-
-        Returns:
-            格式化的上下文字符串
-        """
-        if not shared_analysis:
-            return ""
-
-        lines = ["## 共享补丁分析结果（仅供交叉检查，不代替本分析器自己的 `analyze_patch` 推导）"]
-
-        # 漏洞模式
-        patterns = shared_analysis.get("vulnerability_patterns", [])
-        if patterns:
-            pattern_strs = []
-            for item in patterns[:5]:
-                if isinstance(item, dict):
-                    pattern_strs.append(item.get("type", str(item)))
-                else:
-                    pattern_strs.append(str(item))
-            if pattern_strs:
-                lines.append(f"- 漏洞模式: {', '.join(pattern_strs)}")
-
-        # 建议名称
-        checker_name = shared_analysis.get("checker_name_suggestion")
-        if checker_name:
-            lines.append(f"- 建议名称: {checker_name}")
-
-        # 检测策略
-        strategy = shared_analysis.get("detection_strategy")
-        if strategy:
-            import json
-            if isinstance(strategy, str):
-                lines.append(f"- 检测策略: {strategy}")
-            else:
-                lines.append(f"- 检测策略: {json.dumps(strategy, ensure_ascii=False)}")
-
-        # 关键函数
-        key_funcs = shared_analysis.get("key_functions", [])
-        if key_funcs:
-            lines.append(f"- 关键函数: {', '.join(map(str, key_funcs[:8]))}")
-
-        # 影响函数
-        affected_funcs = shared_analysis.get("affected_functions", [])
-        if affected_funcs:
-            lines.append(f"- 影响函数: {', '.join(map(str, affected_funcs[:8]))}")
-
-        file_details = shared_analysis.get("file_details", []) or []
-        if file_details:
-            focus_files = [
-                str(item.get("path", "")).strip()
-                for item in file_details[:6]
-                if isinstance(item, dict) and str(item.get("path", "")).strip()
-            ]
-            if focus_files:
-                lines.append(f"- 补丁触及文件: {', '.join(focus_files)}")
-
-        patchweaver = shared_analysis.get("patchweaver", {})
-        if patchweaver:
-            lines.append("")
-            lines.append("## PATCHWEAVER 计划")
-
-            summary = patchweaver.get("summary")
-            if summary:
-                lines.append(f"- 机制摘要: {summary}")
-
-            evidence_plan = patchweaver.get("evidence_plan", {}) or {}
-            recommended = evidence_plan.get("recommended_analyzers", []) or []
-            if recommended:
-                lines.append(f"- 推荐分析器: {', '.join(map(str, recommended[:4]))}")
-            if evidence_plan.get("uncertainty_budget"):
-                lines.append(f"- 不确定性预算: {evidence_plan.get('uncertainty_budget')}")
-            escalation_triggers = evidence_plan.get("escalation_triggers", []) or []
-            if escalation_triggers:
-                lines.append(f"- 升级触发器: {', '.join(map(str, escalation_triggers[:5]))}")
-
-            requirements = evidence_plan.get("requirements", []) or []
-            if requirements:
-                planned_types = [item.get("evidence_type", "") for item in requirements[:6] if item.get("evidence_type")]
-                if planned_types:
-                    lines.append(f"- 计划证据: {', '.join(planned_types)}")
-
-                current_analyzer = normalize_analyzer_id(self.analyzer_type)
-                current_focus = [
-                    item.get("evidence_type", "")
-                    for item in requirements
-                    if current_analyzer in (item.get("preferred_analyzers", []) or [])
-                ]
-                if current_focus:
-                    lines.append(f"- 当前分析器重点证据: {', '.join(current_focus[:5])}")
-
-            graph = patchweaver.get("mechanism_graph", {}) or {}
-            primary_patterns = graph.get("primary_patterns", []) or []
-            if primary_patterns:
-                lines.append(f"- VMG 模式: {', '.join(map(str, primary_patterns[:4]))}")
-
-            patch_facts = patchweaver.get("patch_facts", []) or []
-            for fact in patch_facts:
-                if not isinstance(fact, dict):
-                    continue
-                fact_type = str(fact.get("fact_type", "")).strip()
-                attributes = fact.get("attributes", {}) or {}
-                if fact_type == "fix_patterns":
-                    patterns = [str(item).strip() for item in (attributes.get("patterns", []) or []) if str(item).strip()]
-                    if patterns:
-                        lines.append(f"- 修复模式: {', '.join(patterns[:6])}")
-                elif fact_type == "added_guards":
-                    guards = [str(item).strip() for item in (attributes.get("guards", []) or []) if str(item).strip()]
-                    if guards:
-                        lines.append(f"- 补丁新增 Guard: {', '.join(guards[:4])}")
-                elif fact_type == "removed_risky_operations":
-                    operations = [str(item).strip() for item in (attributes.get("operations", []) or []) if str(item).strip()]
-                    if operations:
-                        lines.append(f"- 补丁移除风险操作: {', '.join(operations[:4])}")
-                elif fact_type == "added_api_calls":
-                    apis = [str(item).strip() for item in (attributes.get("apis", []) or []) if str(item).strip()]
-                    if apis:
-                        lines.append(f"- 补丁新增 API: {', '.join(apis[:8])}")
-                elif fact_type == "patch_intent":
-                    summary = str(attributes.get("summary", "") or "").strip()
-                    if summary:
-                        lines.append(f"- 补丁意图: {summary}")
-                elif fact_type == "external_references":
-                    refs: List[str] = []
-                    refs.extend([str(item).strip() for item in (attributes.get("cves", []) or []) if str(item).strip()])
-                    refs.extend([str(item).strip() for item in (attributes.get("cwes", []) or []) if str(item).strip()])
-                    refs.extend([str(item).strip() for item in (attributes.get("issues", []) or []) if str(item).strip()])
-                    if refs:
-                        lines.append(f"- 外部参考: {', '.join(refs[:6])}")
-
-            bundle = patchweaver.get("evidence_bundle", {}) or {}
-            missing = [str(item).strip() for item in (bundle.get("missing_evidence", []) or []) if str(item).strip()]
-            if missing:
-                lines.append(f"- 当前缺失证据: {', '.join(missing[:6])}")
-
-            feedback_bundle = patchweaver.get("validation_feedback", {}) or {}
-            failure_modes: List[str] = []
-            for item in (feedback_bundle.get("records", []) or []):
-                if not isinstance(item, dict):
-                    continue
-                payload = item.get("semantic_payload", {}) or {}
-                mode = str(payload.get("failure_mode", "") or "").strip()
-                if mode and mode not in failure_modes:
-                    failure_modes.append(mode)
-            if failure_modes:
-                lines.append(f"- 最近失败模式: {', '.join(failure_modes[:4])}")
-
-            evidence_escalation = patchweaver.get("evidence_escalation", {}) or {}
-            if evidence_escalation.get("requested"):
-                lines.append(f"- 证据升级: {evidence_escalation.get('reason', '')}")
-
-            history = patchweaver.get("validation_feedback_history", []) or []
-            if history:
-                lines.append("- 最近验证反馈历史:")
-                for item in history[-2:]:
-                    if not isinstance(item, dict):
-                        continue
-                    analyzer_id = str(item.get("analyzer", "") or "").strip()
-                    phase = str(item.get("phase", "") or "").strip() or "validation"
-                    summary = str(item.get("summary", "") or "").strip()
-                    if summary:
-                        prefix = f"[{analyzer_id}] " if analyzer_id else ""
-                        lines.append(f"  - {prefix}phase={phase}: {summary}")
-
-            refinement_targets = patchweaver.get("refinement_targets", {}) or {}
-            current_refinement_target = refinement_targets.get(normalize_analyzer_id(self.analyzer_type), {}) or {}
-            refinement_bundles = patchweaver.get("refinement_evidence_bundles", {}) or {}
-            current_refinement_bundle = refinement_bundles.get(normalize_analyzer_id(self.analyzer_type), {}) or {}
-            if current_refinement_target:
-                lines.append("")
-                lines.append("## 精炼目标")
-                baseline_path = str(current_refinement_target.get("artifact_path", "") or "").strip()
-                checker_name = str(current_refinement_target.get("checker_name", "") or "").strip()
-                if checker_name:
-                    lines.append(f"- 当前待精炼产物: {checker_name}")
-                if baseline_path:
-                    lines.append(f"- 产物路径: {baseline_path}")
-                validation_summary = str(current_refinement_target.get("validation_summary", "") or "").strip()
-                if validation_summary:
-                    lines.append(f"- 当前功能验证摘要: {validation_summary}")
-                refinement_summary = str(current_refinement_target.get("refinement_summary", "") or "").strip()
-                if refinement_summary:
-                    lines.append(f"- 精炼提示: {refinement_summary}")
-                records = len((current_refinement_bundle.get("records", []) or [])) if isinstance(current_refinement_bundle, dict) else 0
-                missing = len((current_refinement_bundle.get("missing_evidence", []) or [])) if isinstance(current_refinement_bundle, dict) else 0
-                if records or missing:
-                    lines.append(f"- 已恢复精炼证据: records={records}, missing={missing}")
-                lines.append("- 进入精炼前先把该产物复制到当前 refinement 目录，后续只在这份工作副本上修改、验证和保存。")
-
-        return "\n".join(lines)
-
-    def _build_runtime_path_context(
-        self,
-        context: AnalyzerContext,
-        work_dir: str,
-    ) -> str:
-        """提供运行时路径锚点，避免模型把输出目录误当成源项目。"""
-        lines = ["## 运行路径"]
-        if context.validate_path:
-            lines.append(f"- 验证/源项目路径: {Path(context.validate_path).expanduser().resolve()}")
-        if work_dir:
-            lines.append(f"- 当前分析器输出目录: {Path(work_dir).expanduser().resolve()}")
-        if context.validate_path:
-            lines.append("- 该路径主要用于后续验证，不是当前补丁理解阶段的输入；当前阶段不要通过读取源码或目录来推导补丁机制。")
-        return "\n".join(lines)
-
     def _stage_refinement_artifact(
         self,
         source_path: str,
@@ -595,6 +384,10 @@ class BaseAnalyzer(ABC):
         """恢复精炼阶段注入的历史 evidence bundle。"""
         from ..evidence.normalizer import EvidenceNormalizer
 
+        direct_bundle = context.evidence_bundle_raw if isinstance(context.evidence_bundle_raw, dict) else {}
+        if direct_bundle:
+            return EvidenceNormalizer.from_raw_bundle(direct_bundle)
+
         patchweaver = ((context.shared_analysis or {}).get("patchweaver", {}) or {})
         refinement_bundles = patchweaver.get("refinement_evidence_bundles", {}) or {}
         raw_bundle = refinement_bundles.get(normalize_analyzer_id(self.analyzer_type), {}) or {}
@@ -607,11 +400,9 @@ class BaseAnalyzer(ABC):
         analyzer_id: AnalyzerId,
         analyzer_collector: Any,
     ):
-        """Collect shared, analyzer-specific, and escalated evidence in one place."""
-        from ..evidence.collectors.metadata_intent import MetadataIntentEvidenceCollector
+        """Collect shared patch facts plus analyzer-native evidence."""
         from ..evidence.collectors.patch_semantics import PatchSemanticsCollector
         from ..evidence.normalizer import EvidenceNormalizer
-        from .evidence_escalation import EvidenceEscalationAdvisor
         from .evidence_schema import EvidenceBundle
 
         normalized_analyzer = normalize_analyzer_id(analyzer_id)
@@ -631,26 +422,8 @@ class BaseAnalyzer(ABC):
             patch_bundle,
             analyzer_bundle,
         )
-
-        escalation = EvidenceEscalationAdvisor().evaluate(
-            analyzer_id=normalized_analyzer,
-            shared_analysis=shared_analysis,
-            evidence_bundle=merged_bundle,
-        )
         patchweaver = dict(shared_analysis.get("patchweaver", {}) or {})
-        patchweaver["evidence_escalation"] = escalation
-        shared_analysis["patchweaver"] = patchweaver
-
-        if escalation.get("requested"):
-            metadata_bundle = MetadataIntentEvidenceCollector(normalized_analyzer).collect(context)
-            merged_bundle = EvidenceNormalizer.merge_bundles(merged_bundle, metadata_bundle)
-            escalation["applied_collectors"] = list(escalation.get("collectors", []))
-            escalation["post_slice_metrics"] = EvidenceNormalizer.slice_metrics(
-                merged_bundle,
-                analyzer=normalized_analyzer,
-            )
-
-        patchweaver["evidence_escalation"] = escalation
+        patchweaver["evidence_escalation"] = {}
         patchweaver["evidence_bundle"] = merged_bundle.to_dict()
         shared_analysis["patchweaver"] = patchweaver
         return merged_bundle
@@ -701,99 +474,6 @@ class BaseAnalyzer(ABC):
         if callable(to_prompt_block):
             return to_prompt_block()
         return ""
-
-    def _build_refinement_context(
-        self,
-        artifact: Any,
-        baseline_result: Optional[AnalyzerResult] = None,
-        synthesis_input: Any = None,
-    ) -> str:
-        """Build refine-specific context around an existing artifact."""
-        if artifact is None:
-            return ""
-
-        artifact_path = str(
-            getattr(artifact, "source_path", "")
-            or getattr(artifact, "output_path", "")
-            or ""
-        ).strip()
-        if not artifact_path:
-            return ""
-
-        lines = ["## 精炼目标"]
-        lines.append(f"- mode: refine")
-        lines.append(f"- target_artifact_path: {artifact_path}")
-        lines.append("- refinement_workspace_rule: copy baseline into current refinement directory first, then refine only that copied artifact")
-
-        checker_name = str(getattr(artifact, "checker_name", "") or "").strip()
-        if checker_name:
-            lines.append(f"- target_artifact_name: {checker_name}")
-
-        if baseline_result is not None:
-            lines.append(f"- baseline_generation_success: {bool(getattr(baseline_result, 'success', False))}")
-            validation_summary = ""
-            validation_result = getattr(baseline_result, "validation_result", None)
-            if validation_result is not None:
-                if bool(getattr(validation_result, "success", False)):
-                    diagnostics = len(getattr(validation_result, "diagnostics", []) or [])
-                    validation_summary = f"validation_ok diagnostics={diagnostics}"
-                else:
-                    validation_summary = str(getattr(validation_result, "error_message", "") or "").strip() or "validation_failed"
-            if validation_summary:
-                lines.append(f"- baseline_validation: {validation_summary}")
-
-        report_entry = getattr(artifact, "report_entry", {}) or {}
-        feedback_summary = str(report_entry.get("validation_feedback_summary", "") or "").strip()
-        if feedback_summary:
-            lines.append("- baseline_feedback_summary:")
-            for item in feedback_summary.splitlines()[:6]:
-                cleaned = item.strip()
-                if cleaned:
-                    lines.append(f"  {cleaned}")
-
-        evidence_summary = str(report_entry.get("post_validation_evidence_summary", "") or report_entry.get("evidence_summary", "") or "").strip()
-        if evidence_summary:
-            lines.append("- baseline_evidence_summary:")
-            for item in evidence_summary.splitlines()[:8]:
-                cleaned = item.strip()
-                if cleaned:
-                    lines.append(f"  {cleaned}")
-
-        baseline_review = self._review_baseline_artifact(
-            artifact_path=artifact_path,
-            analyzer_id=self.analyzer_type,
-        )
-        if baseline_review is not None and not bool(getattr(baseline_review, "success", False)):
-            findings = list((getattr(baseline_review, "metadata", {}) or {}).get("findings", []) or [])
-            error_message = str(getattr(baseline_review, "error", "") or "").strip()
-            if findings or error_message:
-                lines.append("## 基线结构审查失败点")
-                if error_message:
-                    lines.append(f"- review_error: {error_message}")
-                for item in findings[:6]:
-                    cleaned = str(item).strip()
-                    if cleaned:
-                        lines.append(f"- {cleaned}")
-                lines.append("- 以上失败点应优先通过最小修改修复，不要重写整个产物。")
-
-        refinement_digest = self._build_refinement_evidence_digest(synthesis_input)
-        if refinement_digest:
-            lines.append(refinement_digest)
-
-        recommended_queries = self._build_refinement_knowledge_queries(
-            artifact=artifact,
-            baseline_result=baseline_result,
-            synthesis_input=synthesis_input,
-            report_entry=report_entry,
-        )
-        if recommended_queries:
-            lines.append("## 推荐首轮 RAG 查询")
-            for query in recommended_queries[:3]:
-                lines.append(f"- `{query}`")
-
-        lines.append("- 必须先读取 refinement 目录中的工作副本，分析已有 trigger/barrier/guard/状态语义，再在该副本上精炼。")
-        lines.append("- 不要创建新文件名，不要绕开现有质量门。")
-        return "\n".join(lines)
 
     def _review_baseline_artifact(
         self,
@@ -1049,12 +729,6 @@ class BaseAnalyzer(ABC):
     ) -> AnalyzerResult:
         """Subclasses should implement detector synthesis from evidence."""
         raise NotImplementedError
-
-    def _join_context_blocks(self, *blocks: str) -> str:
-        """Join non-empty context blocks with spacing."""
-        valid = [block.strip() for block in blocks if isinstance(block, str) and block.strip()]
-        return "\n\n".join(valid)
-
 
 class AnalyzerRegistry:
     """

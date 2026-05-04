@@ -39,6 +39,12 @@ class _AppliedPatch:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class _ParsedUnifiedHunk:
+    preferred_index: Optional[int]
+    lines: List[str]
+
+
 class ApplyPatchTool(Tool):
     """将 unified diff 应用到单个文本文件。"""
 
@@ -46,6 +52,11 @@ class ApplyPatchTool(Tool):
     _HUNK_HEADER_RE = re.compile(
         r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
     )
+    _STRICT_HUNK_HEADER_RE = re.compile(
+        r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?P<suffix>.*)$"
+    )
+    _LOOSE_UNIFIED_HUNK_HEADER_RE = re.compile(r"^@@(?:\s.*)?$")
+    _CODEX_HUNK_HEADER_RE = re.compile(r"^@@(?:\s.*)?$")
 
     def __init__(self, work_dir: str = None, save_versions: bool = True):
         self.work_dir = work_dir
@@ -125,6 +136,35 @@ class ApplyPatchTool(Tool):
 
             patched = applied.content
             hunk_count = applied.hunk_count
+
+            if patched == original:
+                desired_text = resulting_content if isinstance(resulting_content, str) else ""
+                if desired_text and desired_text != original:
+                    patch_change_count = self._rough_patch_change_count(patch or "")
+                    if self._resulting_content_within_patch_budget(original, desired_text, patch_change_count):
+                        applied = self._apply_with_resulting_content(
+                            original=original,
+                            resulting_content=desired_text,
+                            note=(
+                                "主补丁虽成功解析，但未对当前文件产生实际修改；"
+                                "已回退到 resulting_content 精确重建最终文本。"
+                            ),
+                        )
+                        patched = applied.content
+                        hunk_count = applied.hunk_count
+                    else:
+                        return ToolResult(
+                            success=False,
+                            output="",
+                            error=(
+                                "补丁未对文件产生任何实际修改，且 resulting_content 的改动范围显著超出原始 patch。"
+                                " 请缩小 hunk、修正上下文，或提交更一致的 resulting_content。"
+                            ),
+                            metadata={
+                                "engine": applied.engine,
+                                "attempt_errors": attempt_errors,
+                            },
+                        )
 
             if patched == original:
                 return ToolResult(
@@ -229,11 +269,24 @@ class ApplyPatchTool(Tool):
         prepared_patch: Optional[PatchSet] = None
 
         if patch_text.strip():
+            if self._looks_like_codex_patch(patch_text):
+                try:
+                    patched, hunk_count = self._apply_codex_patch(original, patch_text)
+                    applied = _AppliedPatch(
+                        content=patched,
+                        hunk_count=hunk_count,
+                        engine="codex_patch",
+                        note="检测到 Codex 风格补丁块，已按结构化 hunk 直接应用。",
+                    )
+                except Exception as exc:
+                    attempt_errors.append(f"Codex 风格补丁应用失败: {exc}")
+
             try:
-                prepared_patch = self._parse_patch_with_unidiff(
-                    patch_text=patch_text,
-                    fallback_name=self._WORKSPACE_FILE,
-                )
+                if applied is None:
+                    prepared_patch = self._parse_patch_with_unidiff(
+                        patch_text=patch_text,
+                        fallback_name=self._WORKSPACE_FILE,
+                    )
             except Exception as exc:
                 attempt_errors.append(str(exc))
 
@@ -257,6 +310,18 @@ class ApplyPatchTool(Tool):
                     )
                 except Exception as exc:
                     attempt_errors.append(f"行号漂移容忍回退失败: {exc}")
+
+            if applied is None:
+                try:
+                    patched, hunk_count = self._apply_unified_diff_sequential(original, patch_text)
+                    applied = _AppliedPatch(
+                        content=patched,
+                        hunk_count=hunk_count,
+                        engine="sequential_unified_diff",
+                        note="标准补丁失败后，使用顺序上下文容忍模式完成补丁应用。",
+                    )
+                except Exception as exc:
+                    attempt_errors.append(f"顺序上下文容忍回退失败: {exc}")
         else:
             attempt_errors.append("补丁内容为空")
 
@@ -305,6 +370,102 @@ class ApplyPatchTool(Tool):
                 )
         return applied, attempt_errors
 
+    def _looks_like_codex_patch(self, patch_text: str) -> bool:
+        normalized = str(patch_text or "").lstrip()
+        return normalized.startswith("*** Begin Patch")
+
+    def _apply_codex_patch(self, original: str, patch_text: str) -> Tuple[str, int]:
+        patch_lines = str(patch_text or "").replace("\r\n", "\n").replace("\r", "\n").splitlines()
+        if not patch_lines:
+            raise ValueError("补丁内容为空")
+        if not patch_lines[0].startswith("*** Begin Patch"):
+            raise ValueError("不是合法的 Codex 风格补丁块")
+
+        hunks = self._parse_codex_hunks(patch_lines)
+        if not hunks:
+            raise ValueError("Codex 风格补丁中未找到有效的 @@ hunk")
+
+        original_has_trailing_newline = original.endswith("\n")
+        working_lines = original.splitlines()
+        cursor = 0
+
+        for hunk_lines in hunks:
+            expected_old_lines = [
+                raw_line[1:]
+                for raw_line in hunk_lines
+                if raw_line and raw_line[0] in {" ", "-"}
+            ]
+            old_index = self._locate_hunk_start(
+                original_lines=working_lines,
+                cursor=0,
+                preferred_index=cursor,
+                expected_old_lines=expected_old_lines,
+            )
+
+            replacement: List[str] = []
+            consume_index = old_index
+
+            for raw_line in hunk_lines:
+                prefix = raw_line[0] if raw_line else " "
+                payload = raw_line[1:] if raw_line else ""
+
+                if prefix == " ":
+                    actual_line = working_lines[consume_index] if consume_index < len(working_lines) else payload
+                    consume_index = self._consume_expected_line(working_lines, consume_index, payload, "context")
+                    replacement.append(actual_line)
+                    continue
+                if prefix == "-":
+                    consume_index = self._consume_expected_line(working_lines, consume_index, payload, "deletion")
+                    continue
+                if prefix == "+":
+                    replacement.append(payload)
+                    continue
+                raise ValueError(f"Codex 风格补丁包含不支持的行前缀: {prefix!r}")
+
+            working_lines[old_index:consume_index] = replacement
+            cursor = max(cursor, old_index + len(replacement))
+
+        patched = "\n".join(working_lines)
+        if working_lines and original_has_trailing_newline:
+            patched += "\n"
+        elif not working_lines and original_has_trailing_newline:
+            patched = ""
+        return patched, len(hunks)
+
+    def _parse_codex_hunks(self, patch_lines: List[str]) -> List[List[str]]:
+        hunks: List[List[str]] = []
+        current: List[str] = []
+        saw_update = False
+
+        for line in patch_lines[1:]:
+            if line.startswith("*** End Patch"):
+                break
+            if line.startswith("*** Update File: "):
+                saw_update = True
+                continue
+            if line.startswith("*** Add File: ") or line.startswith("*** Delete File: "):
+                raise ValueError("当前 apply_patch 仅支持单文件 Update File 补丁")
+            if line.startswith("*** Move to: "):
+                raise ValueError("当前 apply_patch 不支持 Move to 补丁")
+            if line.startswith("*** End of File"):
+                continue
+            if self._CODEX_HUNK_HEADER_RE.match(line):
+                if current:
+                    hunks.append(current)
+                    current = []
+                continue
+            if not line:
+                raise ValueError("Codex 风格补丁 hunk 行缺少前缀")
+            if line[0] not in {" ", "+", "-"}:
+                raise ValueError(f"Codex 风格补丁 hunk 行缺少有效前缀: {line[:40]!r}")
+            current.append(line)
+
+        if current:
+            hunks.append(current)
+        if not saw_update:
+            raise ValueError("Codex 风格补丁缺少 `*** Update File:` 头")
+        return hunks
+
     def _parse_patch_with_unidiff(self, patch_text: str, fallback_name: str) -> PatchSet:
         normalized = self._normalize_patch_text(patch_text, fallback_name=fallback_name)
         try:
@@ -334,9 +495,55 @@ class ApplyPatchTool(Tool):
         safe_name = Path(str(fallback_name or self._WORKSPACE_FILE)).name or self._WORKSPACE_FILE
         if not has_headers:
             normalized = f"--- a/{safe_name}\n+++ b/{safe_name}\n{normalized}"
+        normalized = self._repair_hunk_header_counts(normalized)
         if not normalized.endswith("\n"):
             normalized += "\n"
         return normalized
+
+    def _repair_hunk_header_counts(self, patch_text: str) -> str:
+        lines = str(patch_text or "").splitlines()
+        if not lines:
+            return str(patch_text or "")
+
+        repaired: List[str] = []
+        index = 0
+
+        while index < len(lines):
+            line = lines[index]
+            match = self._STRICT_HUNK_HEADER_RE.match(line)
+            if not match:
+                repaired.append(line)
+                index += 1
+                continue
+
+            next_index = index + 1
+            old_count = 0
+            new_count = 0
+            while next_index < len(lines):
+                candidate = lines[next_index]
+                if self._STRICT_HUNK_HEADER_RE.match(candidate) or self._LOOSE_UNIFIED_HUNK_HEADER_RE.match(candidate):
+                    break
+                if candidate.startswith(("diff --git ", "index ", "--- ", "+++ ")):
+                    break
+
+                prefix = candidate[:1]
+                if prefix == "\\":
+                    next_index += 1
+                    continue
+                if prefix in {" ", "-"}:
+                    old_count += 1
+                if prefix in {" ", "+"}:
+                    new_count += 1
+                next_index += 1
+
+            old_start = int(match.group("old_start"))
+            new_start = int(match.group("new_start"))
+            suffix = str(match.group("suffix") or "")
+            repaired.append(f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}")
+            repaired.extend(lines[index + 1:next_index])
+            index = next_index
+
+        return "\n".join(repaired)
 
     def _apply_with_patch_ng(self, original: str, patch_set: PatchSet) -> _AppliedPatch:
         if patch_ng is None:
@@ -436,17 +643,16 @@ class ApplyPatchTool(Tool):
         result: List[str] = []
         cursor = 0
 
-        for header, hunk_lines in hunks:
-            old_start = max(1, int(header.group("old_start")))
+        for hunk in hunks:
             expected_old_lines = [
                 raw_line[1:]
-                for raw_line in hunk_lines
+                for raw_line in hunk.lines
                 if raw_line and raw_line[0] in {" ", "-"}
             ]
             old_index = self._locate_hunk_start(
                 original_lines=original_lines,
                 cursor=cursor,
-                preferred_index=old_start - 1,
+                preferred_index=hunk.preferred_index if hunk.preferred_index is not None else cursor,
                 expected_old_lines=expected_old_lines,
             )
             if old_index < cursor:
@@ -455,7 +661,7 @@ class ApplyPatchTool(Tool):
             result.extend(original_lines[cursor:old_index])
             cursor = old_index
 
-            for raw_line in hunk_lines:
+            for raw_line in hunk.lines:
                 prefix = raw_line[0] if raw_line else " "
                 payload = raw_line[1:] if raw_line else ""
 
@@ -478,6 +684,78 @@ class ApplyPatchTool(Tool):
         if result and original_has_trailing_newline:
             patched += "\n"
         elif not result and original_has_trailing_newline:
+            patched = ""
+        return patched, len(hunks)
+
+    def _apply_unified_diff_sequential(self, original: str, patch_text: str) -> Tuple[str, int]:
+        patch_lines = (patch_text or "").splitlines()
+        if not patch_lines:
+            raise ValueError("补丁内容为空")
+
+        original_has_trailing_newline = original.endswith("\n")
+        working_lines = original.splitlines()
+
+        hunks = self._parse_hunks(patch_lines)
+        if not hunks:
+            raise ValueError("补丁中未找到有效的 @@ hunk")
+
+        cursor = 0
+        for hunk in hunks:
+            expected_old_lines = [
+                raw_line[1:]
+                for raw_line in hunk.lines
+                if raw_line and raw_line[0] in {" ", "-"}
+            ]
+            old_index = self._locate_hunk_start(
+                original_lines=working_lines,
+                cursor=0,
+                preferred_index=hunk.preferred_index if hunk.preferred_index is not None else cursor,
+                expected_old_lines=expected_old_lines,
+            )
+
+            replacement: List[str] = []
+            consume_index = old_index
+
+            for raw_line in hunk.lines:
+                prefix = raw_line[0] if raw_line else " "
+                payload = raw_line[1:] if raw_line else ""
+
+                if prefix == "\\":
+                    continue
+                if prefix == " ":
+                    actual_line = (
+                        working_lines[consume_index]
+                        if consume_index < len(working_lines)
+                        else payload
+                    )
+                    consume_index = self._consume_expected_line(
+                        working_lines,
+                        consume_index,
+                        payload,
+                        "context",
+                    )
+                    replacement.append(actual_line)
+                    continue
+                if prefix == "-":
+                    consume_index = self._consume_expected_line(
+                        working_lines,
+                        consume_index,
+                        payload,
+                        "deletion",
+                    )
+                    continue
+                if prefix == "+":
+                    replacement.append(payload)
+                    continue
+                raise ValueError(f"不支持的补丁行前缀: {prefix!r}")
+
+            working_lines[old_index:consume_index] = replacement
+            cursor = max(cursor, old_index + len(replacement))
+
+        patched = "\n".join(working_lines)
+        if working_lines and original_has_trailing_newline:
+            patched += "\n"
+        elif not working_lines and original_has_trailing_newline:
             patched = ""
         return patched, len(hunks)
 
@@ -522,21 +800,41 @@ class ApplyPatchTool(Tool):
 
         return start_index
 
-    def _parse_hunks(self, patch_lines: List[str]) -> List[Tuple[re.Match, List[str]]]:
-        hunks: List[Tuple[re.Match, List[str]]] = []
-        current_header: Optional[re.Match] = None
+    def _parse_hunks(self, patch_lines: List[str]) -> List[_ParsedUnifiedHunk]:
+        hunks: List[_ParsedUnifiedHunk] = []
+        current_preferred_index: Optional[int] = None
         current_lines: List[str] = []
+        in_hunk = False
 
         for line in patch_lines:
             match = self._HUNK_HEADER_RE.match(line)
             if match:
-                if current_header is not None:
-                    hunks.append((current_header, current_lines))
-                current_header = match
+                if in_hunk:
+                    hunks.append(
+                        _ParsedUnifiedHunk(
+                            preferred_index=current_preferred_index,
+                            lines=current_lines,
+                        )
+                    )
+                current_preferred_index = max(0, int(match.group("old_start")) - 1)
                 current_lines = []
+                in_hunk = True
                 continue
 
-            if current_header is None:
+            if self._LOOSE_UNIFIED_HUNK_HEADER_RE.match(line):
+                if in_hunk:
+                    hunks.append(
+                        _ParsedUnifiedHunk(
+                            preferred_index=current_preferred_index,
+                            lines=current_lines,
+                        )
+                    )
+                current_preferred_index = None
+                current_lines = []
+                in_hunk = True
+                continue
+
+            if not in_hunk:
                 continue
 
             if line.startswith(("diff --git ", "index ", "--- ", "+++ ")):
@@ -544,8 +842,13 @@ class ApplyPatchTool(Tool):
 
             current_lines.append(line)
 
-        if current_header is not None:
-            hunks.append((current_header, current_lines))
+        if in_hunk:
+            hunks.append(
+                _ParsedUnifiedHunk(
+                    preferred_index=current_preferred_index,
+                    lines=current_lines,
+                )
+            )
         return hunks
 
     def _consume_expected_line(

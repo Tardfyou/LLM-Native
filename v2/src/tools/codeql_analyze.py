@@ -10,6 +10,7 @@ CodeQL 分析工具
 import os
 import json
 import re
+import shlex
 import subprocess
 import tempfile
 from typing import Dict, Any, List, Optional, Tuple
@@ -409,13 +410,13 @@ class CodeQLAnalyzeTool(Tool):
             source_root = target_path if os.path.isdir(target_path) else os.path.dirname(target_path)
             os.makedirs(os.path.dirname(database_path) or ".", exist_ok=True)
 
-            build_command = None
+            build_command = self._project_build_script(source_root)
             makefile_candidates = [
                 os.path.join(source_root, "Makefile"),
                 os.path.join(source_root, "makefile"),
                 os.path.join(source_root, "GNUmakefile"),
             ]
-            if any(os.path.exists(path) for path in makefile_candidates):
+            if not build_command and any(os.path.exists(path) for path in makefile_candidates):
                 jobs = max(os.cpu_count() or 1, 1)
                 build_script_dir = os.path.dirname(database_path) or source_root
                 os.makedirs(build_script_dir, exist_ok=True)
@@ -459,7 +460,13 @@ class CodeQLAnalyzeTool(Tool):
             )
 
             if proc.returncode != 0:
-                return False, f"CodeQL 数据库创建失败: {(proc.stderr or proc.stdout)[:500]}"
+                return False, self._format_database_create_failure(
+                    cmd=cmd,
+                    proc=proc,
+                    database_path=database_path,
+                    source_root=source_root,
+                    build_script_path=build_script_path,
+                )
 
             return True, "数据库创建成功"
         except Exception as e:
@@ -470,3 +477,70 @@ class CodeQLAnalyzeTool(Tool):
                     os.unlink(build_script_path)
                 except OSError:
                     pass
+
+    def _project_build_script(self, source_root: str) -> Optional[str]:
+        """Use the prepared whole-directory build script when sample_env created one."""
+        env_dir = Path(source_root) / ".patchweaver_env"
+        manifest_path = env_dir / "validation_env.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                script = str(manifest.get("codeql_build_script", "") or "").strip()
+                if script and Path(script).exists():
+                    return script
+            except Exception:
+                pass
+        fallback = env_dir / "codeql_build.sh"
+        if fallback.exists():
+            return str(fallback)
+        return None
+
+    def _format_database_create_failure(
+        self,
+        *,
+        cmd: List[str],
+        proc: subprocess.CompletedProcess,
+        database_path: str,
+        source_root: str,
+        build_script_path: Optional[str],
+    ) -> str:
+        lines = [
+            "CodeQL 数据库创建失败。",
+            f"returncode={proc.returncode}",
+            f"source_root={source_root}",
+            f"database_path={database_path}",
+            "command=" + " ".join(shlex.quote(str(part)) for part in cmd),
+        ]
+        if build_script_path:
+            lines.append(f"build_script={build_script_path}")
+            try:
+                lines.append("build_script_content:")
+                lines.append(Path(build_script_path).read_text(encoding="utf-8", errors="replace")[:2000])
+            except OSError:
+                pass
+
+        combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        if combined:
+            lines.append("codeql_stdout_stderr:")
+            lines.append(combined[:4000])
+
+        log_tail = self._latest_database_log_tail(database_path)
+        if log_tail:
+            lines.append("latest_codeql_log_tail:")
+            lines.append(log_tail)
+
+        return "\n".join(lines).strip()
+
+    def _latest_database_log_tail(self, database_path: str, limit: int = 4000) -> str:
+        log_dir = Path(database_path) / "log"
+        if not log_dir.exists():
+            return ""
+        logs = sorted(log_dir.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+        if not logs:
+            return ""
+        latest = logs[0]
+        try:
+            text = latest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        return f"{latest}:\n{text[-limit:]}"

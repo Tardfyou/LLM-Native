@@ -59,3 +59,7 @@ prompts:
     path: refine/decide.md
     kind: text
     description: Decision prompt for each refinement step.
+  refine.agent.repair:
+    path: refine/repair.md
+    kind: text
+    description: Repair prompt for failed refinement validation.

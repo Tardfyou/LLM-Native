@@ -15,8 +15,8 @@ from ..agent.tools import Tool, ToolResult
 from ..prompts import PromptRepository
 from ..utils.vulnerability_taxonomy import (
     normalize_vulnerability_type,
-    supported_vulnerability_types,
 )
+from ..llm.usage import normalize_usage
 
 
 @dataclass
@@ -55,6 +55,7 @@ class PatchAnalysisTool(Tool):
     ):
         self._llm_client = llm_client
         self._llm_config = llm_config or {}
+        self._prompt_config = prompt_config or {}
         self._prompt_repository = PromptRepository(config=prompt_config or {})
         self._enable_llm = enable_llm
 
@@ -276,18 +277,22 @@ class PatchAnalysisTool(Tool):
         )
         response = client.generate(
             prompt=prompt,
-            temperature=0.1,
-            max_tokens=4096,
+            temperature=self._analysis_temperature(),
+            max_tokens=16384,
         )
         if not response:
             return {}
 
+        usage = normalize_usage(
+            getattr(client, "get_last_usage", lambda: {})(),
+        )
         payload = self._parse_llm_json(response)
         if not payload:
             return {}
         normalized = self._normalize_llm_result(payload, structural_result)
         if normalized:
             normalized["analysis_backend"] = "llm"
+            normalized["llm_usage"] = usage
         return normalized
 
     def _get_llm_client(self):
@@ -305,6 +310,21 @@ class PatchAnalysisTool(Tool):
         except Exception:
             return None
 
+    def _analysis_temperature(self) -> float:
+        agent_config = (
+            self._prompt_config.get("agent", {})
+            if isinstance(self._prompt_config.get("agent", {}), dict)
+            else {}
+        )
+        temperature = agent_config.get("generate_patch_analysis_temperature")
+        if temperature is None:
+            temperature = agent_config.get("generate_temperature")
+        if temperature is None:
+            temperature = agent_config.get("temperature")
+        if temperature is None:
+            temperature = 0.1
+        return float(temperature)
+
     def _build_llm_prompt(
         self,
         patch_content: str,
@@ -313,12 +333,6 @@ class PatchAnalysisTool(Tool):
         structural_result: Dict[str, Any],
         analysis_depth: str,
     ) -> str:
-        supported = sorted(supported_vulnerability_types(include_extended=True))
-        patch_excerpt_limit = 32000 if analysis_depth == "deep" else 20000
-        patch_excerpt = patch_content[:patch_excerpt_limit]
-        if len(patch_content) > patch_excerpt_limit:
-            patch_excerpt += "\n...<patch truncated>..."
-
         summary = {
             "patch_path": patch_path,
             "files_changed": structural_result.get("files_changed", []),
@@ -329,7 +343,7 @@ class PatchAnalysisTool(Tool):
             "patch_semantics": structural_result.get("patch_semantics", {}),
         }
         schema = {
-            "primary_pattern": "one canonical value from supported_vulnerability_types or unknown",
+            "primary_pattern": "canonical vulnerability type used by project taxonomy or unknown",
             "confidence": "float in [0,1]",
             "analysis_rationale": "short explanation tied to concrete patch evidence",
             "vulnerability_patterns": [
@@ -361,10 +375,9 @@ class PatchAnalysisTool(Tool):
             {
                 "ANALYSIS_DEPTH": analysis_depth,
                 "PATCH_PATH": patch_path,
-                "SUPPORTED_VULNERABILITY_TYPES_JSON": json.dumps(supported, ensure_ascii=False),
                 "STRUCTURAL_SUMMARY_JSON": json.dumps(summary, ensure_ascii=False, indent=2),
                 "REQUIRED_SCHEMA_JSON": json.dumps(schema, ensure_ascii=False, indent=2),
-                "PATCH_EXCERPT": patch_excerpt,
+                "PATCH_EXCERPT": patch_content,
             },
             strict=True,
         )

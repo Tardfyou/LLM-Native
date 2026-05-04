@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,8 @@ from typing import Any, Dict, Optional
 
 REFINEMENT_INPUT_MANIFEST = "refinement_input.json"
 REFINEMENT_INPUT_SCHEMA_VERSION = 1
+EVIDENCE_INPUT_MANIFEST = "evidence_manifest.json"
+EVIDENCE_INPUT_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -33,6 +36,7 @@ class ExistingAnalyzerArtifact:
     evidence_bundle_raw: Dict[str, Any] = field(default_factory=dict)
     post_validation_evidence_bundle_path: str = ""
     post_validation_evidence_bundle_raw: Dict[str, Any] = field(default_factory=dict)
+    fixed_validation_raw: Dict[str, Any] = field(default_factory=dict)
     report_entry: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -44,6 +48,8 @@ class RefinementSession:
     patch_path: str
     analyzer_choice: str
     validate_path: str = ""
+    evidence_dir: str = ""
+    evidence_input_dir: str = ""
     shared_analysis: Dict[str, Any] = field(default_factory=dict)
     final_report: Dict[str, Any] = field(default_factory=dict)
     artifacts: Dict[str, ExistingAnalyzerArtifact] = field(default_factory=dict)
@@ -56,6 +62,7 @@ class RefinementSessionLoader:
         self,
         input_dir: str,
         patch_path_override: Optional[str] = None,
+        evidence_input_dir: Optional[str] = None,
     ) -> RefinementSession:
         root = Path(input_dir).expanduser().resolve()
         if not root.exists():
@@ -63,16 +70,27 @@ class RefinementSessionLoader:
 
         manifest_path = root / REFINEMENT_INPUT_MANIFEST
         if manifest_path.exists():
-            return self._load_from_manifest(
+            session = self._load_from_manifest(
                 root=root,
                 manifest_path=manifest_path,
                 patch_path_override=patch_path_override,
             )
+        else:
+            session = self._load_from_legacy_report(
+                root=root,
+                patch_path_override=patch_path_override,
+            )
 
-        return self._load_from_legacy_report(
-            root=root,
-            patch_path_override=patch_path_override,
-        )
+        auto_evidence_dir = evidence_input_dir
+        if not auto_evidence_dir and (root / EVIDENCE_INPUT_MANIFEST).exists():
+            auto_evidence_dir = str(root)
+
+        if auto_evidence_dir:
+            self._overlay_external_evidence(
+                session=session,
+                evidence_input_dir=auto_evidence_dir,
+            )
+        return session
 
     def _load_from_manifest(
         self,
@@ -201,6 +219,101 @@ class RefinementSessionLoader:
             artifacts=artifacts,
         )
 
+    def _overlay_external_evidence(
+        self,
+        session: RefinementSession,
+        evidence_input_dir: str,
+    ) -> None:
+        root = Path(evidence_input_dir).expanduser().resolve()
+        if not root.exists():
+            raise FileNotFoundError(f"证据目录不存在: {root}")
+
+        manifest_path = root / EVIDENCE_INPUT_MANIFEST
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"缺少证据清单: {manifest_path}。请先运行独立 evidence 收集命令。"
+            )
+
+        manifest = self._read_json(manifest_path)
+        evidence_patch_path = self._normalize_loaded_path(
+            root,
+            str(manifest.get("patch_path", "") or "").strip(),
+        )
+        if evidence_patch_path and evidence_patch_path != session.patch_path:
+            raise ValueError(
+                f"证据目录 {root} 对应的 patch 与当前 refine 输入不一致: "
+                f"{evidence_patch_path} != {session.patch_path}"
+            )
+
+        evidence_dir = self._normalize_loaded_path(
+            root,
+            str(manifest.get("evidence_dir", "") or "").strip(),
+        )
+        shared_analysis = self._load_evidence_shared_analysis(root, manifest)
+        if shared_analysis:
+            session.shared_analysis = self._merge_shared_analysis(
+                base=session.shared_analysis,
+                override=shared_analysis,
+            )
+
+        raw_artifacts = manifest.get("artifacts", {}) or {}
+        if isinstance(raw_artifacts, dict):
+            for analyzer_id, payload in raw_artifacts.items():
+                normalized_id = str(analyzer_id or "").strip().lower()
+                if normalized_id not in session.artifacts or not isinstance(payload, dict):
+                    continue
+                artifact = session.artifacts[normalized_id]
+                evidence_bundle_path = self._resolve_existing_path(
+                    str(payload.get("evidence_bundle_path", "") or ""),
+                    root,
+                    [root / normalized_id / "evidence_bundle.json"],
+                )
+                evidence_bundle_raw = (
+                    self._read_json(Path(evidence_bundle_path))
+                    if evidence_bundle_path
+                    else {}
+                )
+                if evidence_bundle_raw:
+                    artifact.evidence_bundle_path = evidence_bundle_path
+                    artifact.evidence_bundle_raw = evidence_bundle_raw
+
+        session.evidence_input_dir = str(root)
+        session.evidence_dir = evidence_dir
+
+    def _load_evidence_shared_analysis(
+        self,
+        root: Path,
+        manifest: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        shared_analysis_path = self._resolve_existing_path(
+            str(manifest.get("shared_analysis_path", "") or ""),
+            root,
+            [root / "patchweaver_plan.json"],
+        )
+        if shared_analysis_path:
+            return self._read_json(Path(shared_analysis_path))
+
+        inline = manifest.get("shared_analysis", {})
+        return inline if isinstance(inline, dict) else {}
+
+    def _merge_shared_analysis(
+        self,
+        base: Dict[str, Any],
+        override: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        merged = copy.deepcopy(base or {})
+        incoming = copy.deepcopy(override or {})
+        if not incoming:
+            return merged
+
+        base_patchweaver = dict(merged.get("patchweaver", {}) or {})
+        override_patchweaver = dict(incoming.get("patchweaver", {}) or {})
+        merged.update({k: v for k, v in incoming.items() if k != "patchweaver"})
+        if base_patchweaver or override_patchweaver:
+            base_patchweaver.update(override_patchweaver)
+            merged["patchweaver"] = base_patchweaver
+        return merged
+
     def _load_manifest_shared_analysis(
         self,
         root: Path,
@@ -230,14 +343,12 @@ class RefinementSessionLoader:
             [artifact_dir / "result.json"],
         )
         report_entry = (
-            self._read_json(Path(result_path))
-            if result_path
-            else (
-                payload.get("report_entry", {})
-                if isinstance(payload.get("report_entry"), dict)
-                else {}
-            )
+            payload.get("report_entry", {})
+            if isinstance(payload.get("report_entry"), dict)
+            else {}
         )
+        if not report_entry and result_path:
+            report_entry = self._read_json(Path(result_path))
 
         output_path = self._resolve_existing_path(
             str(payload.get("output_path", "") or ""),
@@ -297,6 +408,12 @@ class RefinementSessionLoader:
                 else {}
             )
         )
+        fixed_validation_path = root / "fixed_validation.json"
+        fixed_validation_raw = (
+            self._read_json(fixed_validation_path)
+            if fixed_validation_path.exists()
+            else {}
+        )
 
         return ExistingAnalyzerArtifact(
             analyzer_id=analyzer_id,
@@ -308,6 +425,7 @@ class RefinementSessionLoader:
             evidence_bundle_raw=evidence_bundle_raw,
             post_validation_evidence_bundle_path=post_validation_evidence_bundle_path,
             post_validation_evidence_bundle_raw=post_validation_evidence_bundle_raw,
+            fixed_validation_raw=fixed_validation_raw,
             report_entry=report_entry,
         )
 
@@ -362,6 +480,12 @@ class RefinementSessionLoader:
             if post_validation_evidence_bundle_path
             else {}
         )
+        fixed_validation_path = root / "fixed_validation.json"
+        fixed_validation_raw = (
+            self._read_json(fixed_validation_path)
+            if fixed_validation_path.exists()
+            else {}
+        )
 
         return ExistingAnalyzerArtifact(
             analyzer_id=analyzer_id,
@@ -373,6 +497,7 @@ class RefinementSessionLoader:
             evidence_bundle_raw=evidence_bundle_raw,
             post_validation_evidence_bundle_path=post_validation_evidence_bundle_path,
             post_validation_evidence_bundle_raw=post_validation_evidence_bundle_raw,
+            fixed_validation_raw=fixed_validation_raw,
             report_entry=entry,
         )
 

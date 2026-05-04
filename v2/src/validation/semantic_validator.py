@@ -5,13 +5,16 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
+from ..experiments.sample_env import load_validation_env
 from .codeql_support import (
     build_codeql_search_path_args,
     build_codeql_database_path,
@@ -34,6 +37,7 @@ class SemanticValidator:
         self.codeql_search_path = self.config.get("search_path", "")
         self.timeout = self.config.get("timeout", 120)
         self.codeql_auto_create_db = self.config.get("codeql_auto_create_db", True)
+        self.csa_jobs = self._resolve_csa_jobs(self.config.get("csa_jobs", self.config.get("jobs")))
 
     def validate_csa_checker(
         self,
@@ -66,41 +70,63 @@ class SemanticValidator:
         try:
             project_root = Path(__file__).resolve().parents[2]
             scan_script = project_root / "scripts" / "scan_project.sh"
-            if not scan_script.exists():
-                return ValidationResult(
-                    stage=ValidationStage.SEMANTIC,
-                    analyzer=AnalyzerType.CSA,
-                    success=False,
-                    execution_time=time.time() - start_time,
-                    error_message=f"扫描脚本不存在: {scan_script}",
-                )
-
-            resolved_include_dirs = self._resolve_csa_include_dirs(target_path, include_dirs)
-
-            cmd = [str(scan_script), checker_so_path, checker_name, target_path]
-            for inc_dir in resolved_include_dirs:
-                cmd.extend(["-I", inc_dir])
-            cmd.extend(["--format", "text"])
-
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                cwd=str(project_root),
+            validation_env = load_validation_env(target_path)
+            compile_commands_path = str(validation_env.get("compile_commands_path", "") or "").strip()
+            resolved_include_dirs = self._resolve_csa_include_dirs(
+                target_path,
+                include_dirs,
+                validation_env=validation_env,
             )
-            output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-            diagnostic_output, report_path = self._resolve_csa_scan_output(output, project_root)
-            diagnostics = self._parse_analyzer_output(diagnostic_output, target_path, "csa")
+
+            if compile_commands_path and Path(compile_commands_path).exists():
+                diagnostics, report_path, return_code = self._run_csa_with_compile_db(
+                    checker_so_path=checker_so_path,
+                    checker_name=checker_name,
+                    target_path=target_path,
+                    compile_commands_path=compile_commands_path,
+                    include_dirs=resolved_include_dirs,
+                )
+                diagnostic_output = ""
+            else:
+                scan_script = project_root / "scripts" / "scan_project.sh"
+                if not scan_script.exists():
+                    return ValidationResult(
+                        stage=ValidationStage.SEMANTIC,
+                        analyzer=AnalyzerType.CSA,
+                        success=False,
+                        execution_time=time.time() - start_time,
+                        error_message=f"扫描脚本不存在: {scan_script}",
+                    )
+
+                cmd = [str(scan_script), checker_so_path, checker_name, target_path]
+                for inc_dir in resolved_include_dirs:
+                    cmd.extend(["-I", inc_dir])
+                cmd.extend(["--format", "text"])
+
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    cwd=str(project_root),
+                )
+                output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+                diagnostic_output, report_path = self._resolve_csa_scan_output(output, project_root)
+                diagnostics = self._parse_analyzer_output(diagnostic_output, target_path, "csa")
+                return_code = proc.returncode
             hard_errors = [diag for diag in diagnostics if diag.severity == "error"]
-            success = proc.returncode == 0 and not hard_errors
+            env_blocked, env_block_reason = self._detect_environment_block(
+                diagnostics,
+                diagnostic_output,
+            )
+            success = return_code == 0 and not hard_errors
             error_message = ""
             if not success:
                 if hard_errors:
                     first = hard_errors[0]
                     error_message = f"{first.file_path}:{first.line}: {first.message}"[:500]
                 else:
-                    error_message = self._strip_ansi(proc.stderr or proc.stdout or "CSA 扫描失败")[:500]
+                    error_message = self._strip_ansi(diagnostic_output or "CSA 扫描失败")[:500]
             return ValidationResult(
                 stage=ValidationStage.SEMANTIC,
                 analyzer=AnalyzerType.CSA,
@@ -114,10 +140,14 @@ class SemanticValidator:
                     "scan_script": str(scan_script),
                     "target_path": target_path,
                     "include_dirs": resolved_include_dirs,
-                    "return_code": proc.returncode,
+                    "compile_commands_path": compile_commands_path,
+                    "return_code": return_code,
                     "hard_errors": len(hard_errors),
                     "report_path": report_path,
-                    "diagnostic_output_source": "saved_report" if report_path else "process_output",
+                    "diagnostic_output_source": "compile_commands" if compile_commands_path else ("saved_report" if report_path else "process_output"),
+                    "environment_blocked": env_blocked,
+                    "environment_block_reason": env_block_reason,
+                    "validation_target": target_path,
                 },
             )
         except subprocess.TimeoutExpired:
@@ -145,6 +175,7 @@ class SemanticValidator:
         output_path: str = None,
     ) -> ValidationResult:
         start_time = time.time()
+        query_path = str(Path(query_path).expanduser().resolve())
 
         if not os.path.exists(query_path):
             return ValidationResult(
@@ -236,6 +267,9 @@ class SemanticValidator:
                     "database_resolution": resolution_message,
                     "query_path": query_path,
                     "decoded_results": decoded_artifacts,
+                    "environment_blocked": False,
+                    "environment_block_reason": "",
+                    "validation_target": target_path or database_path,
                 },
             )
         except subprocess.TimeoutExpired:
@@ -321,6 +355,7 @@ class SemanticValidator:
         self,
         target_path: str,
         include_dirs: Optional[List[str]],
+        validation_env: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         resolved: List[str] = []
         seen = set()
@@ -336,6 +371,12 @@ class SemanticValidator:
                 resolved.append(key)
 
         for item in include_dirs or []:
+            token = str(item or "").strip()
+            if token:
+                add(Path(token))
+
+        env_include_dirs = (validation_env or {}).get("include_dirs", [])
+        for item in env_include_dirs or []:
             token = str(item or "").strip()
             if token:
                 add(Path(token))
@@ -363,6 +404,222 @@ class SemanticValidator:
                 add(root / relative)
 
         return resolved
+
+    def _run_csa_with_compile_db(
+        self,
+        checker_so_path: str,
+        checker_name: str,
+        target_path: str,
+        compile_commands_path: str,
+        include_dirs: List[str],
+    ) -> Tuple[List[Diagnostic], str, int]:
+        target = Path(target_path).expanduser().resolve()
+        compile_db = self._load_compile_commands(compile_commands_path)
+        jobs: List[Tuple[int, Dict[str, Any], Path, List[str]]] = []
+        for index, entry in enumerate(compile_db):
+            source_path = self._resolve_compile_db_source(entry)
+            if source_path is None or not source_path.exists():
+                continue
+            if target.is_file() and source_path.resolve() != target:
+                continue
+            if target.is_dir():
+                try:
+                    source_path.resolve().relative_to(target)
+                except ValueError:
+                    continue
+            command = self._build_csa_command_from_compile_entry(
+                checker_so_path=checker_so_path,
+                checker_name=checker_name,
+                entry=entry,
+                source_path=source_path,
+                include_dirs=include_dirs,
+            )
+            jobs.append((index, entry, source_path, command))
+
+        diagnostics: List[Diagnostic] = []
+        failures = 0
+        if jobs:
+            max_workers = max(1, min(self.csa_jobs, len(jobs)))
+            ordered_results: List[Tuple[int, List[Diagnostic], int]] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(self._run_csa_compile_entry, entry, source_path, command): (index, source_path)
+                    for index, entry, source_path, command in jobs
+                }
+                for future in as_completed(futures):
+                    index, source_path = futures[future]
+                    try:
+                        entry_diags, return_code = future.result()
+                    except subprocess.TimeoutExpired as exc:
+                        entry_diags = [
+                            Diagnostic(
+                                file_path=str(source_path),
+                                line=1,
+                                column=1,
+                                severity="error",
+                                message=f"CSA 单文件分析超时 ({self.timeout}秒): {exc}",
+                                source="csa",
+                            )
+                        ]
+                        return_code = 124
+                    except Exception as exc:
+                        entry_diags = [
+                            Diagnostic(
+                                file_path=str(source_path),
+                                line=1,
+                                column=1,
+                                severity="error",
+                                message=f"CSA 单文件分析失败: {exc}",
+                                source="csa",
+                            )
+                        ]
+                        return_code = 1
+                    ordered_results.append((index, entry_diags, return_code))
+
+            for _, entry_diags, return_code in sorted(ordered_results, key=lambda item: item[0]):
+                diagnostics.extend(entry_diags)
+                if return_code != 0:
+                    failures += 1
+        report_path = ""
+        return diagnostics, report_path, 0 if failures == 0 else 1
+
+    def _run_csa_compile_entry(
+        self,
+        entry: Dict[str, Any],
+        source_path: Path,
+        command: List[str],
+    ) -> Tuple[List[Diagnostic], int]:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            cwd=str(Path(str(entry.get("directory", source_path.parent)) or source_path.parent).expanduser().resolve()),
+        )
+        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+        return self._parse_analyzer_output(output, str(source_path), "csa"), proc.returncode
+
+    def _resolve_csa_jobs(self, configured: Any) -> int:
+        env_value = os.environ.get("PATCHWEAVER_CSA_JOBS") or os.environ.get("CSA_JOBS")
+        raw_value = env_value if env_value not in (None, "") else configured
+        try:
+            jobs = int(raw_value)
+        except (TypeError, ValueError):
+            jobs = min(8, max(1, os.cpu_count() or 1))
+        return max(1, jobs)
+
+    def _load_compile_commands(self, compile_commands_path: str) -> List[Dict[str, Any]]:
+        try:
+            payload = json.loads(Path(compile_commands_path).read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
+
+    def _resolve_compile_db_source(self, entry: Dict[str, Any]) -> Optional[Path]:
+        directory = Path(str(entry.get("directory", ".") or ".")).expanduser().resolve()
+        file_value = str(entry.get("file", "") or "").strip()
+        if not file_value:
+            return None
+        file_path = Path(file_value)
+        return file_path.resolve() if file_path.is_absolute() else (directory / file_path).resolve()
+
+    def _build_csa_command_from_compile_entry(
+        self,
+        checker_so_path: str,
+        checker_name: str,
+        entry: Dict[str, Any],
+        source_path: Path,
+        include_dirs: List[str],
+    ) -> List[str]:
+        raw_command = str(entry.get("command", "") or "")
+        tokens = self._safe_split(raw_command)
+        compiler = self.clang_path
+        if source_path.suffix.lower() == ".c":
+            compiler = re.sub(r"clang\+\+$", "clang", self.clang_path)
+        args = self._extract_validation_args(tokens, Path(str(entry.get("directory", source_path.parent)) or source_path.parent))
+        for include_dir in include_dirs:
+            args.append(f"-I{include_dir}")
+        return [
+            compiler,
+            "--analyze",
+            "-Xclang",
+            "-load",
+            "-Xclang",
+            checker_so_path,
+            "-Xclang",
+            "-analyzer-checker",
+            "-Xclang",
+            checker_name,
+            "-Xclang",
+            "-analyzer-output=text",
+            *self._dedupe_args(args),
+            str(source_path),
+        ]
+
+    def _extract_validation_args(self, tokens: List[str], directory: Path) -> List[str]:
+        args: List[str] = []
+        skip_next = False
+        for index, token in enumerate(tokens):
+            if skip_next:
+                skip_next = False
+                continue
+            if token in {"-c", "-o", "-MF", "-MT", "-MQ"}:
+                skip_next = index + 1 < len(tokens)
+                continue
+            if token in {"-I", "-D", "-U", "-include", "-isystem", "-iquote", "-imacros", "-std", "-x"}:
+                if index + 1 < len(tokens):
+                    value = tokens[index + 1]
+                    args.extend([token, self._resolve_command_flag_value(token, value, directory)])
+                    skip_next = True
+                continue
+            if token.startswith("-I") and len(token) > 2:
+                args.append("-I" + self._resolve_command_flag_value("-I", token[2:], directory))
+            elif token.startswith("-D") or token.startswith("-U"):
+                args.append(token)
+            elif token.startswith("-std="):
+                args.append(token)
+            elif token.startswith("-include") and len(token) > len("-include"):
+                args.extend(["-include", self._resolve_command_flag_value("-include", token[len("-include") :], directory)])
+            elif token.startswith("-isystem") and len(token) > len("-isystem"):
+                args.extend(["-isystem", self._resolve_command_flag_value("-isystem", token[len("-isystem") :], directory)])
+            elif token.startswith("-iquote") and len(token) > len("-iquote"):
+                args.extend(["-iquote", self._resolve_command_flag_value("-iquote", token[len("-iquote") :], directory)])
+            elif token in {"-pthread", "-fPIC", "-fpic", "-fms-extensions", "-funsigned-char", "-fshort-wchar"} or token.startswith("-m") or token.startswith("-W"):
+                args.append(token)
+        return args
+
+    def _resolve_command_flag_value(self, flag: str, value: str, directory: Path) -> str:
+        if flag in {"-I", "-include", "-isystem", "-iquote", "-imacros"}:
+            path = Path(value)
+            return str(path if path.is_absolute() else (directory / path).resolve())
+        return value
+
+    def _dedupe_args(self, args: List[str]) -> List[str]:
+        deduped: List[str] = []
+        seen = set()
+        index = 0
+        while index < len(args):
+            token = args[index]
+            if token in {"-I", "-include", "-isystem", "-iquote", "-imacros", "-D", "-U", "-std", "-x"} and index + 1 < len(args):
+                pair = (token, args[index + 1])
+                if pair not in seen:
+                    seen.add(pair)
+                    deduped.extend([token, args[index + 1]])
+                index += 2
+                continue
+            if token not in seen:
+                seen.add(token)
+                deduped.append(token)
+            index += 1
+        return deduped
+
+    def _safe_split(self, raw_command: str) -> List[str]:
+        try:
+            return shlex.split(raw_command)
+        except Exception:
+            return raw_command.split()
 
     def _parse_codeql_results(self, output_path: str, decoded_artifacts: Optional[Dict[str, Any]] = None) -> List[Diagnostic]:
         decoded_json = ((decoded_artifacts or {}).get("json") or {}).get("content")
@@ -411,6 +668,18 @@ class SemanticValidator:
                     code=result_set_name,
                 ))
         return diagnostics
+
+    def _detect_environment_block(self, diagnostics: List[Diagnostic], raw_output: str) -> Tuple[bool, str]:
+        messages = [str(diag.message or "").strip() for diag in diagnostics if getattr(diag, "severity", "") == "error"]
+        text = "\n".join(messages + [self._strip_ansi(raw_output)])
+        lowered = text.lower()
+        if "file not found" in lowered:
+            return True, "missing_header"
+        if "no such file or directory" in lowered:
+            return True, "missing_file"
+        if "fatal error" in lowered and "include" in lowered:
+            return True, "include_resolution_failed"
+        return False, ""
 
     def _codeql_uri_to_path(self, uri: Optional[str]) -> str:
         if not uri:
@@ -462,19 +731,21 @@ class SemanticValidator:
             if is_codeql_database_dir(database_path):
                 return True, "数据库已存在"
 
-            if not target_path or not os.path.exists(target_path):
+            resolved_target = str(Path(target_path).expanduser().resolve()) if target_path else ""
+            if not resolved_target or not os.path.exists(resolved_target):
                 return False, f"无法创建数据库，目标路径不存在: {target_path}"
 
-            source_root = target_path if os.path.isdir(target_path) else os.path.dirname(target_path)
+            source_root = resolved_target if os.path.isdir(resolved_target) else os.path.dirname(resolved_target)
             os.makedirs(os.path.dirname(database_path) or ".", exist_ok=True)
 
-            build_command = None
+            validation_env = load_validation_env(resolved_target)
+            build_command = str(validation_env.get("codeql_build_script", "") or "").strip() or None
             makefile_candidates = [
                 os.path.join(source_root, "Makefile"),
                 os.path.join(source_root, "makefile"),
                 os.path.join(source_root, "GNUmakefile"),
             ]
-            if any(os.path.exists(path) for path in makefile_candidates):
+            if not build_command and any(os.path.exists(path) for path in makefile_candidates):
                 jobs = max(os.cpu_count() or 1, 1)
                 build_script_dir = os.path.dirname(database_path) or source_root
                 os.makedirs(build_script_dir, exist_ok=True)
@@ -514,7 +785,7 @@ class SemanticValidator:
                 capture_output=True,
                 text=True,
                 timeout=max(self.timeout, 300),
-                cwd=source_root,
+                cwd=str(Path(str(validation_env.get("version_root", source_root)) or source_root).expanduser().resolve()),
             )
             if proc.returncode != 0:
                 return False, f"CodeQL 数据库创建失败: {(proc.stderr or proc.stdout)[:500]}"

@@ -1,0 +1,15 @@
+diff --git a/src/packet_parser.c b/src/packet_parser.c
+index 6d31337..d6300aa 100644
+--- a/src/packet_parser.c
++++ b/src/packet_parser.c
+@@ -9,6 +9,10 @@ int parse_packet_name(Packet *pkt, const char *input, size_t input_len) {
+     if (!pkt || !input) {
+         return -1;
+     }
++
++    if (input_len >= sizeof(pkt->name)) {
++        return -1;
++    }
+ 
+     memcpy(pkt->name, input, input_len);
+     pkt->name[input_len] = '\0';

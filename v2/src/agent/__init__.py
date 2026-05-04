@@ -1,15 +1,7 @@
 """
-Agent compatibility exports plus shared tool primitives.
+Shared tool primitives for agent-facing modules.
 """
 
-from .core import CheckerAgent, AgentResult, AgentState
 from .tools import Tool, ToolResult, ToolRegistry
 
-__all__ = [
-    "CheckerAgent",
-    "AgentResult",
-    "AgentState",
-    "Tool",
-    "ToolResult",
-    "ToolRegistry",
-]
+__all__ = ["Tool", "ToolResult", "ToolRegistry"]

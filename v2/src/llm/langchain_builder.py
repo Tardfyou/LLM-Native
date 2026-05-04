@@ -5,22 +5,9 @@ from typing import Any, Dict, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
-import httpx
 
-
-# Provider 配置 (不含密钥，密钥在配置文件中)
-PROVIDER_CONFIGS = {
-    "deepseek": {
-        "base_url": "https://api.deepseek.com",
-        "env_key": "DEEPSEEK_API_KEY",
-        "default_model": "deepseek-chat",
-    },
-    "xty": {
-        "base_url": "https://api.xty.app/v1",
-        "env_key": "XTY_API_KEY",
-        "default_model": "gpt-3.5-turbo",
-    },
-}
+from .packy_chat_model import PackyStreamingChatModel
+from .provider_config import PROVIDER_CONFIGS, resolve_provider_name
 
 
 def build_langchain_chat_model(
@@ -29,6 +16,8 @@ def build_langchain_chat_model(
     *,
     temperature_key: Optional[str] = None,
     default_temperature: float = 0.2,
+    generation_config_key: Optional[str] = None,
+    temperature_override: Optional[float] = None,
 ) -> BaseChatModel:
     if isinstance(override, BaseChatModel):
         return override
@@ -41,9 +30,7 @@ def build_langchain_chat_model(
     agent_config = raw_config.get("agent", {}) if isinstance(raw_config.get("agent", {}), dict) else {}
 
     # 确定 provider
-    provider = str(llm_config.get("provider", "deepseek") or "deepseek").strip().lower()
-    if provider not in PROVIDER_CONFIGS:
-        provider = "deepseek"
+    provider = resolve_provider_name(llm_config.get("provider", "deepseek"))
 
     provider_info = PROVIDER_CONFIGS[provider]
 
@@ -65,18 +52,43 @@ def build_langchain_chat_model(
     base_url = str(base_urls.get(provider, default_base_url) or default_base_url).strip()
 
     # Temperature
-    temperature = None
-    if temperature_key:
-        temperature = agent_config.get(temperature_key, None)
+    temperature = temperature_override
     if temperature is None:
-        temperature = agent_config.get("temperature", generation.get("temperature", default_temperature))
+        if temperature_key:
+            temperature = agent_config.get(temperature_key, None)
+        if temperature is None:
+            temperature = agent_config.get("temperature", generation.get("temperature", default_temperature))
+
+    scoped_generation = {}
+    if generation_config_key:
+        scoped_generation = llm_config.get(generation_config_key, {})
+        if not isinstance(scoped_generation, dict):
+            scoped_generation = {}
+
+    max_tokens = scoped_generation.get("max_tokens", generation.get("max_tokens", 16384))
+
+    temperature_value = float(temperature or default_temperature)
+    timeout_value = float(generation.get("timeout", 120) or 120)
+    max_retries_value = int(generation.get("max_retries", 3) or 3)
+    max_tokens_value = int(max_tokens or 16384)
+
+    if bool(provider_info.get("force_langchain_stream_adapter", False)):
+        return PackyStreamingChatModel(
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=temperature_value,
+            max_tokens=max_tokens_value,
+            timeout=timeout_value,
+            max_retries=max_retries_value,
+        )
 
     return ChatOpenAI(
         model=model_name,
         api_key=api_key,
         base_url=base_url,
-        temperature=float(temperature or default_temperature),
-        max_tokens=int(generation.get("max_tokens", 8192) or 8192),
-        timeout=float(generation.get("timeout", 120) or 120),
-        max_retries=int(generation.get("max_retries", 3) or 3),
+        temperature=temperature_value,
+        max_tokens=max_tokens_value,
+        timeout=timeout_value,
+        max_retries=max_retries_value,
     )

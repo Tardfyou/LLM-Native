@@ -1,33 +1,102 @@
-You are analyzing a security patch for detector synthesis.
+你在做“补丁语义分析”。目标不是解释 CWE，也不是复述补丁内容，而是把当前补丁里对后续静态漏洞检测器生成真正有用的语义事实提炼出来，其中会用于生成CSA或CodeQL的静态漏洞检测器。
 
-Return JSON only. Do not use markdown fences.
+只返回一个 JSON 对象。不要使用 Markdown 代码块，不要添加解释性前后缀，不要输出 schema 之外的字段。
 
-Rules:
-- Prefer the root-cause vulnerability mechanism, not superficial API overlap or keyword matches
-- If the patch does not provide enough evidence to classify the vulnerability type confidently, set `primary_pattern` to `unknown`
-- Do not guess a specific type merely because formatting APIs, allocation APIs, or null checks appear in the diff
-- Even when `primary_pattern` is `unknown`, you must still extract important patch semantics: affected functions, added guards, removed risky operations, added or replaced APIs, lifecycle/state changes, and cross-file implications
-- When multiple mechanisms look plausible, keep `primary_pattern` as `unknown` and include only evidence-backed candidates in `vulnerability_patterns`
-- Prefer fix-shape semantics over raw bug labels: explicit invalidation, authoritative relookup, handle/id validation, safe API replacement, ownership transfer, or barrier insertion
-- If the patch replaces direct cached-object access with stable-handle validation plus authoritative lookup/rebind, capture that explicitly in `fix_patterns` and `detection_strategy.suggestions`
-- Use `detection_strategy.suggestions` to record observability hints such as:
-  - prefer consumer-side misuse over cross-function release->use continuity
-  - prefer missing authoritative relookup over plain null-check reasoning
-  - avoid using null/non-null as freshness proof for stale/dangling resources
-- Your rationale must cite concrete diff evidence, not generic CWE prose
+你的分析必须服务于“只看 patch 先起草 detector”这个场景，因此要优先给出：
+- 最小可命中的 patch-local 锚点
+- 补丁前的危险机制
+- 补丁后阻断该机制的 guard / barrier / 生命周期调整 / 权威重查
+- 后续生成时哪些条件适合首稿命中，哪些条件只能作为二次收敛过滤
 
-Context:
+核心原则：
+- 先看 fix-shape，再决定 bug label。
+- 先抽取 patch-local 事实，再考虑是否能归类到某个漏洞类型。
+- patch 证据不足时，`primary_pattern` 必须设为 `unknown`，不要硬猜。
+- 即使 `primary_pattern=unknown`，也必须把对生成有用的局部机制讲清楚。
+
+请按下面顺序思考，但最终仍然只输出 JSON：
+
+1. 先抽取补丁事实
+- changed file / changed function / changed expression 是第一优先级。
+- 找出补丁真正动到的调用、字段访问、数组访问、释放、返回路径、赋值、条件判断、标签跳转、清理顺序。
+- 如果危险点就在被删除或被替换的那一行，明确指出这一点。
+- 如果补丁主要改的是错误路径，明确旧路径中“继续消费失效对象 / 继续执行危险操作”的位置。
+
+2. 再识别“补丁前的危险机制”
+- 不要只说“缺少检查”，要说清楚“哪个值/对象/状态被怎样消费而产生风险”。
+- 变量来源既要考虑普通赋值，也要考虑声明初始化。
+- 写入既要考虑 `=`，也要考虑 `|=`、`+=`、`-=`、`*=` 等复合赋值。
+- 危险消费既要考虑显式调用，也要考虑数组索引、字段解引用、返回失效对象、继续传递失效句柄、循环边界、长度参数、释放后再次使用。
+
+3. 最后识别“补丁后如何阻断”
+- 重点看这些 fix-shape：
+  - 新增 guard / barrier / 边界检查
+  - 删除危险调用 / 危险释放 / 危险写入 / 危险返回路径
+  - unsafe API 被 safe API、显式长度检查或受控路径替换
+  - 资源所有权、释放顺序、清理时机、失效方式发生变化
+  - 旧对象/旧句柄/旧缓存被“重新查找 / 重新绑定 / 权威校验”取代
+  - 错误处理从“继续执行”改成“清理后提前返回 / 跳转退出”
+- 不要把“新增日志”“返回值变化”“格式化调整”当成主机制，除非它直接阻断危险消费。
+
+4. 决定 `detection_strategy`
+- 首稿优先命中 patch-local 最小锚点，再考虑 guard/barrier。
+- 如果补丁删除了一个明确的危险操作，首稿优先匹配那个危险操作本身。
+- 如果补丁新增了 guard/barrier，首稿优先匹配原来的 source/sink 或状态关系，不要一开始就把 guard 写成硬过滤，否则容易 0 hit。
+- 如果补丁体现的是资源生命周期问题，优先抓“free/destroy/release 后继续访问/传递/返回/解引用”的局部模式。
+- 如果补丁体现的是权威重查/重绑，优先抓“继续使用旧对象/旧句柄而没有重查”的消费点；不要把“非空”误当成“仍然有效”。
+- 只有在 patch 明确体现跨函数或跨文件依赖时，才建议复杂数据流或跨文件分析。
+
+强约束：
+- `vulnerability_patterns` 里必须写“补丁前什么机制会触发、补丁后怎样被阻断或替换”。
+- `analysis_rationale` 必须引用当前 diff 里的具体证据，不能写泛泛的 CWE 描述。
+- `evidence_lines` 必须尽量落到补丁中真实出现的代码片段、条件、调用、字段、返回或清理动作，不能写抽象空话。
+- 当多个机制都像，但补丁无法区分主因时，`primary_pattern=unknown`，`vulnerability_patterns` 只保留有补丁证据支撑的候选。
+- 不要把补丁文本中没有体现的项目背景、历史知识、跨过程链路当成事实。
+
+针对常见补丁类型，你要特别注意：
+
+1. 新增 guard / barrier / 边界检查
+- 说清 guard 保护的是哪个值、哪个 sink、哪个状态关系。
+- 说清 guard 与危险消费点之间的关系，而不是只写“增加了校验”。
+- 如果 patch 中最稳定的语义锚点其实是数组访问、长度参数、memcpy/memmove/read/write、索引计算、循环边界，就优先围绕它写。
+
+2. 资源生命周期 / UAF / double free / cleanup 顺序
+- 说清哪个对象何时进入失效态。
+- 说清失效后又被哪个调用、解引用、返回路径、清理路径继续消费。
+- 说清补丁是通过删除危险消费、重排释放顺序、补充 null/reset、提前返回、还是重查对象来阻断。
+
+3. 权威重查 / 重绑定 / handle freshness
+- 如果旧逻辑是直接访问、缓存对象或沿用旧句柄，而新逻辑改成“校验后重查”，要把这一点明确写进 `fix_patterns`。
+- `detection_strategy.suggestions` 里明确提醒：
+  - 首稿更应优先检测“缺少权威重查/重绑”
+  - 不要把旧指针非空、旧索引合法、旧句柄仍可访问，当作对象仍然新鲜有效的证明
+
+4. 范围 / 长度 / 索引 / 容量
+- 说清被消费的值是什么，它流向了哪个数组访问、拷贝、读写、分配或循环边界。
+- 如果 patch 同时改了值来源和消费点，优先把“危险消费点”作为首稿锚点。
+
+`detection_strategy.suggestions` 应优先包含这类可直接指导生成的结论：
+- 首稿应该先命中的 patch-local 锚点是什么
+- 哪些 guard/barrier 暂时不要写成硬过滤
+- 哪些条件只是辅助收敛，不是首要命中条件
+- 是否真的需要数据流追踪，还是局部 AST / CFG 就够
+- 是否真的需要跨文件分析，还是只盯住补丁涉及函数/文件即可
+
+置信度要求：
+- `confidence` 只反映你对“补丁主机制判断”的把握，不反映你输出写得是否完整。
+- 证据弱、机制分叉、补丁面过大、或修复只是间接信号时，降低 `confidence`。
+- 无法稳健归类时，用 `unknown`，但不要放弃输出生成有用的 patch-local 语义。
+
+上下文：
 - analysis_depth: {{ANALYSIS_DEPTH}}
 - patch_path: {{PATCH_PATH}}
 
-Supported vulnerability types:
-{{SUPPORTED_VULNERABILITY_TYPES_JSON}}
 
-Structural patch summary:
+补丁结构摘要：
 {{STRUCTURAL_SUMMARY_JSON}}
 
-Required JSON schema:
+必须满足的 JSON schema：
 {{REQUIRED_SCHEMA_JSON}}
 
-Patch excerpt:
+补丁全文：
 {{PATCH_EXCERPT}}

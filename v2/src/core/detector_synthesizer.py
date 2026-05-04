@@ -926,12 +926,6 @@ class DetectorSynthesisInputBuilder:
                 axes.append("source-to-sink flow")
             if record.type == "call_chain" or slice_kind == "interprocedural_slice":
                 axes.append("interprocedural flow")
-            if record.type == "api_contract" or slice_kind == "api_contract_slice":
-                axes.append("api contracts")
-            if record.type == "metadata_hint" or slice_kind == "intent_slice":
-                axes.append("patch intent and barrier semantics")
-            if record.type == "context_summary" or slice_kind == "context_summary":
-                axes.append("project and build context")
         return self._dedupe_strings(axes)
 
     def _constraints_for(
@@ -1348,15 +1342,6 @@ class DetectorSynthesisInputBuilder:
                     hints.append(f"Call-chain context: {', '.join(map(str, summary[:3]))}")
                 else:
                     hints.append(f"Call-chain context: {summary}")
-            elif record.type == "api_contract" and payload.get("apis"):
-                hints.append(f"API semantics: {', '.join(map(str, top_items(payload.get('apis'), 4)))}")
-            elif record.type == "metadata_hint" and payload.get("summary"):
-                hints.append(f"Patch intent: {payload.get('summary')}")
-            elif record.type == "metadata_hint" and payload.get("external_references"):
-                refs = payload.get("external_references", {}) or {}
-                ref_tokens = top_items(refs.get("cves"), 2) + top_items(refs.get("cwes"), 2)
-                if ref_tokens:
-                    hints.append(f"External refs: {', '.join(map(str, ref_tokens[:4]))}")
             elif payload.get("call_targets"):
                 hints.append(f"Observed calls: {', '.join(map(str, top_items(payload.get('call_targets'), 4)))}")
             elif payload.get("globals"):
@@ -1583,19 +1568,18 @@ class DetectorSynthesisInputBuilder:
         silence_support = [
             record.evidence_id
             for record in selected_records
-            if record.type in {"patch_fact", "metadata_hint", "api_contract", "context_summary"}
-            or (record.evidence_slice and record.evidence_slice.kind in {"intent_slice", "context_summary", "api_contract_slice"})
+            if record.type in {"patch_fact", "semantic_slice", "path_guard", "state_transition"}
         ]
         transfer_support = [
             record.evidence_id
             for record in selected_records
-            if record.type in {"call_chain", "semantic_slice", "metadata_hint"}
-            or (record.evidence_slice and record.evidence_slice.kind in {"interprocedural_slice", "semantic_slice", "intent_slice"})
+            if record.type in {"call_chain", "semantic_slice", "dataflow_candidate"}
+            or (record.evidence_slice and record.evidence_slice.kind in {"interprocedural_slice", "semantic_slice", "flow_witness"})
         ]
         interface_support = [
             record.evidence_id
             for record in selected_records
-            if record.type in {"diagnostic", "context_summary", "metadata_hint"}
+            if record.type in {"patch_fact", "call_chain"}
         ]
 
         clauses = [

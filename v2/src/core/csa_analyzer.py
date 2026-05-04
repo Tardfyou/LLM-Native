@@ -38,7 +38,7 @@ class CSAAnalyzer(BaseAnalyzer):
         name="CSA (Clang Static Analyzer)",
         description="路径敏感，擅长 C/C++ 内存与状态错误（UAF、空指针、越界等）。",
         best_for=["use_after_free", "null_dereference", "buffer_overflow", "double_free"],
-        evidence_types=["path_guard", "state_transition", "allocation_lifecycle", "context_summary", "semantic_slice", "metadata_hint", "diagnostic"],
+        evidence_types=["patch_fact", "semantic_slice", "path_guard", "state_transition", "allocation_lifecycle"],
         detector_artifacts=["checker_plugin", "shared_object"],
         strengths=["path_sensitive", "stateful", "lifecycle_reasoning"],
         validation_modes=["compile", "semantic"],
@@ -126,11 +126,12 @@ class CSAAnalyzer(BaseAnalyzer):
         # 设置工具的工作目录
         self._setup_tool_work_dirs(work_dir)
 
-        self._emit_progress("evidence_collection_started")
-        evidence_bundle = self.collect_evidence(context)
+        from .evidence_schema import EvidenceBundle
+
+        evidence_bundle = EvidenceBundle()
         synthesis_input = self.build_synthesis_input(context, evidence_bundle)
         self._emit_progress(
-            "evidence_collection_completed",
+            "evidence_loaded",
             records=len(getattr(evidence_bundle, "records", []) or []),
             missing=len(getattr(evidence_bundle, "missing_evidence", []) or []),
         )
@@ -187,13 +188,6 @@ class CSAAnalyzer(BaseAnalyzer):
         self._setup_tool_work_dirs(work_dir)
         from ..evidence.normalizer import EvidenceNormalizer
 
-        extra_context = self._join_context_blocks(
-            self._build_extra_context(context.shared_analysis),
-            self._build_runtime_path_context(context, work_dir),
-            self._build_evidence_context(evidence_bundle),
-            self._build_synthesis_context(synthesis_input),
-        )
-
         self._ensure_generate_agent()
         from ..generate import GenerationRequest
 
@@ -203,7 +197,6 @@ class CSAAnalyzer(BaseAnalyzer):
                 patch_path=context.patch_path,
                 work_dir=work_dir,
                 validate_path=context.validate_path or "",
-                extra_context=extra_context,
                 max_iterations=int((self.config.get("agent", {}) or {}).get("max_iterations", 12) or 12),
             )
         )
@@ -265,6 +258,17 @@ class CSAAnalyzer(BaseAnalyzer):
                 "evidence_summary": self._build_evidence_context(evidence_bundle),
                 "synthesis_input": synthesis_input.to_dict(),
                 "synthesis_summary": synthesis_input.to_prompt_block(),
+                "generation_agent": {
+                    "final_message": agent_result.final_message,
+                    "tool_history": agent_result.metadata.get("tool_history", []),
+                    "notes": agent_result.metadata.get("notes", []),
+                    "plan": agent_result.metadata.get("plan", {}),
+                    "rag_match": agent_result.metadata.get("rag_match", False),
+                    "rag_check_result": agent_result.metadata.get("rag_check_result", ""),
+                    "llm_usage": agent_result.metadata.get("llm_usage", {}),
+                    "llm_usage_by_phase": agent_result.metadata.get("llm_usage_by_phase", {}),
+                },
+                "llm_usage": agent_result.metadata.get("llm_usage", {}),
                 "structural_seed": {
                     "enabled": False,
                     "reason": "generate_stage_seed_bootstrap_disabled",
@@ -352,10 +356,10 @@ class CSAAnalyzer(BaseAnalyzer):
         work_dir = self._create_work_dir(context.output_dir)
         self._setup_tool_work_dirs(work_dir)
 
-        evidence_bundle = self.collect_evidence(context)
+        evidence_bundle = self.restore_refinement_evidence_bundle(context)
         synthesis_input = self.build_synthesis_input(context, evidence_bundle)
         self._emit_progress(
-            "evidence_collection_completed",
+            "evidence_loaded",
             records=len(getattr(evidence_bundle, "records", []) or []),
             missing=len(getattr(evidence_bundle, "missing_evidence", []) or []),
         )
@@ -379,17 +383,6 @@ class CSAAnalyzer(BaseAnalyzer):
             source_path=refinement_baseline_path,
             work_dir=work_dir,
         )
-        extra_context = self._join_context_blocks(
-            self._build_extra_context(context.shared_analysis),
-            self._build_runtime_path_context(context, work_dir),
-            self._build_evidence_context(evidence_bundle),
-            self._build_synthesis_context(synthesis_input),
-            self._build_refinement_context(
-                artifact=artifact,
-                baseline_result=baseline_result,
-                synthesis_input=synthesis_input,
-            ),
-        )
 
         from ..evidence.normalizer import EvidenceNormalizer
         from ..refine import LangChainRefinementAgent, RefinementRequest
@@ -409,8 +402,10 @@ class CSAAnalyzer(BaseAnalyzer):
                 target_path=staged_target,
                 source_path=refinement_baseline_path,
                 validate_path=context.validate_path or "",
+                evidence_dir=context.evidence_dir or "",
+                evidence_bundle_raw=context.evidence_bundle_raw if isinstance(context.evidence_bundle_raw, dict) else {},
+                baseline_validation_summary=str((baseline_result.metadata or {}).get("baseline_validation_summary", "") or ""),
                 checker_name=Path(staged_target).stem,
-                extra_context=extra_context,
                 max_iterations=int((self.config.get("agent", {}) or {}).get("max_iterations", 12) or 12),
             )
         )
@@ -447,20 +442,35 @@ class CSAAnalyzer(BaseAnalyzer):
                     error=final_error,
                 )
 
+        compiled_output_path = str(agent_result.output_path or "").strip()
+        compile_attempts = int(agent_result.compile_attempts or 0)
+        if final_success:
+            compiled_output_path, extra_compile_attempts, compile_error = self._ensure_shared_object_output(
+                checker_name=agent_result.checker_name,
+                checker_code=agent_result.checker_code,
+                work_dir=work_dir,
+                current_output_path=compiled_output_path,
+            )
+            compile_attempts += extra_compile_attempts
+            if compile_error:
+                final_success = False
+                final_error = compile_error
+
         result = AnalyzerResult(
             analyzer_type=AnalyzerType.CSA,
             success=final_success,
             checker_name=agent_result.checker_name,
             checker_code=agent_result.checker_code,
-            output_path=agent_result.output_path,
+            output_path=compiled_output_path,
             iterations=agent_result.iterations,
-            compile_attempts=agent_result.compile_attempts,
+            compile_attempts=compile_attempts,
             error_message=final_error,
             execution_time=time.time() - start_time,
             metadata={
                 "work_dir": work_dir,
                 "patch_path": context.patch_path,
                 "refinement_target_path": staged_target,
+                "baseline_source_path": str(getattr(artifact, "source_path", "") or ""),
                 "artifact_review": review_metadata,
                 "evidence_bundle": evidence_bundle.to_dict(),
                 "evidence_records": len(evidence_bundle.records),
@@ -478,7 +488,13 @@ class CSAAnalyzer(BaseAnalyzer):
                 "refinement_agent": {
                     "final_message": agent_result.final_message,
                     "tool_history": agent_result.metadata.get("tool_history", []),
+                    "model_requested_stop": bool(agent_result.metadata.get("model_requested_stop", False)),
+                    "last_decision_action": str(agent_result.metadata.get("last_decision_action", "") or ""),
+                    "last_repair_action": str(agent_result.metadata.get("last_repair_action", "") or ""),
+                    "llm_usage": agent_result.metadata.get("llm_usage", {}),
+                    "llm_usage_by_phase": agent_result.metadata.get("llm_usage_by_phase", {}),
                 },
+                "llm_usage": agent_result.metadata.get("llm_usage", {}),
             },
         )
         self._emit_progress(
@@ -564,18 +580,34 @@ class CSAAnalyzer(BaseAnalyzer):
         if review_tool and hasattr(review_tool, "set_work_dir"):
             review_tool.set_work_dir(work_dir)
 
-    def _build_extra_context(self, shared_analysis: Dict[str, Any]) -> str:
-        """构建 CSA 特定上下文"""
-        base_context = super()._build_extra_context(shared_analysis)
-        if not shared_analysis:
-            return base_context
+    def _ensure_shared_object_output(
+        self,
+        checker_name: str,
+        checker_code: str,
+        work_dir: str,
+        current_output_path: str,
+    ) -> Tuple[str, int, str]:
+        resolved_output = str(current_output_path or "").strip()
+        if resolved_output.endswith(".so") and Path(resolved_output).exists():
+            return resolved_output, 0, ""
 
-        lines = [base_context] if base_context else []
-        lines.append("- CSA 生成约束: 用 AST、ProgramState 和路径条件表达语义，禁止依赖关键词匹配、占位 helper 或常量返回。")
-        lines.append("- CSA barrier 约束: no-report 条件必须由同一路径上的真实 guard/barrier 证明，不能因为函数里存在任意检查就整体静默。")
-        lines.append("- CSA 证明边界: 空值性质、参数合法性或无关检查不能替代容量、生命周期或状态证明。")
-        lines.append("- CSA 模式选择: 先判断当前漏洞是否更适合 local consumer AST/contract trigger；不要因为属于 UAF 就默认套 `ProgramStateTrait`/`FreedSymbols`。")
-        lines.append("- CSA 泛化要求: 允许以 patch 为语义锚点，但最终 checker 必须面向同类别漏洞，而不是 patch-only 实现。")
-        lines.append("- CSA 知识来源: 漏洞族特定 sink/barrier/误报反例应优先从高相关知识库结果中补齐。")
+        if not checker_code.strip():
+            return resolved_output, 0, "缺少可编译的 checker 源码，无法生成 .so"
 
-        return "\n".join(lines)
+        if not self._tool_registry or not self._tool_registry.has("compile_checker"):
+            return resolved_output, 0, "未注册 compile_checker，无法为 refine 候选生成 .so"
+
+        compile_tool = self._tool_registry.get("compile_checker")
+        compile_result = compile_tool.execute(
+            checker_name=checker_name or "BufferOverflowChecker",
+            source_code=checker_code,
+            output_dir=work_dir,
+        )
+        if not compile_result.success:
+            details = str(compile_result.error or compile_result.output or "编译 refine 候选失败").strip()
+            return "", 1, details
+
+        output_file = str((compile_result.metadata or {}).get("output_file", "") or "").strip()
+        if not output_file or not Path(output_file).exists():
+            return "", 1, "compile_checker 未返回有效的 .so 输出路径"
+        return output_file, 1, ""

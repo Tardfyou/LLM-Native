@@ -23,6 +23,7 @@ class EvidenceCollector(ABC):
     """Base class for analyzer-native evidence collectors."""
 
     analyzer_id: str = "generic"
+    supported_types: List[str] = []
 
     @abstractmethod
     def collect(self, context: AnalyzerContext) -> EvidenceBundle:
@@ -32,13 +33,13 @@ class EvidenceCollector(ABC):
         return (context.shared_analysis or {}).get("patchweaver", {}) or {}
 
     def _evidence_requirements(self, context: AnalyzerContext) -> List[Dict[str, Any]]:
-        plan = self._shared_patchweaver(context).get("evidence_plan", {}) or {}
-        requirements = []
-        for item in plan.get("requirements", []) or []:
-            preferred = [str(name).lower().strip() for name in (item.get("preferred_analyzers", []) or [])]
-            if not preferred or self.analyzer_id in preferred:
-                requirements.append(item)
-        return requirements
+        return [
+            {
+                "evidence_type": evidence_type,
+                "reason": "Standalone evidence collection precomputes all refine-supported evidence for this analyzer.",
+            }
+            for evidence_type in list(self.supported_types or [])
+        ]
 
     def _file_details(self, context: AnalyzerContext) -> List[Dict[str, Any]]:
         return (context.shared_analysis or {}).get("file_details", []) or []
