@@ -34,9 +34,9 @@ llm:
 
   # API密钥配置 (硬编码在配置文件)
   api_keys:
-    deepseek: "sk-f1ed234b6c2240e1bed912e09e601c75"
-    xty: "sk-ygS7w7TCUEw4UvMiA077323d5e974f8a9fAa75B65c1127Fe"
-    packyapi: "sk-sWgsnXSC7tFcNLwvje0mgaa9r3W7HMry0c8TmR0UulO3IoKb"
+    deepseek: ""
+    xty: ""
+    packyapi: ""
 
   # 各 Provider 的 Base URL
   base_urls:

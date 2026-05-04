@@ -1,0 +1,5 @@
+name: custom-queries-v2
+version: 0.0.1
+dependencies:
+  codeql/cpp-all: 8.0.3
+extractor: cpp

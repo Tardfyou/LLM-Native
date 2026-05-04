@@ -1,0 +1,14 @@
+sample_id,project,cwe_id,vulnerability_type,primary_analyzer,generate_total_seconds,generate_agent_seconds,generate_validation_seconds,generate_agent_prompt_tokens,generate_agent_completion_tokens,generate_agent_total_tokens,generate_pipeline_total_tokens,generate_llm_calls,generate_iterations,generate_compile_attempts,refine_total_seconds,refine_agent_seconds,refine_validation_seconds,refine_agent_prompt_tokens,refine_agent_completion_tokens,refine_agent_total_tokens,refine_pipeline_total_tokens,refine_llm_calls,refine_iterations,refine_compile_attempts,artifact_nonempty_lines_before,artifact_nonempty_lines_after,artifact_nonempty_delta
+vul4c_cwe369_libtiff_cve20177595,libtiff,CWE-369,divide by zero,codeql,106.764,90.975,15.534,28928,2081,31009,68292,9,4,0,382.879,201.473,17.495,19489,2432,21921,255662,24,2,0,110,259,149
+vul4c_cwe119_imagemagick_cve20169556,imagemagick,CWE-119,buffer overflow,codeql,147.858,87.692,59.905,29605,2196,31801,69478,9,4,0,499.896,141.62,62.581,46422,5155,51577,401364,42,5,0,90,183,93
+vul4c_cwe415_libzip_cve201712858,libzip,CWE-415,double free,codeql,113.183,98.732,14.355,8409,811,9220,24377,3,3,0,133.405,128.45,1.311,58035,4988,63023,126046,12,6,0,49,90,41
+vul4c_cwe125_graphicsmagick_cve201712937,graphicsmagick,CWE-125,out-of-bounds read,codeql,221.678,135.796,85.661,30154,1466,31620,69364,9,4,0,,,,,,,,,,,67,,
+vul4c_cwe416_graphicsmagick_cve201714103,graphicsmagick,CWE-416,use after free,csa,331.81,297.261,34.33,27814,4022,31836,73136,7,3,1,,,,,,,,,,,283,,
+vul4c_cwe787_ngiflib_cve201810717,ngiflib,CWE-787,out-of-bounds write,codeql,195.844,189.771,5.847,32602,1805,34407,77098,9,4,0,,,,,,,,,,,68,,
+git_cwe120_xrdp_cve202223468,xrdp,CWE-120,classic buffer overflow,codeql,147.18,140.141,7.023,31149,1451,32600,72765,9,4,0,,,,,,,,,,,30,,
+git_cwe415_vim_cve202555158,vim,CWE-415,double free,codeql,125.35,70.282,55.053,23110,3498,26608,53216,6,3,0,,,,,,,,,,,51,,
+vul4c_cwe120_jhead_cve202028840,jhead,CWE-120,classic buffer overflow,codeql,176.957,167.55,9.18,65861,5467,71328,148864,17,8,0,7.773,0.0,7.773,0,0,0,0,0,3,0,69,198,129
+vul4c_cwe190_binutils_cve201714745,binutils,CWE-190,integer overflow or wraparound,csa,265.43,219.018,46.171,31791,3383,35174,76492,9,4,1,30.892,2.531,19.751,0,0,0,23450,2,0,0,378,520,142
+vul4c_cwe416_imagemagick_cve201712877,imagemagick,CWE-416,use after free,codeql,241.592,184.879,56.481,32507,2251,34758,75657,9,4,0,224.674,150.351,70.384,67499,5829,73328,146656,14,7,0,97,119,22
+vul4c_cwe476_binutils_cve201714940,binutils,CWE-476,NULL pointer dereference,codeql,286.411,225.824,17.360,143021,6099,149120,149120,19,9,7,159.81,153.025,3.03,76891,6071,82962,165924,16,8,0,44,76,32
+vul4c_cwe20_binutils_cve20179043,binutils,CWE-20,input validation error,codeql,362.3,350.016,12.268,66707,5551,72258,150954,17,8,0,199.738,192.152,3.714,82105,7994,90099,180198,16,8,0,86,134,48

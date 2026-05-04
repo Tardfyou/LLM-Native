@@ -1,0 +1,33 @@
+sample_id,source_dataset,cve_id,project,cwe_id,vulnerability_type,benchmark_relpath,preferred_analyzer,run_generate,run_refine,run_backend_compare,selection_reason,quality_notes
+vul4c_cwe119_imagemagick_cve20169556,vul4c,CVE-2016-9556,imagemagick,CWE-119,buffer overflow,imagemagick/CVE-2016-9556,csa,true,true,true,单文件单hunk，边界约束补丁清晰,候选主样本
+vul4c_cwe119_libming_cve20169827,vul4c,CVE-2016-9827,libming,CWE-119,buffer overflow,libming/CVE-2016-9827,csa,true,false,false,单文件小补丁，越界保护语义集中,候选主样本
+vul4c_cwe119_libxml2_cve20125134,vul4c,CVE-2012-5134,libxml2,CWE-119,buffer overflow,libxml2/CVE-2012-5134,csa,true,false,false,补丁规模小，适合做生成评估,候选主样本
+vul4c_cwe120_jhead_cve202028840,vul4c,CVE-2020-28840,jhead,CWE-120,classic buffer overflow,jhead/CVE-2020-28840,csa,true,true,true,经典缓冲区拷贝边界修复，语义直接,待补第三个同类样本
+vul4c_cwe120_gilcc_cve202021572,vul4c,CVE-2020-21572,gilcc,CWE-120,classic buffer overflow,gilcc/CVE-2020-21572,csa,true,true,true,单文件边界检查补丁，可做同类对照,待补第三个同类样本
+vul4c_cwe125_binutils_cve201715021,vul4c,CVE-2017-15021,binutils,CWE-125,out-of-bounds read,binutils/CVE-2017-15021,csa,true,false,false,越界读修复小且明确,候选主样本
+vul4c_cwe125_elfutils_cve20177607,vul4c,CVE-2017-7607,elfutils,CWE-125,out-of-bounds read,elfutils/CVE-2017-7607,csa,true,true,true,读取边界判断补丁简单清晰,候选精炼样本
+vul4c_cwe125_graphicsmagick_cve201712937,vul4c,CVE-2017-12937,graphicsmagick,CWE-125,out-of-bounds read,graphicsmagick/CVE-2017-12937,csa,true,false,false,颜色表索引校验补丁极小且语义直接,候选补位样本
+vul4c_cwe125_libdwarf_cve20169558,vul4c,CVE-2016-9558,libdwarf,CWE-125,out-of-bounds read,libdwarf/CVE-2016-9558,csa,true,true,true,单hunk补丁，便于分析越界读机制,候选精炼样本
+vul4c_cwe190_binutils_cve201714745,vul4c,CVE-2017-14745,binutils,CWE-190,integer overflow or wraparound,binutils/CVE-2017-14745,codeql,true,true,true,整数边界补丁精简，适合后端对比,候选精炼样本
+vul4c_cwe190_libarchive_cve20165844,vul4c,CVE-2016-5844,libarchive,CWE-190,integer overflow or wraparound,libarchive/CVE-2016-5844,codeql,true,true,true,整数运算溢出检查具有代表性,候选精炼样本
+vul4c_cwe190_jasper_cve20169387,vul4c,CVE-2016-9387,jasper,CWE-190,integer overflow or wraparound,jasper/CVE-2016-9387,codeql,true,false,false,多行补丁但机制集中在整数范围控制,候选主样本
+vul4c_cwe369_binutils_cve201715025,vul4c,CVE-2017-15025,binutils,CWE-369,divide by zero,binutils/CVE-2017-15025,csa,true,false,false,除零保护补丁小，触发条件明确,候选主样本
+vul4c_cwe369_libming_cve20169265,vul4c,CVE-2016-9265,libming,CWE-369,divide by zero,libming/CVE-2016-9265,csa,true,true,true,修复通过显式分母检查完成，语义清晰,候选精炼样本
+vul4c_cwe369_libtiff_cve20177595,vul4c,CVE-2017-7595,libtiff,CWE-369,divide by zero,libtiff/CVE-2017-7595,csa,true,true,true,经典除零保护案例，补丁直接体现guard,候选精炼样本
+vul4c_cwe416_imagemagick_cve201712877,vul4c,CVE-2017-12877,imagemagick,CWE-416,use after free,imagemagick/CVE-2017-12877,csa,true,true,true,UAF 修复为局部状态约束，适合证据收集,候选精炼样本
+vul4c_cwe416_graphicsmagick_cve201714103,vul4c,CVE-2017-14103,graphicsmagick,CWE-416,use after free,graphicsmagick/CVE-2017-14103,csa,true,false,false,错误路径资源释放顺序修正明显，适合作为 UAF 补位样本,候选补位样本
+vul4c_cwe416_libming_cve20188964,vul4c,CVE-2018-8964,libming,CWE-416,use after free,libming/CVE-2018-8964,csa,true,true,true,UAF 修复逻辑与释放后约束直接相关，适合精炼,候选精炼样本
+vul4c_cwe416_libming_cve20188806,vul4c,CVE-2018-8806,libming,CWE-416,use after free,libming/CVE-2018-8806,csa,true,false,false,真实 UAF 案例，补丁语义集中在释放后约束,候选主样本
+vul4c_cwe415_libzip_cve201712858,vul4c,CVE-2017-12858,libzip,CWE-415,double free,libzip/CVE-2017-12858,csa,true,true,true,双重释放真实样本稀缺，该样本需保留,待补两个同类样本
+vul4c_cwe476_libming_cve20169828,vul4c,CVE-2016-9828,libming,CWE-476,NULL pointer dereference,libming/CVE-2016-9828,csa,true,false,false,空指针解引用补丁很小，利于基线评估,候选主样本
+vul4c_cwe476_binutils_cve201714940,vul4c,CVE-2017-14940,binutils,CWE-476,NULL pointer dereference,binutils/CVE-2017-14940,csa,true,true,true,NULL 检查增强补丁直接，适合精炼,候选精炼样本
+vul4c_cwe476_jasper_cve201610248,vul4c,CVE-2016-10248,jasper,CWE-476,NULL pointer dereference,jasper/CVE-2016-10248,csa,true,false,false,空指针路径补丁清晰,候选主样本
+vul4c_cwe476_openjpeg_cve20167445,vul4c,CVE-2016-7445,openjpeg,CWE-476,NULL pointer dereference,openjpeg/CVE-2016-7445,csa,true,false,false,指针返回值判空与输入解析路径直接相关,候选补位样本
+vul4c_cwe787_libdwarf_cve20169275,vul4c,CVE-2016-9275,libdwarf,CWE-787,out-of-bounds write,libdwarf/CVE-2016-9275,csa,true,false,false,越界写补丁小且直接,候选主样本
+vul4c_cwe787_openjpeg_cve201714041,vul4c,CVE-2017-14041,openjpeg,CWE-787,out-of-bounds write,openjpeg/CVE-2017-14041,csa,true,true,true,边界写保护逻辑典型，适合精炼,候选精炼样本
+vul4c_cwe787_ngiflib_cve201810677,vul4c,CVE-2018-10677,ngiflib,CWE-787,out-of-bounds write,ngiflib/CVE-2018-10677,csa,true,false,false,图像尺寸与画布边界约束补丁清晰,候选补位样本
+vul4c_cwe787_ngiflib_cve201810717,vul4c,CVE-2018-10717,ngiflib,CWE-787,out-of-bounds write,ngiflib/CVE-2018-10717,csa,true,false,false,像素写入前的剩余长度检查直接对应越界写风险,候选补位样本
+vul4c_cwe787_zziplib_cve20175975,vul4c,CVE-2017-5975,zziplib,CWE-787,out-of-bounds write,zziplib/CVE-2017-5975,csa,true,false,false,越界写样本独立且补丁集中,候选主样本
+vul4c_cwe20_jasper_cve20169390,vul4c,CVE-2016-9390,jasper,CWE-20,input validation error,jasper/CVE-2016-9390,codeql,true,false,false,输入校验型补丁小，利于生成评估,候选主样本
+vul4c_cwe20_libtiff_cve20177601,vul4c,CVE-2017-7601,libtiff,CWE-20,input validation error,libtiff/CVE-2017-7601,codeql,true,false,false,输入约束补丁直接体现前置检查,候选主样本
+vul4c_cwe20_binutils_cve20179043,vul4c,CVE-2017-9043,binutils,CWE-20,input validation error,binutils/CVE-2017-9043,codeql,true,true,true,输入合法性判断较明确，适合精炼与后端对比,候选精炼样本

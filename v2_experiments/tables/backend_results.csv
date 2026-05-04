@@ -1,0 +1,1 @@
+sample_id,project,cwe_id,vulnerability_type,run_started_at,csa_success,csa_vuln_hit,csa_fixed_silent,csa_pds,csa_total_tokens,csa_total_seconds,codeql_success,codeql_vuln_hit,codeql_fixed_silent,codeql_pds,codeql_total_tokens,codeql_total_seconds,notes

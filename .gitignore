@@ -63,7 +63,15 @@ v2/backups/
 v2/tests/output/
 v2/tests/**/outputs/
 v2/tests/**/tmp_analysis/
-v2_experiments/
+v2_experiments/datasets/
+v2_experiments/logs/
+v2_experiments/runs/
+v2_experiments/figures/*.pdf
+v2_experiments/figures/*.png
+v2_experiments/figures/figures/*.pdf
+v2_experiments/figures/figures/*.png
+v2_experiments/figures/figures/*.svg
+v2_experiments/support/codeql_smoke/results.*
 
 # Configuration with secrets
 API_KEYS.txt
@@ -77,6 +85,7 @@ temp/
 *.bak
 tmp_*.json
 prompt.txt
+.codex
 .codex/
 
 # Docker
